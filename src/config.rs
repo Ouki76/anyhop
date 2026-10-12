@@ -5,6 +5,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
@@ -22,6 +23,7 @@ impl Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
@@ -38,6 +40,17 @@ pub struct ServerConfig {
 
 fn default_state_file() -> String {
     "anyhop.redb".into()
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_listen(),
+            max_retries: default_max_retries(),
+            attempt_timeout_secs: default_attempt_timeout_secs(),
+            state_file: default_state_file(),
+        }
+    }
 }
 
 fn default_listen() -> String {
