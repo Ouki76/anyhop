@@ -60,10 +60,10 @@ enum Tab {
 }
 
 const TABS: &[(Tab, &str)] = &[
-    (Tab::Overview, "Обзор"),
-    (Tab::Providers, "Провайдеры"),
-    (Tab::Quotas, "Квоты"),
-    (Tab::Events, "События"),
+    (Tab::Overview, "Overview"),
+    (Tab::Providers, "Providers"),
+    (Tab::Quotas, "Quotas"),
+    (Tab::Events, "Events"),
 ];
 
 fn fmt_time(ts: u64) -> String {
@@ -161,15 +161,19 @@ fn App() -> View {
     });
 
     view! {
+        div(class="topbar") {}
         div(class="wrap") {
             div(class="top") {
                 div {
-                    div(class="logo") { "anyhop" span(class="dot") { "." } }
-                    div(class="tagline") { "LLM gateway" }
+                    div(class="logo") {
+                        div(class="logo-mark") { i {} i {} i {} i {} }
+                        span(class="logo-text") { "anyhop" }
+                    }
+                    div(class="tagline") { "LLM Gateway · Rotation · Failover" }
                 }
                 div(class="status-pill") {
                     div(class="pulse") {}
-                    (format!("{}/{} ключей активно", active_keys.get_clone(), total_keys.get_clone()))
+                    (format!("{}/{} keys active", active_keys.get_clone(), total_keys.get_clone()))
                 }
             }
 
@@ -232,22 +236,22 @@ fn OverviewTab(providers: Signal<Vec<ProviderDto>>, events: Signal<Vec<EventDto>
         div(class="stats") {
             div(class="stat") {
                 div(class="num") { (n_providers.get_clone()) }
-                div(class="lbl") { "Провайдеры" }
+                div(class="lbl") { "Providers" }
             }
             div(class="stat") {
                 div(class="num") { (fmt_num(in_flight.get_clone())) }
-                div(class="lbl") { "Запросов сейчас" }
+                div(class="lbl") { "In flight" }
             }
             div(class="stat") {
                 div(class="num") { (fmt_num(total_requests.get_clone())) }
-                div(class="lbl") { "Запросов всего" }
+                div(class="lbl") { "Total requests" }
             }
             div(class="stat") {
                 div(class="num") { (fmt_num(total_tokens.get_clone())) }
-                div(class="lbl") { "Токенов обработано" }
+                div(class="lbl") { "Tokens processed" }
             }
         }
-        div(class="section-title") { "Последние события" }
+        div(class="section-title") { "Recent events" }
         div(class="card") {
             EventList(events=events, limit=5)
         }
@@ -283,8 +287,8 @@ fn ProviderCard(p: ProviderDto) -> View {
             }
             table {
                 tr {
-                    th { "Ключ" } th { "Статус" } th { "Кулдаун" } th { "Сейчас" }
-                    th { "Запросы" } th { "Ошибки" } th { "Токены in" } th { "Токены out" } th { "" }
+                    th { "Key" } th { "Status" } th { "Cooldown" } th { "In-flight" }
+                    th { "Requests" } th { "Failures" } th { "Tokens in" } th { "Tokens out" } th { "" }
                 }
                 Indexed(
                     list=create_signal(p.keys),
@@ -312,7 +316,7 @@ fn ProviderCard(p: ProviderDto) -> View {
                 let pname2 = pname_add.clone();
                 view! {
                     div(class="addkey") {
-                        input(class="input", r#type="text", placeholder="добавить ключ…",
+                        input(class="input", r#type="text", placeholder="add a key…",
                               bind:value=new_key)
                         button(class="btn btn-primary", on:click=move |_| {
                             let secret = new_key.get_clone();
@@ -324,7 +328,7 @@ fn ProviderCard(p: ProviderDto) -> View {
                                     post_json("/api/keys/add", &body).await;
                                 });
                             }
-                        }) { "Добавить" }
+                        }) { "Add" }
                     }
                 }
             } else {
@@ -337,7 +341,7 @@ fn ProviderCard(p: ProviderDto) -> View {
 #[component(inline_props)]
 fn KeyActionButton(provider: String, id: String, status: String) -> View {
     let dead = status == "dead";
-    let label = if dead { "включить" } else { "выключить" };
+    let label = if dead { "enable" } else { "disable" };
     let class = if dead { "btn" } else { "btn btn-danger" };
     let url = if dead { "/api/keys/enable" } else { "/api/keys/disable" };
     view! {
@@ -356,7 +360,7 @@ fn KeyActionButton(provider: String, id: String, status: String) -> View {
 fn QuotasTab(quotas: Signal<Vec<QuotaDto>>) -> View {
     view! {
         (if quotas.get_clone().is_empty() {
-            view! { div(class="card") { div(class="empty") { "Квоты появятся для OAuth-провайдеров (antigravity)" } } }
+            view! { div(class="card") { div(class="empty") { "Quotas appear for OAuth providers (antigravity)" } } }
         } else {
             view! {
                 Indexed(
@@ -368,7 +372,7 @@ fn QuotasTab(quotas: Signal<Vec<QuotaDto>>) -> View {
                                 span(class="badge") { (q.account) }
                             }
                             table {
-                                tr { th { "Модель" } th { "Осталось" } th { "Сброс" } }
+                                tr { th { "Model" } th { "Remaining" } th { "Reset" } }
                                 Indexed(
                                     list=create_signal(q.models),
                                     view=|m: QuotaModelDto| {
@@ -422,7 +426,7 @@ fn EventList(events: Signal<Vec<EventDto>>, limit: usize) -> View {
     });
     view! {
         (if limited.get_clone().is_empty() {
-            view! { div(class="empty") { "Событий пока нет — всё спокойно" } }
+            view! { div(class="empty") { "No events yet — all quiet" } }
         } else {
             view! {
                 div(class="events") {
