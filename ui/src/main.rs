@@ -96,6 +96,40 @@ fn main() {
     sycamore::render(App);
 }
 
+fn current_theme() -> String {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+        .and_then(|e| e.get_attribute("data-theme"))
+        .unwrap_or_else(|| "light".into())
+}
+
+fn set_theme(t: &str) {
+    if let Some(w) = web_sys::window() {
+        if let Some(e) = w.document().and_then(|d| d.document_element()) {
+            let _ = e.set_attribute("data-theme", t);
+        }
+        if let Ok(Some(s)) = w.local_storage() {
+            let _ = s.set_item("theme", t);
+        }
+    }
+}
+
+#[component]
+fn ThemeToggle() -> View {
+    let theme = create_signal(current_theme());
+    view! {
+        button(class="theme-btn", on:click=move |_| {
+            let next = if theme.get_clone() == "dark" { "light" } else { "dark" };
+            set_theme(next);
+            theme.set(next.to_string());
+        }) {
+            span(class="sq") {}
+            (if theme.get_clone() == "dark" { "Light" } else { "Dark" })
+        }
+    }
+}
+
 #[component]
 fn App() -> View {
     let tab = create_signal(Tab::Overview);
@@ -175,6 +209,7 @@ fn App() -> View {
                     div(class="pulse") {}
                     (format!("{}/{} keys active", active_keys.get_clone(), total_keys.get_clone()))
                 }
+                ThemeToggle()
             }
 
             nav(class="tabs") {
