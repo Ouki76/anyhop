@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use crate::antigravity::{self, Account};
 use crate::config::{ProviderConfig, ProviderKind};
 use crate::pool::KeyPool;
+use crate::storage::Storage;
 
 const MODELS_CACHE_TTL: Duration = Duration::from_secs(600);
 
@@ -21,7 +22,7 @@ pub struct Provider {
 }
 
 impl Provider {
-    pub fn from_config(cfg: &ProviderConfig) -> anyhow::Result<Self> {
+    pub fn from_config(cfg: &ProviderConfig, storage: Option<&Storage>) -> anyhow::Result<Self> {
         let base_url = cfg.base_url.trim_end_matches('/').to_string();
         let (secrets, ag_accounts) = match cfg.kind {
             ProviderKind::OpenaiCompat | ProviderKind::Gemini => {
@@ -43,8 +44,12 @@ impl Provider {
                     "provider '{}': no accounts configured (run `anyhop auth antigravity`)",
                     cfg.name
                 );
-                let accounts: Vec<Arc<Account>> =
-                    cfg.accounts.iter().map(Account::new).map(Arc::new).collect();
+                let accounts: Vec<Arc<Account>> = cfg
+                    .accounts
+                    .iter()
+                    .map(|a| Account::new(a, &cfg.name, storage))
+                    .map(Arc::new)
+                    .collect();
                 let secrets: Vec<String> =
                     accounts.iter().map(|a| a.pool_secret().to_string()).collect();
                 (secrets, accounts)
@@ -59,7 +64,7 @@ impl Provider {
             name: cfg.name.clone(),
             kind: cfg.kind,
             base_url,
-            pool: KeyPool::new(secrets, cfg.strategy),
+            pool: KeyPool::new(cfg.name.clone(), secrets, cfg.strategy, storage.cloned()),
             models: cfg.models.clone(),
             extra_headers: cfg
                 .headers

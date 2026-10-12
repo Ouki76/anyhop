@@ -79,11 +79,17 @@ pub struct Account {
     identity: String,
     pub email: Option<String>,
     project_id_static: Option<String>,
+    provider: String,
+    storage: Option<crate::storage::Storage>,
     state: tokio::sync::Mutex<AccountState>,
 }
 
 impl Account {
-    pub fn new(cfg: &crate::config::AntigravityAccountConfig) -> Self {
+    pub fn new(
+        cfg: &crate::config::AntigravityAccountConfig,
+        provider: &str,
+        storage: Option<&crate::storage::Storage>,
+    ) -> Self {
         let refresh_token = if cfg.refresh_token.is_empty() {
             None
         } else {
@@ -93,17 +99,57 @@ impl Account {
             .clone()
             .or_else(|| cfg.access_token.clone())
             .unwrap_or_default();
+
+        // Pre-seeded token from config, else cached token from previous runs.
+        let cached = cfg
+            .access_token
+            .is_none()
+            .then(|| {
+                storage.and_then(|s| s.load_oauth(provider, &identity))
+            })
+            .flatten();
+        let access_token = cfg
+            .access_token
+            .clone()
+            .or_else(|| cached.as_ref().map(|c| c.access_token.clone()))
+            .filter(|t| !t.is_empty());
+        let expires_at_ms = if cfg.access_token.is_some() {
+            // Pre-seeded tokens never expire (no refresh token to renew them).
+            u64::MAX
+        } else {
+            cached.as_ref().map(|c| c.expires_at_ms).unwrap_or(0)
+        };
+        let project_id = cfg
+            .project_id
+            .clone()
+            .or_else(|| cached.as_ref().and_then(|c| c.project_id.clone()));
+
         Self {
             refresh_token,
             identity,
             email: cfg.email.clone(),
             project_id_static: cfg.project_id.clone(),
+            provider: provider.to_string(),
+            storage: storage.cloned(),
             state: tokio::sync::Mutex::new(AccountState {
-                access_token: cfg.access_token.clone(),
-                // Pre-seeded tokens never expire (no refresh token to renew them).
-                expires_at_ms: if cfg.access_token.is_some() { u64::MAX } else { 0 },
-                project_id: cfg.project_id.clone(),
+                access_token,
+                expires_at_ms,
+                project_id,
             }),
+        }
+    }
+
+    fn persist(&self, access_token: &str, expires_at_ms: u64, project_id: Option<&str>) {
+        if let Some(s) = &self.storage {
+            s.save_oauth(
+                &self.provider,
+                &self.identity,
+                crate::storage::OAuthRecord {
+                    access_token: access_token.to_string(),
+                    expires_at_ms,
+                    project_id: project_id.map(str::to_string),
+                },
+            );
         }
     }
 
@@ -174,6 +220,8 @@ impl Account {
         let expires_in = v.get("expires_in").and_then(|e| e.as_u64()).unwrap_or(3600);
         st.expires_at_ms = now_ms() + expires_in * 1000;
         st.access_token = Some(token.clone());
+        let project = st.project_id.clone();
+        self.persist(&token, st.expires_at_ms, project.as_deref());
         Ok(token)
     }
 
@@ -231,6 +279,9 @@ impl Account {
                 )
             })?;
         st.project_id = Some(project.clone());
+        if let Some(t) = &st.access_token {
+            self.persist(t, st.expires_at_ms, Some(&project));
+        }
         Ok(project)
     }
 }
@@ -470,12 +521,16 @@ pub async fn run_auth_flow() -> anyhow::Result<()> {
     let email = fetch_email(&http, &tokens.access_token).await;
 
     // Best-effort project discovery so the snippet is complete.
-    let account = Account::new(&crate::config::AntigravityAccountConfig {
-        refresh_token: tokens.refresh_token.clone(),
-        email: email.clone(),
-        project_id: None,
-        access_token: None,
-    });
+    let account = Account::new(
+        &crate::config::AntigravityAccountConfig {
+            refresh_token: tokens.refresh_token.clone(),
+            email: email.clone(),
+            project_id: None,
+            access_token: None,
+        },
+        "antigravity",
+        None,
+    );
     let project_id = match account.ensure_project_id(&http, &tokens.access_token).await {
         Ok(p) => Some(p),
         Err(e) => {

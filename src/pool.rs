@@ -3,10 +3,11 @@ use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::Strategy;
+use crate::storage::{HealthRecord, StatsRecord, Storage};
 
-const STATUS_ACTIVE: u8 = 0;
-const STATUS_COOLDOWN: u8 = 1;
-const STATUS_DEAD: u8 = 2;
+pub const STATUS_ACTIVE: u8 = 0;
+pub const STATUS_COOLDOWN: u8 = 1;
+pub const STATUS_DEAD: u8 = 2;
 
 const MAX_COOLDOWN: Duration = Duration::from_secs(300);
 const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
@@ -78,20 +79,117 @@ impl KeyState {
             .store(now_ms() + d.as_millis() as u64, Ordering::Relaxed);
         self.status.store(STATUS_COOLDOWN, Ordering::Relaxed);
     }
+
+    fn health(&self) -> HealthRecord {
+        HealthRecord {
+            status: self.status.load(Ordering::Relaxed),
+            cooldown_until_ms: self.cooldown_until_ms.load(Ordering::Relaxed),
+        }
+    }
+
+    fn restore_health(&self, rec: &HealthRecord) {
+        self.status.store(rec.status, Ordering::Relaxed);
+        self.cooldown_until_ms
+            .store(rec.cooldown_until_ms, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KeySnapshot {
+    pub masked: String,
+    pub status: String,
+    pub cooldown_remaining_secs: u64,
+    pub requests: u64,
+    pub failures: u64,
 }
 
 pub struct KeyPool {
+    name: String,
     strategy: Strategy,
     keys: Vec<Arc<KeyState>>,
     cursor: AtomicUsize,
+    storage: Option<Storage>,
 }
 
 impl KeyPool {
-    pub fn new(secrets: Vec<String>, strategy: Strategy) -> Self {
-        Self {
+    pub fn new(
+        name: String,
+        secrets: Vec<String>,
+        strategy: Strategy,
+        storage: Option<Storage>,
+    ) -> Self {
+        let pool = Self {
+            name,
             strategy,
             keys: secrets.into_iter().map(|s| Arc::new(KeyState::new(s))).collect(),
             cursor: AtomicUsize::new(0),
+            storage,
+        };
+        pool.restore();
+        pool
+    }
+
+    /// Restore health and stats persisted from previous runs.
+    fn restore(&self) {
+        let Some(storage) = &self.storage else { return };
+        for key in &self.keys {
+            if let Some(h) = storage.load_health(&self.name, &key.secret) {
+                key.restore_health(&h);
+            }
+            if let Some(s) = storage.load_stats(&self.name, &key.secret) {
+                key.requests.store(s.requests, Ordering::Relaxed);
+                key.failures.store(s.failures, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn persist_health(&self, key: &KeyState) {
+        if let Some(storage) = &self.storage {
+            storage.save_health(&self.name, &key.secret, key.health());
+        }
+    }
+
+    /// Snapshot for the dashboard.
+    pub fn snapshot(&self) -> Vec<KeySnapshot> {
+        let now = now_ms();
+        self.keys
+            .iter()
+            .map(|k| {
+                let status = k.status.load(Ordering::Relaxed);
+                let until = k.cooldown_until_ms.load(Ordering::Relaxed);
+                KeySnapshot {
+                    masked: k.masked(),
+                    status: match status {
+                        STATUS_ACTIVE => "active",
+                        STATUS_COOLDOWN if now >= until => "active",
+                        STATUS_COOLDOWN => "cooldown",
+                        _ => "dead",
+                    }
+                    .to_string(),
+                    cooldown_remaining_secs: if status == STATUS_COOLDOWN && until > now {
+                        (until - now) / 1000
+                    } else {
+                        0
+                    },
+                    requests: k.requests.load(Ordering::Relaxed),
+                    failures: k.failures.load(Ordering::Relaxed),
+                }
+            })
+            .collect()
+    }
+
+    /// Persist current request/failure counters (called periodically).
+    pub fn persist_stats(&self) {
+        let Some(storage) = &self.storage else { return };
+        for key in &self.keys {
+            storage.save_stats(
+                &self.name,
+                &key.secret,
+                StatsRecord {
+                    requests: key.requests.load(Ordering::Relaxed),
+                    failures: key.failures.load(Ordering::Relaxed),
+                },
+            );
         }
     }
 
@@ -150,5 +248,6 @@ impl KeyPool {
                 key.set_cooldown(BASE_BACKOFF * 2u32.pow(shift));
             }
         }
+        self.persist_health(key);
     }
 }

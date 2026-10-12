@@ -2,6 +2,7 @@ mod antigravity;
 mod config;
 mod gemini;
 mod pool;
+mod storage;
 mod providers;
 mod proxy;
 
@@ -41,9 +42,24 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::Config::load(&config_path)?;
     info!("loaded config from {config_path}");
 
+    let storage = if cfg.server.state_file.is_empty() {
+        None
+    } else {
+        match storage::Storage::open(&cfg.server.state_file) {
+            Ok(s) => {
+                info!("state storage: {}", cfg.server.state_file);
+                Some(s)
+            }
+            Err(e) => {
+                tracing::warn!("cannot open state file '{}': {e} (running without persistence)", cfg.server.state_file);
+                None
+            }
+        }
+    };
+
     let mut providers = Vec::new();
     for p in &cfg.providers {
-        let provider = providers::Provider::from_config(p)?;
+        let provider = providers::Provider::from_config(p, storage.as_ref())?;
         info!(
             "provider '{}' ({} keys, strategy {:?})",
             provider.name,
@@ -70,7 +86,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .route("/v1/models", get(proxy::list_models))
         .route("/healthz", get(|| async { "ok" }))
-        .with_state(state);
+        .with_state(state.clone());
+
+    // Periodic stats persistence.
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            for p in &state.router.providers {
+                p.pool.persist_stats();
+            }
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(&cfg.server.listen).await?;
     info!("anyhop listening on http://{}", cfg.server.listen);

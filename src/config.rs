@@ -31,6 +31,13 @@ pub struct ServerConfig {
     /// Timeout for a single upstream attempt.
     #[serde(default = "default_attempt_timeout_secs")]
     pub attempt_timeout_secs: u64,
+    /// redb state file (key health, OAuth tokens, stats). Empty = disabled.
+    #[serde(default = "default_state_file")]
+    pub state_file: String,
+}
+
+fn default_state_file() -> String {
+    "anyhop.redb".into()
 }
 
 fn default_listen() -> String {
