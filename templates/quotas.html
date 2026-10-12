@@ -1,0 +1,27 @@
+{% if quotas.is_empty() %}
+<div class="empty">Квоты появятся для antigravity-провайдеров</div>
+{% else %}
+{% for q in quotas %}
+<div class="provider">
+  <div class="provider-head">
+    <b>{{ q.provider }}</b>
+    <span class="badge">{{ q.account }}</span>
+  </div>
+  <table>
+    <tr><th>Model</th><th>Remaining</th><th>Reset</th></tr>
+    {% for m in q.models %}
+    <tr>
+      <td class="mono">{{ m.id }}</td>
+      <td>
+        {% if let Some(p) = m.pct %}
+        <div class="quota-bar"><div class="quota-fill{% if m.low %} quota-low{% endif %}" style="width: {{ p }}%"></div></div>
+        <span class="quota-pct">{{ p }}%</span>
+        {% else %}—{% endif %}
+      </td>
+      <td>{% if m.reset.is_empty() %}—{% else %}{{ m.reset }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endfor %}
+{% endif %}

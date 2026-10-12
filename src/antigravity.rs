@@ -289,12 +289,20 @@ impl Account {
     }
 }
 
-/// Fetch the account's available models from cloudcode (`:fetchAvailableModels`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelQuota {
+    pub id: String,
+    /// 0.0–1.0 remaining quota, when reported.
+    pub remaining_fraction: Option<f64>,
+    pub reset_time: Option<String>,
+}
+
+/// Fetch the account's available models (with quota info) from cloudcode.
 pub async fn fetch_available_models(
     http: &reqwest::Client,
     base_url: &str,
     access_token: &str,
-) -> Result<Vec<String>, AuthError> {
+) -> Result<Vec<ModelQuota>, AuthError> {
     let resp = http
         .post(format!("{base_url}/{API_VERSION}:fetchAvailableModels"))
         .bearer_auth(access_token)
@@ -315,16 +323,45 @@ pub async fn fetch_available_models(
     let v: Value = serde_json::from_str(&body)
         .map_err(|e| AuthError::Transient(format!("fetchAvailableModels: bad JSON: {e}")))?;
 
-    // Expected shape: {"models": {"<id>": {...}, ...}}; tolerate {"models": [{"name"|"id": ...}]}.
+    // Expected shape: {"models": {"<id>": {...quotaInfo...}, ...}};
+    // tolerate {"models": [{"name"|"id": ...}]}.
+    let quota_of = |m: &Value| -> (Option<f64>, Option<String>) {
+        let q = m.get("quotaInfo").or_else(|| m.get("quota"));
+        let frac = q
+            .and_then(|q| q.get("remainingFraction").or_else(|| q.get("remaining")))
+            .and_then(|f| f.as_f64().or_else(|| f.as_str().and_then(|s| s.parse().ok())));
+        let reset = q
+            .and_then(|q| q.get("resetTime").or_else(|| q.get("reset_time")))
+            .and_then(|r| r.as_str())
+            .map(str::to_string);
+        (frac, reset)
+    };
     let models = match v.get("models") {
-        Some(Value::Object(o)) => o.keys().cloned().collect(),
+        Some(Value::Object(o)) => o
+            .iter()
+            .map(|(id, m)| {
+                let (remaining_fraction, reset_time) = quota_of(m);
+                ModelQuota {
+                    id: id.clone(),
+                    remaining_fraction,
+                    reset_time,
+                }
+            })
+            .collect(),
         Some(Value::Array(a)) => a
             .iter()
             .filter_map(|m| {
-                m.get("name")
+                let id = m
+                    .get("name")
                     .or_else(|| m.get("id"))
                     .and_then(|n| n.as_str())
-                    .map(|s| s.trim_start_matches("models/").to_string())
+                    .map(|s| s.trim_start_matches("models/").to_string())?;
+                let (remaining_fraction, reset_time) = quota_of(m);
+                Some(ModelQuota {
+                    id,
+                    remaining_fraction,
+                    reset_time,
+                })
             })
             .collect(),
         _ => Vec::new(),

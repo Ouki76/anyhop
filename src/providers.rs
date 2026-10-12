@@ -39,6 +39,7 @@ pub struct Provider {
     /// Codex (ChatGPT) OAuth accounts.
     codex_accounts: Vec<Arc<crate::codex::CodexAccount>>,
     models_cache: Mutex<Option<(Instant, Vec<String>)>>,
+    quota_cache: Mutex<Option<(Instant, Vec<(String, Vec<antigravity::ModelQuota>)>)>>,
 }
 
 impl Provider {
@@ -136,6 +137,7 @@ impl Provider {
             ag_accounts,
             codex_accounts,
             models_cache: Mutex::new(None),
+            quota_cache: Mutex::new(None),
         })
     }
 
@@ -183,12 +185,44 @@ impl Provider {
         };
         match antigravity::fetch_available_models(acc.client(), &self.base_url, &token).await {
             Ok(list) if !list.is_empty() => {
+                let ids: Vec<String> = list.iter().map(|m| m.id.clone()).collect();
                 let mut cache = self.models_cache.lock().unwrap();
-                *cache = Some((Instant::now(), list.clone()));
-                list
+                *cache = Some((Instant::now(), ids.clone()));
+                ids
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Per-account model quotas (antigravity only), cached for 60s.
+    pub async fn quotas(&self) -> Vec<(String, Vec<antigravity::ModelQuota>)> {
+        if !matches!(self.kind, ProviderKind::Antigravity) {
+            return Vec::new();
+        }
+        {
+            let cache = self.quota_cache.lock().unwrap();
+            if let Some((ts, q)) = &*cache
+                && ts.elapsed() < Duration::from_secs(60)
+            {
+                return q.clone();
+            }
+        }
+        let mut out = Vec::new();
+        for acc in &self.ag_accounts {
+            let Ok(token) = acc.ensure_access_token().await else {
+                continue;
+            };
+            if let Ok(models) =
+                antigravity::fetch_available_models(acc.client(), &self.base_url, &token).await
+            {
+                out.push((acc.label(), models));
+            }
+        }
+        if !out.is_empty() {
+            let mut cache = self.quota_cache.lock().unwrap();
+            *cache = Some((Instant::now(), out.clone()));
+        }
+        out
     }
 }
 

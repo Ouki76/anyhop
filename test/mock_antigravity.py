@@ -45,8 +45,14 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({
                 "models": {
-                    "gemini-3-pro-high": {"displayName": "Gemini 3 Pro High"},
-                    "gemini-3-flash": {"displayName": "Gemini 3 Flash"},
+                    "gemini-3-pro-high": {
+                        "displayName": "Gemini 3 Pro High",
+                        "quotaInfo": {"remainingFraction": 0.73, "resetTime": "2026-10-13T00:00:00Z"},
+                    },
+                    "gemini-3-flash": {
+                        "displayName": "Gemini 3 Flash",
+                        "quotaInfo": {"remainingFraction": 0.05, "resetTime": "2026-10-13T00:00:00Z"},
+                    },
                 }
             }).encode())
             return

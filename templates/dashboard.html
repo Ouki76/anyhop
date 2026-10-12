@@ -72,6 +72,13 @@ h2 { font-size: 15px; margin: 24px 0 10px; color: var(--dim); font-weight: 600; 
   font-family: ui-monospace, monospace;
 }
 .input:focus { outline: none; border-color: var(--accent); }
+.quota-bar {
+  display: inline-block; width: 120px; height: 8px; vertical-align: middle;
+  background: #21262d; border-radius: 4px; overflow: hidden;
+}
+.quota-fill { height: 100%; background: var(--green); border-radius: 4px; }
+.quota-fill.quota-low { background: var(--red); }
+.quota-pct { margin-left: 8px; font-size: 12px; color: var(--dim); }
 </style>
 </head>
 <body>
@@ -82,6 +89,11 @@ h2 { font-size: 15px; margin: 24px 0 10px; color: var(--dim); font-weight: 600; 
 
 <div hx-get="/dashboard/partials/keys" hx-trigger="load, every 3s" hx-swap="innerHTML">
 {% include "keys_table.html" %}
+</div>
+
+<h2>Квоты аккаунтов</h2>
+<div hx-get="/dashboard/partials/quotas" hx-trigger="load, every 60s" hx-swap="innerHTML">
+  <div class="empty">Загрузка квот…</div>
 </div>
 
 <h2>Failover events (live)</h2>

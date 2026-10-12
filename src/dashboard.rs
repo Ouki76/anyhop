@@ -61,6 +61,54 @@ struct KeysTableTemplate {
     providers: Vec<ProviderView>,
 }
 
+struct QuotaModelView {
+    id: String,
+    pct: Option<u64>,
+    low: bool,
+    reset: String,
+}
+
+struct QuotaView {
+    provider: String,
+    account: String,
+    models: Vec<QuotaModelView>,
+}
+
+#[derive(Template)]
+#[template(path = "quotas.html")]
+struct QuotasTemplate {
+    quotas: Vec<QuotaView>,
+}
+
+pub async fn quotas_partial(State(state): State<Arc<AppState>>) -> Response {
+    let router = state.router.load();
+    let mut quotas = Vec::new();
+    for p in &router.providers {
+        for (account, models) in p.quotas().await {
+            quotas.push(QuotaView {
+                provider: p.name.clone(),
+                account,
+                models: models
+                    .into_iter()
+                    .map(|m| {
+                        let pct = m.remaining_fraction.map(|f| (f * 100.0).round() as u64);
+                        QuotaModelView {
+                            id: m.id,
+                            pct,
+                            low: pct.map(|p| p < 10).unwrap_or(false),
+                            reset: m.reset_time.unwrap_or_default(),
+                        }
+                    })
+                    .collect(),
+            });
+        }
+    }
+    match (QuotasTemplate { quotas }).render() {
+        Ok(html) => Html(html).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 pub async fn index(State(state): State<Arc<AppState>>) -> Response {
     let router = state.router.load();
     let tpl = DashboardTemplate {

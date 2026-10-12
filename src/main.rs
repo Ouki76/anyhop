@@ -169,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(|| async { axum::response::Redirect::to("/dashboard") }))
         .route("/dashboard", get(dashboard::index))
         .route("/dashboard/partials/keys", get(dashboard::keys_partial))
+        .route("/dashboard/partials/quotas", get(dashboard::quotas_partial))
         .route("/dashboard/events", get(dashboard::events_sse))
         .route("/dashboard/static/htmx.min.js", get(dashboard::htmx_js))
         .route("/dashboard/static/sse.js", get(dashboard::htmx_sse_js))
