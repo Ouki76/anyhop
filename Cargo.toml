@@ -29,6 +29,7 @@ arc-swap = "1.9.2"
 base64 = "0.23.1"
 rust-embed = { version = "8.13.0", optional = true }
 mime_guess = { version = "2.0.5", optional = true }
+memchr = "2.8.3"
 
 [features]
 default = ["dashboard"]

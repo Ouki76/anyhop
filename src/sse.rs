@@ -66,9 +66,7 @@ impl SseParser {
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    memchr::memmem::find(haystack, needle)
 }
 
 /// Serialize a JSON value as an SSE frame: `data: {...}\n\n`.

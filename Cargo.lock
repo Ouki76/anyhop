@@ -22,6 +22,7 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
+ "memchr",
  "mimalloc",
  "mime_guess",
  "redb",
