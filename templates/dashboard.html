@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>anyhop</title>
+<script src="/dashboard/static/htmx.min.js"></script>
+<script src="/dashboard/static/sse.js"></script>
+<style>
+:root {
+  --bg: #0d1117; --panel: #161b22; --border: #30363d;
+  --fg: #e6edf3; --dim: #8b949e;
+  --green: #3fb950; --yellow: #d29922; --red: #f85149; --accent: #58a6ff;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--fg);
+  font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding: 24px; max-width: 1100px; margin: 0 auto;
+}
+h1 { font-size: 22px; font-weight: 600; }
+h1 .dot { color: var(--accent); }
+.sub { color: var(--dim); font-size: 13px; margin-top: 2px; }
+header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; }
+.provider {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; margin-bottom: 16px; overflow: hidden;
+}
+.provider-head {
+  display: flex; gap: 10px; align-items: center;
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+}
+.provider-head b { font-size: 15px; }
+.badge {
+  font-size: 11px; padding: 2px 8px; border-radius: 10px;
+  background: #21262d; color: var(--dim); border: 1px solid var(--border);
+}
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 16px; font-size: 13px; }
+th { color: var(--dim); font-weight: 500; border-bottom: 1px solid var(--border); }
+tr + tr td { border-top: 1px solid #21262d; }
+td.mono { font-family: ui-monospace, "SF Mono", monospace; }
+.chip {
+  display: inline-block; font-size: 11px; font-weight: 600;
+  padding: 2px 10px; border-radius: 10px;
+}
+.chip-active   { color: var(--green);  background: rgba(63,185,80,.12); }
+.chip-cooldown { color: var(--yellow); background: rgba(210,153,34,.12); }
+.chip-dead     { color: var(--red);    background: rgba(248,81,73,.12); }
+h2 { font-size: 15px; margin: 24px 0 10px; color: var(--dim); font-weight: 600; }
+#events {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 8px 16px; min-height: 60px;
+  font-family: ui-monospace, "SF Mono", monospace; font-size: 12.5px;
+}
+.ev { padding: 4px 0; border-bottom: 1px solid #21262d; }
+.ev:last-child { border-bottom: none; }
+.ev-ts { color: var(--dim); margin-right: 8px; }
+.ev-warn { color: var(--yellow); }
+.ev-err  { color: var(--red); }
+.ev-info { color: var(--dim); }
+.empty { color: var(--dim); padding: 12px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>anyhop<span class="dot">.</span></h1>
+  <span class="sub">LLM gateway · key rotation · failover</span>
+</header>
+
+<div hx-get="/dashboard/partials/keys" hx-trigger="load, every 3s" hx-swap="innerHTML">
+{% include "keys_table.html" %}
+</div>
+
+<h2>Failover events (live)</h2>
+<div id="events" hx-ext="sse" sse-connect="/dashboard/events" sse-swap="message" hx-swap="afterbegin">
+  <div class="empty">Ожидание событий…</div>
+</div>
+</body>
+</html>

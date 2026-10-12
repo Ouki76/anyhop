@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::Strategy;
+use crate::events::DashEvent;
 use crate::storage::{HealthRecord, StatsRecord, Storage};
 
 pub const STATUS_ACTIVE: u8 = 0;
@@ -109,14 +110,17 @@ pub struct KeyPool {
     keys: Vec<Arc<KeyState>>,
     cursor: AtomicUsize,
     storage: Option<Storage>,
+    events: Option<tokio::sync::broadcast::Sender<DashEvent>>,
 }
 
 impl KeyPool {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         secrets: Vec<String>,
         strategy: Strategy,
         storage: Option<Storage>,
+        events: Option<tokio::sync::broadcast::Sender<DashEvent>>,
     ) -> Self {
         let pool = Self {
             name,
@@ -124,9 +128,16 @@ impl KeyPool {
             keys: secrets.into_iter().map(|s| Arc::new(KeyState::new(s))).collect(),
             cursor: AtomicUsize::new(0),
             storage,
+            events,
         };
         pool.restore();
         pool
+    }
+
+    fn emit(&self, key: &KeyState, kind: &'static str, detail: String) {
+        if let Some(tx) = &self.events {
+            let _ = tx.send(DashEvent::new(&self.name, &key.masked(), kind, detail));
+        }
     }
 
     /// Restore health and stats persisted from previous runs.
@@ -232,20 +243,24 @@ impl KeyPool {
         match kind {
             FailKind::Auth => {
                 key.status.store(STATUS_DEAD, Ordering::Relaxed);
+                self.emit(key, "dead", "auth rejected, key disabled".into());
             }
             FailKind::RateLimited { retry_after_secs } => {
                 // Rate limit is a quota signal, not instability — no exponential backoff.
                 key.consecutive_failures.store(0, Ordering::Relaxed);
-                key.set_cooldown(
-                    retry_after_secs
-                        .map(Duration::from_secs)
-                        .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN),
-                );
+                let d = retry_after_secs
+                    .map(Duration::from_secs)
+                    .unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN)
+                    .min(MAX_COOLDOWN);
+                key.set_cooldown(d);
+                self.emit(key, "rate_limited", format!("cooldown {}s", d.as_secs()));
             }
             FailKind::Server | FailKind::Network => {
                 let n = key.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
                 let shift = (n - 1).min(6) as u32;
-                key.set_cooldown(BASE_BACKOFF * 2u32.pow(shift));
+                let d = (BASE_BACKOFF * 2u32.pow(shift)).min(MAX_COOLDOWN);
+                key.set_cooldown(d);
+                self.emit(key, "backoff", format!("cooldown {}s", d.as_secs()));
             }
         }
         self.persist_health(key);

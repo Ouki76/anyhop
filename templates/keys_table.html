@@ -1,0 +1,22 @@
+{% for p in providers %}
+<div class="provider">
+  <div class="provider-head">
+    <b>{{ p.name }}</b>
+    <span class="badge">{{ p.kind }}</span>
+    <span class="badge">{{ p.strategy }}</span>
+    <span class="badge">{{ p.base_url }}</span>
+  </div>
+  <table>
+    <tr><th>Key</th><th>Status</th><th>Cooldown</th><th>Requests</th><th>Failures</th></tr>
+    {% for k in p.keys %}
+    <tr>
+      <td class="mono">{{ k.masked }}</td>
+      <td><span class="chip chip-{{ k.status }}">{{ k.status }}</span></td>
+      <td>{% if k.cooldown_remaining_secs > 0 %}{{ k.cooldown_remaining_secs }}s{% else %}—{% endif %}</td>
+      <td>{{ k.requests }}</td>
+      <td>{{ k.failures }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endfor %}

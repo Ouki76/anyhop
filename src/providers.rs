@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::antigravity::{self, Account};
 use crate::config::{ProviderConfig, ProviderKind};
+use crate::events::DashEvent;
 use crate::pool::KeyPool;
 use crate::storage::Storage;
 
@@ -11,6 +12,7 @@ const MODELS_CACHE_TTL: Duration = Duration::from_secs(600);
 pub struct Provider {
     pub name: String,
     pub kind: ProviderKind,
+    pub strategy: crate::config::Strategy,
     pub base_url: String,
     pub pool: KeyPool,
     pub models: Vec<String>,
@@ -22,7 +24,11 @@ pub struct Provider {
 }
 
 impl Provider {
-    pub fn from_config(cfg: &ProviderConfig, storage: Option<&Storage>) -> anyhow::Result<Self> {
+    pub fn from_config(
+        cfg: &ProviderConfig,
+        storage: Option<&Storage>,
+        events: Option<&tokio::sync::broadcast::Sender<DashEvent>>,
+    ) -> anyhow::Result<Self> {
         let base_url = cfg.base_url.trim_end_matches('/').to_string();
         let (secrets, ag_accounts) = match cfg.kind {
             ProviderKind::OpenaiCompat | ProviderKind::Gemini => {
@@ -63,8 +69,15 @@ impl Provider {
         Ok(Self {
             name: cfg.name.clone(),
             kind: cfg.kind,
+            strategy: cfg.strategy,
             base_url,
-            pool: KeyPool::new(cfg.name.clone(), secrets, cfg.strategy, storage.cloned()),
+            pool: KeyPool::new(
+                cfg.name.clone(),
+                secrets,
+                cfg.strategy,
+                storage.cloned(),
+                events.cloned(),
+            ),
             models: cfg.models.clone(),
             extra_headers: cfg
                 .headers

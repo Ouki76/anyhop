@@ -20,6 +20,7 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub max_retries: usize,
     pub attempt_timeout: Duration,
+    pub events: tokio::sync::broadcast::Sender<crate::events::DashEvent>,
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>, ty: &str) -> Response {

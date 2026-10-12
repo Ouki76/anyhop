@@ -1,5 +1,7 @@
 mod antigravity;
 mod config;
+mod dashboard;
+mod events;
 mod gemini;
 mod pool;
 mod storage;
@@ -57,9 +59,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let (events_tx, _) = tokio::sync::broadcast::channel::<events::DashEvent>(256);
+
     let mut providers = Vec::new();
     for p in &cfg.providers {
-        let provider = providers::Provider::from_config(p, storage.as_ref())?;
+        let provider = providers::Provider::from_config(p, storage.as_ref(), Some(&events_tx))?;
         info!(
             "provider '{}' ({} keys, strategy {:?})",
             provider.name,
@@ -80,12 +84,19 @@ async fn main() -> anyhow::Result<()> {
         http,
         max_retries: cfg.server.max_retries,
         attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),
+        events: events_tx,
     });
 
     let app = axum::Router::new()
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .route("/v1/models", get(proxy::list_models))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/", get(|| async { axum::response::Redirect::to("/dashboard") }))
+        .route("/dashboard", get(dashboard::index))
+        .route("/dashboard/partials/keys", get(dashboard::keys_partial))
+        .route("/dashboard/events", get(dashboard::events_sse))
+        .route("/dashboard/static/htmx.min.js", get(dashboard::htmx_js))
+        .route("/dashboard/static/sse.js", get(dashboard::htmx_sse_js))
         .with_state(state.clone());
 
     // Periodic stats persistence.
