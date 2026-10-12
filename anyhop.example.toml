@@ -1,0 +1,24 @@
+[server]
+listen = "127.0.0.1:8080"
+max_retries = 4
+attempt_timeout_secs = 120
+
+# OpenAI-compatible provider (OpenRouter, DeepSeek, Groq, CatRouter, ...)
+[[providers]]
+name = "openrouter"
+type = "openai_compat"
+base_url = "https://openrouter.ai/v1"
+strategy = "round_robin" # round_robin | least_used | fill_first
+keys = ["sk-or-xxx", "sk-or-yyy"]
+models = ["openai/gpt-4o-mini", "deepseek/deepseek-chat"]
+# [providers.headers]
+# HTTP-Referer = "https://your-site.example"
+
+# Gemini — скоро (step 2)
+# [[providers]]
+# name = "gemini"
+# type = "gemini"
+# base_url = "https://generativelanguage.googleapis.com/v1beta"
+# strategy = "fill_first" # дожимаем дневную квоту ключа, потом следующий
+# keys = ["AIza...", "AIza..."]
+# models = ["gemini-2.5-flash"]

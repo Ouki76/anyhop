@@ -1,0 +1,12 @@
+[server]
+listen = "127.0.0.1:18080"
+max_retries = 4
+attempt_timeout_secs = 10
+
+[[providers]]
+name = "mock"
+type = "openai_compat"
+base_url = "http://127.0.0.1:9100/v1"
+strategy = "round_robin"
+keys = ["good-key-1", "bad-429", "bad-401", "good-key-2"]
+models = ["test-model"]
