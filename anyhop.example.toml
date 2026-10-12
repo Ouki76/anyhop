@@ -4,6 +4,8 @@ max_retries = 4
 attempt_timeout_secs = 120
 # Глобальный прокси для всех апстримов (переопределяется per-provider/per-account):
 # proxy = "socks5://user:pass@127.0.0.1:1080"
+# Входящая авторизация: клиенты обязаны слать Authorization: Bearer <api_key>
+# api_key = "sk-anyhop-change-me"
 
 # OpenAI-compatible provider (OpenRouter, DeepSeek, Groq, CatRouter, ...)
 [[providers]]
@@ -13,6 +15,8 @@ base_url = "https://openrouter.ai/v1"
 strategy = "round_robin" # round_robin | least_used | fill_first
 keys = ["sk-or-xxx", "sk-or-yyy"]
 models = ["openai/gpt-4o-mini", "deepseek/deepseek-chat"]
+# max_concurrent = 5      # лимит одновременных запросов на ключ (0 = без лимита)
+# drain_below_pct = 10    # проактивный кулдаун ключа, когда осталось <10% лимита
 # [providers.headers]
 # HTTP-Referer = "https://your-site.example"
 
@@ -38,3 +42,8 @@ models = ["openai/gpt-4o-mini", "deepseek/deepseek-chat"]
 # refresh_token = "1//..."
 # project_id = "..."           # опционально, резолвится автоматически
 # proxy = "http://1.2.3.4:3128"  # опционально: свой прокси для этого аккаунта
+
+# Combos — виртуальные модели с fallback-цепочкой между провайдерами:
+# [[combos]]
+# name = "flash"
+# chain = ["antigravity/gemini-3-flash", "gemini/gemini-2.5-flash", "openrouter/deepseek-chat"]

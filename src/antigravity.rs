@@ -377,6 +377,71 @@ pub fn endpoint(base_url: &str, stream: bool) -> String {
     }
 }
 
+/// Parse Google's 429 error details for the exact quota reset time (unix ms).
+/// Handles RetryInfo.retryDelay ("123s") and quotaResetTimeStamp (RFC3339).
+pub fn parse_quota_reset_ms(body: &str) -> Option<u64> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let details = v.pointer("/error/details")?.as_array()?;
+    let mut until: Option<u64> = None;
+    for d in details {
+        if let Some(rd) = d.get("retryDelay").and_then(|s| s.as_str())
+            && let Some(secs) = rd.strip_suffix('s').and_then(|s| s.parse::<f64>().ok())
+        {
+            until = Some(now_ms() + (secs * 1000.0) as u64);
+        }
+        if let Some(ts) = d.get("quotaResetTimeStamp").and_then(|s| s.as_str())
+            && let Some(ms) = parse_rfc3339_ms(ts)
+        {
+            until = Some(until.map_or(ms, |u: u64| u.max(ms)));
+        }
+    }
+    until
+}
+
+/// Minimal RFC3339 ("YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]") → unix ms.
+fn parse_rfc3339_ms(s: &str) -> Option<u64> {
+    let (date, rest) = s.split_once('T')?;
+    let mut dp = date.split('-');
+    let y: i64 = dp.next()?.parse().ok()?;
+    let mo: i64 = dp.next()?.parse().ok()?;
+    let d: i64 = dp.next()?.parse().ok()?;
+    let (time, off) = match rest.find(['Z', '+']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => match rest.rfind('-') {
+            Some(i) if i > 6 => (&rest[..i], &rest[i..]),
+            _ => (rest, "Z"),
+        },
+    };
+    let time = time.split('.').next()?;
+    let mut tp = time.split(':');
+    let h: i64 = tp.next()?.parse().ok()?;
+    let mi: i64 = tp.next()?.parse().ok()?;
+    let sec: i64 = tp.next()?.parse().ok()?;
+    let off_secs: i64 = if off == "Z" || off.is_empty() {
+        0
+    } else {
+        let sign = if off.starts_with('-') { -1 } else { 1 };
+        let o = &off[1..];
+        let mut op = o.split(':');
+        let oh: i64 = op.next()?.parse().ok()?;
+        let om: i64 = op.next().unwrap_or("0").parse().ok()?;
+        sign * (oh * 3600 + om * 60)
+    };
+    let days = days_from_civil(y, mo, d);
+    let secs = days * 86400 + h * 3600 + mi * 60 + sec - off_secs;
+    Some(secs.max(0) as u64 * 1000)
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
 /// Unwrap the v1internal `{"response": {...}}` envelope if present.
 pub fn unwrap_response(v: Value) -> Value {
     match v.get("response") {

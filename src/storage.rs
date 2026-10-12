@@ -38,6 +38,10 @@ pub struct OAuthRecord {
 pub struct StatsRecord {
     pub requests: u64,
     pub failures: u64,
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
 }
 
 #[derive(Debug, Clone)]

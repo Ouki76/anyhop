@@ -26,6 +26,21 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"error":{"message":"invalid key"}}')
             return
+        if "drain-key" in auth:
+            # Почти исчерпанный лимит: 1/100, сброс через 2с
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("x-ratelimit-remaining-requests", "1")
+            self.send_header("x-ratelimit-limit-requests", "100")
+            self.send_header("x-ratelimit-reset-requests", "2s")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "id": "chatcmpl-mock", "object": "chat.completion",
+                "model": body.get("model"),
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "drain ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            }).encode())
+            return
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()

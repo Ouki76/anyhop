@@ -27,6 +27,7 @@ pub struct Provider {
     pub name: String,
     pub kind: ProviderKind,
     pub strategy: crate::config::Strategy,
+    pub drain_below_pct: u32,
     pub base_url: String,
     pub client: reqwest::Client,
     pub pool: KeyPool,
@@ -92,12 +93,14 @@ impl Provider {
             name: cfg.name.clone(),
             kind: cfg.kind,
             strategy: cfg.strategy,
+            drain_below_pct: cfg.drain_below_pct,
             base_url,
             client: build_http_client(effective_proxy)?,
             pool: KeyPool::new(
                 cfg.name.clone(),
                 secrets,
                 cfg.strategy,
+                cfg.max_concurrent,
                 storage.cloned(),
                 events.cloned(),
             ),
@@ -137,7 +140,7 @@ impl Provider {
                 return list.clone();
             }
         }
-        let Some(key) = self.pool.pick() else {
+        let Some(key) = self.pool.pick("") else {
             return Vec::new();
         };
         let Some(acc) = self.ag_account(&key.secret) else {
@@ -160,13 +163,35 @@ impl Provider {
 /// Resolves incoming model names to providers.
 pub struct ProviderRouter {
     pub providers: Vec<Provider>,
+    pub combos: Vec<crate::config::ComboConfig>,
+}
+
+pub enum Resolved<'a> {
+    One(&'a Provider, String),
+    /// Ordered fallback chain of (provider, upstream_model).
+    Chain(Vec<(&'a Provider, String)>),
 }
 
 impl ProviderRouter {
+    pub fn resolve<'a>(&'a self, model: &str) -> Option<Resolved<'a>> {
+        let combo_name = model.strip_prefix("combo/").unwrap_or(model);
+        if let Some(c) = self.combos.iter().find(|c| c.name == combo_name) {
+            let chain: Vec<_> = c
+                .chain
+                .iter()
+                .filter_map(|m| self.resolve_single(m))
+                .collect();
+            if !chain.is_empty() {
+                return Some(Resolved::Chain(chain));
+            }
+        }
+        self.resolve_single(model).map(|(p, m)| Resolved::One(p, m))
+    }
+
     /// `model` may be "provider/upstream-model" (explicit) or a bare model name
     /// matched against each provider's model list (empty list = wildcard).
-    /// Returns (provider, upstream_model_name).
-    pub fn resolve<'a>(&'a self, model: &str) -> Option<(&'a Provider, String)> {
+    /// Explicit model lists take priority over wildcard providers.
+    fn resolve_single<'a>(&'a self, model: &str) -> Option<(&'a Provider, String)> {
         if let Some((prefix, rest)) = model.split_once('/')
             && let Some(p) = self.providers.iter().find(|p| p.name == prefix)
         {
@@ -174,7 +199,8 @@ impl ProviderRouter {
         }
         self.providers
             .iter()
-            .find(|p| p.models.is_empty() || p.models.iter().any(|m| m == model))
+            .find(|p| p.models.iter().any(|m| m == model))
+            .or_else(|| self.providers.iter().find(|p| p.models.is_empty()))
             .map(|p| (p, model.to_string()))
     }
 }

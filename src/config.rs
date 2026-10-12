@@ -9,6 +9,17 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    #[serde(default)]
+    pub combos: Vec<ComboConfig>,
+}
+
+/// A virtual model: ordered fallback chain across providers.
+/// Referenced as the combo name (or `combo/<name>`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComboConfig {
+    pub name: String,
+    /// Entries like "provider/model".
+    pub chain: Vec<String>,
 }
 
 impl Config {
@@ -39,6 +50,9 @@ pub struct ServerConfig {
     /// Global upstream proxy (http/https/socks5). Overridden per provider/account.
     #[serde(default)]
     pub proxy: Option<String>,
+    /// If set, /v1/* endpoints require `Authorization: Bearer <api_key>`.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 fn default_state_file() -> String {
@@ -53,6 +67,7 @@ impl Default for ServerConfig {
             attempt_timeout_secs: default_attempt_timeout_secs(),
             state_file: default_state_file(),
             proxy: None,
+            api_key: None,
         }
     }
 }
@@ -91,6 +106,13 @@ pub struct ProviderConfig {
     /// Upstream proxy: http://, https://, socks5://, socks5h://.
     #[serde(default)]
     pub proxy: Option<String>,
+    /// Max concurrent in-flight requests per key (0 = unlimited).
+    #[serde(default)]
+    pub max_concurrent: u32,
+    /// Proactively cool a key down when remaining requests fall below this %% of the limit
+    /// (OpenAI-compat rate-limit headers). 0 = disabled.
+    #[serde(default)]
+    pub drain_below_pct: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

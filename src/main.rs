@@ -11,9 +11,38 @@ mod proxy;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::{Request, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{get, post};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+/// Gateway auth: /v1/* requires Bearer <api_key> when configured.
+async fn require_api_key(
+    State(state): State<Arc<proxy::AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(expected) = &state.api_key {
+        let ok = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|t| t == expected)
+            .unwrap_or(false);
+        if !ok {
+            return proxy::error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid or missing gateway API key",
+                "authentication_error",
+            );
+        }
+    }
+    next.run(req).await
+}
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -82,16 +111,34 @@ async fn main() -> anyhow::Result<()> {
         providers.push(provider);
     }
 
+    for c in &cfg.combos {
+        info!("combo '{}' ({} targets)", c.name, c.chain.len());
+    }
+    if cfg.server.api_key.is_some() {
+        info!("gateway API key auth enabled for /v1/*");
+    }
+
     let state = Arc::new(proxy::AppState {
-        router: providers::ProviderRouter { providers },
+        router: providers::ProviderRouter {
+            providers,
+            combos: cfg.combos.clone(),
+        },
         max_retries: cfg.server.max_retries,
         attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),
+        api_key: cfg.server.api_key.clone(),
         events: events_tx,
     });
 
-    let app = axum::Router::new()
+    let api = axum::Router::new()
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .route("/v1/models", get(proxy::list_models))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_key,
+        ));
+
+    let app = axum::Router::new()
+        .merge(api)
         .route("/healthz", get(|| async { "ok" }))
         .route("/", get(|| async { axum::response::Redirect::to("/dashboard") }))
         .route("/dashboard", get(dashboard::index))

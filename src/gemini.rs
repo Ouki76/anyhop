@@ -296,6 +296,18 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
 
 // ---------- response translation (Gemini -> OpenAI) ----------
 
+/// (prompt_tokens, completion_tokens) from a Gemini usageMetadata container.
+pub fn usage_pair(v: &Value) -> (u64, u64) {
+    let um = match v.get("usageMetadata") {
+        Some(um) => um,
+        None => return (0, 0),
+    };
+    (
+        um.get("promptTokenCount").and_then(|x| x.as_u64()).unwrap_or(0),
+        um.get("candidatesTokenCount").and_then(|x| x.as_u64()).unwrap_or(0),
+    )
+}
+
 fn usage_of(v: &Value) -> Value {
     let um = v.get("usageMetadata").cloned().unwrap_or(json!({}));
     let get = |k: &str| um.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
@@ -440,6 +452,7 @@ pub fn translate_sse_stream(
     resp: reqwest::Response,
     model: &str,
     envelope: bool,
+    stats: Option<std::sync::Arc<crate::pool::KeyState>>,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
     struct State {
         inner: std::pin::Pin<
@@ -448,6 +461,7 @@ pub fn translate_sse_stream(
         buf: String,
         eof: bool,
         sent_done: bool,
+        stats: Option<std::sync::Arc<crate::pool::KeyState>>,
         st: SseState,
     }
 
@@ -456,6 +470,7 @@ pub fn translate_sse_stream(
         buf: String::new(),
         eof: false,
         sent_done: false,
+        stats,
         st: SseState {
             id: gen_id(),
             created: now_secs(),
@@ -481,6 +496,13 @@ pub fn translate_sse_stream(
                     continue;
                 };
                 let v = if envelope { crate::antigravity::unwrap_response(v) } else { v };
+                if let Some(k) = &s.stats {
+                    let (p, c) = usage_pair(&v);
+                    if p > 0 || c > 0 {
+                        k.prompt_tokens.fetch_add(p, std::sync::atomic::Ordering::Relaxed);
+                        k.completion_tokens.fetch_add(c, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 let chunk = translate_chunk(&v, &mut s.st);
                 return Some((Ok(Bytes::from(format!("data: {chunk}\n\n"))), s));
             }

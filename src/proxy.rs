@@ -2,27 +2,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
+use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::antigravity::{self, AuthError};
 use crate::config::ProviderKind;
 use crate::gemini;
-use crate::pool::FailKind;
-use crate::providers::{Provider, ProviderRouter};
+use crate::pool::{FailKind, KeyState};
+use crate::providers::{Provider, ProviderRouter, Resolved};
 
 pub struct AppState {
     pub router: ProviderRouter,
     pub max_retries: usize,
     pub attempt_timeout: Duration,
+    pub api_key: Option<String>,
     pub events: tokio::sync::broadcast::Sender<crate::events::DashEvent>,
 }
 
-fn error_response(status: StatusCode, message: impl Into<String>, ty: &str) -> Response {
+pub fn error_response(status: StatusCode, message: impl Into<String>, ty: &str) -> Response {
     let body = serde_json::json!({
         "error": {
             "message": message.into(),
@@ -44,14 +46,21 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
             }));
         }
     }
+    for c in &state.router.combos {
+        data.push(serde_json::json!({
+            "id": c.name,
+            "object": "model",
+            "owned_by": "combo",
+        }));
+    }
     Json(serde_json::json!({ "object": "list", "data": data })).into_response()
 }
 
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    body: axum::body::Bytes,
+    body: Bytes,
 ) -> Response {
-    let mut payload: serde_json::Value = match serde_json::from_slice(&body) {
+    let payload: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             return error_response(
@@ -74,40 +83,91 @@ pub async fn chat_completions(
         );
     };
 
-    let Some((provider, upstream_model)) = state.router.resolve(&model) else {
+    let Some(resolved) = state.router.resolve(&model) else {
         return error_response(
             StatusCode::NOT_FOUND,
             format!("no provider serves model '{model}'"),
             "model_not_found",
         );
     };
-    payload["model"] = serde_json::Value::String(upstream_model.clone());
 
     let is_stream = payload
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    match resolved {
+        Resolved::One(provider, upstream_model) => {
+            match run_target(&state, provider, &upstream_model, &payload, is_stream).await {
+                Some(resp) => resp,
+                None => exhausted_response(&provider.name, state.max_retries),
+            }
+        }
+        Resolved::Chain(chain) => {
+            let total = chain.len();
+            for (i, (provider, upstream_model)) in chain.iter().enumerate() {
+                if let Some(resp) =
+                    run_target(&state, provider, upstream_model, &payload, is_stream).await
+                {
+                    if i > 0 {
+                        info!(combo = %model, fallback = i + 1, of = total, "combo fallback succeeded");
+                    }
+                    return resp;
+                }
+                let _ = state.events.send(crate::events::DashEvent::new(
+                    "combo",
+                    &model,
+                    "backoff",
+                    format!("target '{}/{}' exhausted, trying next", provider.name, upstream_model),
+                ));
+            }
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("combo '{model}': all {total} targets exhausted"),
+                "provider_unavailable",
+            )
+        }
+    }
+}
+
+fn exhausted_response(provider: &str, attempts: usize) -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("provider '{provider}' unavailable after {attempts} attempts"),
+        "provider_unavailable",
+    )
+}
+
+/// Run the retry loop for one provider/model target.
+/// Some(resp) = definitive answer (success or client error), None = try next target.
+async fn run_target(
+    state: &AppState,
+    provider: &Provider,
+    model: &str,
+    payload: &Value,
+    is_stream: bool,
+) -> Option<Response> {
     // Gemini-family payloads are translated once, before the retry loop
-    // (the antigravity envelope additionally needs a per-account project id,
-    // so only the inner Gemini body is prebuilt here).
+    // (the antigravity envelope additionally needs a per-account project id).
     let gemini_body = if matches!(provider.kind, ProviderKind::Gemini | ProviderKind::Antigravity) {
-        match gemini::translate_request(&payload) {
+        match gemini::translate_request(payload) {
             Ok(b) => Some(b),
             Err(e) => {
-                return error_response(StatusCode::BAD_REQUEST, e, "invalid_request_error");
+                return Some(error_response(StatusCode::BAD_REQUEST, e, "invalid_request_error"));
             }
         }
     } else {
         None
     };
 
-    let mut last_err: Option<(StatusCode, String)> = None;
-
     for _ in 0..state.max_retries.max(1) {
-        let Some(key) = provider.pool.pick() else {
-            warn!(provider = %provider.name, model = %upstream_model, "no available keys (all cooling down or dead)");
+        let Some(key) = provider.pool.pick(model) else {
+            warn!(provider = %provider.name, model, "no available keys (all busy/cooling down/dead)");
             break;
+        };
+        let Some(guard) = key.try_acquire() else {
+            // Saturated — try another key without penalizing this one.
+            continue;
         };
 
         let mut req = match provider.kind {
@@ -115,15 +175,15 @@ pub async fn chat_completions(
                 .client
                 .post(format!("{}/chat/completions", provider.base_url))
                 .bearer_auth(&key.secret)
-                .json(&payload),
+                .json(payload),
             ProviderKind::Gemini => provider
                 .client
-                .post(gemini::endpoint(&provider.base_url, &upstream_model, is_stream))
+                .post(gemini::endpoint(&provider.base_url, model, is_stream))
                 .header("x-goog-api-key", &key.secret)
                 .json(gemini_body.as_ref().expect("gemini body")),
             ProviderKind::Antigravity => {
                 let Some(account) = provider.ag_account(&key.secret) else {
-                    provider.pool.report_failure(&key, FailKind::Auth);
+                    provider.pool.report_failure(&key, FailKind::Auth, model);
                     continue;
                 };
                 let token = match account.ensure_access_token().await {
@@ -134,8 +194,7 @@ pub async fn chat_completions(
                             AuthError::Transient(_) => FailKind::Network,
                         };
                         warn!(provider = %provider.name, account = %account.label(), error = %e, "token refresh failed");
-                        provider.pool.report_failure(&key, kind);
-                        last_err = Some((StatusCode::UNAUTHORIZED, e.to_string()));
+                        provider.pool.report_failure(&key, kind, model);
                         continue;
                     }
                 };
@@ -147,20 +206,20 @@ pub async fn chat_completions(
                             AuthError::Transient(_) => FailKind::Network,
                         };
                         warn!(provider = %provider.name, account = %account.label(), error = %e, "project resolution failed");
-                        provider.pool.report_failure(&key, kind);
-                        last_err = Some((StatusCode::BAD_GATEWAY, e.to_string()));
+                        provider.pool.report_failure(&key, kind, model);
                         continue;
                     }
                 };
                 let inner = gemini_body.as_ref().expect("gemini body").clone();
-                let envelope = match antigravity::translate_request_envelope(
-                    &upstream_model,
-                    inner,
-                    &project,
-                ) {
+                let envelope = match antigravity::translate_request_envelope(model, inner, &project)
+                {
                     Ok(v) => v,
                     Err(e) => {
-                        return error_response(StatusCode::BAD_REQUEST, e, "invalid_request_error");
+                        return Some(error_response(
+                            StatusCode::BAD_REQUEST,
+                            e,
+                            "invalid_request_error",
+                        ));
                     }
                 };
                 account
@@ -178,15 +237,13 @@ pub async fn chat_completions(
         let result = tokio::time::timeout(state.attempt_timeout, req.send()).await;
         let resp = match result {
             Err(_) => {
-                provider.pool.report_failure(&key, FailKind::Network);
+                provider.pool.report_failure(&key, FailKind::Network, model);
                 warn!(provider = %provider.name, key = %key.masked(), "attempt timed out");
-                last_err = Some((StatusCode::GATEWAY_TIMEOUT, "upstream timeout".into()));
                 continue;
             }
             Ok(Err(e)) => {
-                provider.pool.report_failure(&key, FailKind::Network);
+                provider.pool.report_failure(&key, FailKind::Network, model);
                 warn!(provider = %provider.name, key = %key.masked(), error = %e, "network error");
-                last_err = Some((StatusCode::BAD_GATEWAY, format!("upstream network error: {e}")));
                 continue;
             }
             Ok(Ok(resp)) => resp,
@@ -195,40 +252,13 @@ pub async fn chat_completions(
         let status = resp.status();
         if status.is_success() {
             provider.pool.report_success(&key);
-            info!(provider = %provider.name, key = %key.masked(), model = %upstream_model, "ok");
-            return match provider.kind {
-                ProviderKind::OpenaiCompat => stream_upstream(resp),
-                ProviderKind::Gemini | ProviderKind::Antigravity => {
-                    let envelope = matches!(provider.kind, ProviderKind::Antigravity);
-                    if is_stream {
-                        let stream = gemini::translate_sse_stream(resp, &upstream_model, envelope);
-                        Response::builder()
-                            .status(StatusCode::OK)
-                            .header(header::CONTENT_TYPE, "text/event-stream")
-                            .header(header::CACHE_CONTROL, "no-cache")
-                            .body(Body::from_stream(stream))
-                            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-                    } else {
-                        match resp.json::<serde_json::Value>().await {
-                            Ok(v) => {
-                                let v = if envelope {
-                                    antigravity::unwrap_response(v)
-                                } else {
-                                    v
-                                };
-                                Json(gemini::translate_response(&upstream_model, &v))
-                                    .into_response()
-                            }
-                            Err(e) => error_response(
-                                StatusCode::BAD_GATEWAY,
-                                format!("invalid upstream JSON: {e}"),
-                                "upstream_error",
-                            ),
-                        }
-                    }
-                }
-            };
+            info!(provider = %provider.name, key = %key.masked(), model, "ok");
+            if provider.drain_below_pct > 0 {
+                check_drain_headers(provider, &key, &resp);
+            }
+            return Some(success_response(provider, model, resp, is_stream, key, guard).await);
         }
+        drop(guard);
 
         let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let retry_after_secs = resp
@@ -241,54 +271,197 @@ pub async fn chat_completions(
 
         match status.as_u16() {
             429 => {
-                provider
-                    .pool
-                    .report_failure(&key, FailKind::RateLimited { retry_after_secs });
-                warn!(provider = %provider.name, key = %key.masked(), retry_after = ?retry_after_secs, "rate limited, key on cooldown");
+                // Antigravity quotas are per-model: parse exact reset time.
+                if matches!(provider.kind, ProviderKind::Antigravity)
+                    && let Some(until_ms) = antigravity::parse_quota_reset_ms(&text)
+                {
+                    provider
+                        .pool
+                        .report_failure(&key, FailKind::ModelQuota { until_ms }, model);
+                    warn!(provider = %provider.name, key = %key.masked(), model, "model quota exhausted");
+                } else {
+                    provider
+                        .pool
+                        .report_failure(&key, FailKind::RateLimited { retry_after_secs }, model);
+                    warn!(provider = %provider.name, key = %key.masked(), retry_after = ?retry_after_secs, "rate limited, key on cooldown");
+                }
             }
             401 | 403 => {
-                provider.pool.report_failure(&key, FailKind::Auth);
+                provider.pool.report_failure(&key, FailKind::Auth, model);
                 warn!(provider = %provider.name, key = %key.masked(), "auth failed, key marked dead");
             }
             // Gemini returns 400 INVALID_ARGUMENT for invalid API keys.
             400 if matches!(provider.kind, ProviderKind::Gemini)
                 && snippet.contains("API key not valid") =>
             {
-                provider.pool.report_failure(&key, FailKind::Auth);
+                provider.pool.report_failure(&key, FailKind::Auth, model);
                 warn!(provider = %provider.name, key = %key.masked(), "gemini key invalid, marked dead");
             }
             s if s >= 500 => {
-                provider.pool.report_failure(&key, FailKind::Server);
+                provider.pool.report_failure(&key, FailKind::Server, model);
                 warn!(provider = %provider.name, key = %key.masked(), status = s, "upstream 5xx, key on cooldown");
             }
             _ => {
                 // Client error (400 etc.) — not the key's fault, pass through as-is.
                 info!(provider = %provider.name, key = %key.masked(), status = %status.as_u16(), "upstream 4xx, passing through");
-                return error_response(status, snippet, "upstream_error");
+                return Some(error_response(status, snippet, "upstream_error"));
             }
         }
-        last_err = Some((status, snippet));
     }
+    None
+}
 
-    let (code, detail) = last_err.unwrap_or((StatusCode::SERVICE_UNAVAILABLE, String::new()));
-    error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        format!(
-            "provider '{}' unavailable after {} attempts (last upstream status {}): {}",
-            provider.name,
-            state.max_retries,
-            code.as_u16(),
-            detail
-        ),
-        "provider_unavailable",
-    )
+/// Proactive drain: cool the key down before it hits the rate limit,
+/// based on x-ratelimit-remaining/limit/reset headers.
+fn check_drain_headers(provider: &Provider, key: &Arc<KeyState>, resp: &reqwest::Response) {
+    let h = resp.headers();
+    let get_u64 = |name: &str| {
+        h.get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+    };
+    let (Some(remaining), Some(limit)) = (
+        get_u64("x-ratelimit-remaining-requests"),
+        get_u64("x-ratelimit-limit-requests"),
+    ) else {
+        return;
+    };
+    if limit == 0 || remaining * 100 >= limit * provider.drain_below_pct as u64 {
+        return;
+    }
+    let reset = h
+        .get("x-ratelimit-reset-requests")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_reset_duration)
+        .unwrap_or(Duration::from_secs(60));
+    provider.pool.drain(key, reset);
+}
+
+/// Parse OpenAI-style reset durations: "500ms", "1s", "1m30s", "2h5m".
+fn parse_reset_duration(s: &str) -> Option<Duration> {
+    let mut total = Duration::ZERO;
+    let mut num = String::new();
+    let mut unit = String::new();
+    let mut flush = |num: &mut String, unit: &mut String| -> Option<()> {
+        if num.is_empty() {
+            unit.clear();
+            return Some(());
+        }
+        let v: f64 = num.parse().ok()?;
+        let d = match unit.as_str() {
+            "ms" => Duration::from_secs_f64(v / 1000.0),
+            "s" => Duration::from_secs_f64(v),
+            "m" => Duration::from_secs_f64(v * 60.0),
+            "h" => Duration::from_secs_f64(v * 3600.0),
+            _ => return None,
+        };
+        total += d;
+        num.clear();
+        unit.clear();
+        Some(())
+    };
+    for c in s.trim().chars() {
+        if c.is_ascii_digit() || c == '.' {
+            if !unit.is_empty() {
+                flush(&mut num, &mut unit)?;
+            }
+            num.push(c);
+        } else if !c.is_whitespace() {
+            unit.push(c);
+        }
+    }
+    flush(&mut num, &mut unit)?;
+    (total > Duration::ZERO).then_some(total)
+}
+
+/// Build the client response for a successful upstream call.
+async fn success_response(
+    provider: &Provider,
+    model: &str,
+    resp: reqwest::Response,
+    is_stream: bool,
+    key: Arc<KeyState>,
+    guard: crate::pool::KeyGuard,
+) -> Response {
+    match provider.kind {
+        ProviderKind::OpenaiCompat => {
+            if is_stream {
+                stream_upstream(resp, guard)
+            } else {
+                // Buffer small JSON responses to capture usage stats.
+                let status = resp.status();
+                let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
+                drop(guard);
+                match resp.bytes().await {
+                    Ok(bytes) => {
+                        if let Ok(v) = serde_json::from_slice::<Value>(&bytes)
+                            && let Some(u) = v.get("usage")
+                        {
+                            add_usage(
+                                &key,
+                                u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                                u.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                            );
+                        }
+                        let mut b = Response::builder()
+                            .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK));
+                        if let Some(ct) = content_type {
+                            b = b.header(header::CONTENT_TYPE, ct);
+                        }
+                        b.body(Body::from(bytes))
+                            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                    }
+                    Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+                }
+            }
+        }
+        ProviderKind::Gemini | ProviderKind::Antigravity => {
+            let envelope = matches!(provider.kind, ProviderKind::Antigravity);
+            if is_stream {
+                let stream = gemini::translate_sse_stream(resp, model, envelope, Some(key));
+                let stream = stream.map(move |item| {
+                    let _ = &guard; // keep the in-flight slot until the stream ends
+                    item
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .body(Body::from_stream(stream))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            } else {
+                drop(guard);
+                match resp.json::<Value>().await {
+                    Ok(v) => {
+                        let v = if envelope { antigravity::unwrap_response(v) } else { v };
+                        let (p, c) = gemini::usage_pair(&v);
+                        add_usage(&key, p, c);
+                        Json(gemini::translate_response(model, &v)).into_response()
+                    }
+                    Err(e) => error_response(
+                        StatusCode::BAD_GATEWAY,
+                        format!("invalid upstream JSON: {e}"),
+                        "upstream_error",
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn add_usage(key: &KeyState, prompt: u64, completion: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    key.prompt_tokens.fetch_add(prompt, Relaxed);
+    key.completion_tokens.fetch_add(completion, Relaxed);
 }
 
 /// Pass an upstream 2xx response through to the client with zero buffering.
-fn stream_upstream(resp: reqwest::Response) -> Response {
+/// The guard keeps the key's in-flight slot until the stream ends.
+fn stream_upstream(resp: reqwest::Response, guard: crate::pool::KeyGuard) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
     let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
-    let stream = resp.bytes_stream().map(|chunk| {
+    let stream = resp.bytes_stream().map(move |chunk| {
+        let _ = &guard;
         chunk.map_err(|e| std::io::Error::other(format!("upstream stream error: {e}")))
     });
     let mut builder = Response::builder().status(status);
@@ -298,10 +471,4 @@ fn stream_upstream(resp: reqwest::Response) -> Response {
     builder
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-}
-
-/// Used by the Gemini adapter in step 2.
-#[allow(dead_code)]
-pub fn provider_of<'a>(state: &'a AppState, name: &str) -> Option<&'a Provider> {
-    state.router.providers.iter().find(|p| p.name == name)
 }
