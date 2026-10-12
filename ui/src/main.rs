@@ -529,63 +529,6 @@ fn KeyActionButton(provider: String, id: String, status: String) -> View {
 
 // ---------- Квоты ----------
 
-#[component(inline_props)]
-fn QuotasTab(quotas: Signal<Vec<QuotaDto>>) -> View {
-    view! {
-        (if quotas.get_clone().is_empty() {
-            view! { div(class="card") { div(class="empty") {
-                div(class="pix") { i {} i {} i {} i {} i {} i {} i {} i {} i {} }
-                "Quotas appear for OAuth providers (antigravity)"
-            } } }
-        } else {
-            view! {
-                Indexed(
-                    list=quotas,
-                    view=|q: QuotaDto| view! {
-                        div(class="card") {
-                            div(class="card-head") {
-                                b { (q.provider) }
-                                span(class="badge raw") { (q.account) }
-                            }
-                            table {
-                                tr { th { "Model" } th { "Remaining" } th { "Reset" } }
-                                Indexed(
-                                    list=create_signal(q.models),
-                                    view=|m: QuotaModelDto| {
-                                        let reset = if m.reset.is_empty() { "—".to_string() } else { m.reset.clone() };
-                                        view! {
-                                        tr {
-                                            td(class="mono") { (m.id) }
-                                            td {
-                                                (match m.pct {
-                                                    Some(pct) => {
-                                                        let cls = if m.low { "quota-fill low" } else { "quota-fill" };
-                                                        view! {
-                                                            div(class="quota-bar") {
-                                                                div(class=cls, style=format!("width: {}%", pct)) {}
-                                                            }
-                                                            span(class="quota-pct") { (format!("{}%", pct)) }
-                                                        }
-                                                    }
-                                                    None => view! { "—" },
-                                                })
-                                            }
-                                            td { (reset) }
-                                        }
-                                        }
-                                    },
-                                )
-                            }
-                        }
-                    },
-                )
-            }
-        })
-    }
-}
-
-// ---------- Config ----------
-
 async fn fetch_text(url: &str) -> Option<String> {
     Request::get(url).send().await.ok()?.text().await.ok()
 }
@@ -628,7 +571,6 @@ fn ConfigTab() -> View {
             div(class="config-actions") {
                 button(class="btn btn-primary", on:click=move |_| {
                     let body = serde_json::json!({"toml": toml.get_clone()});
-                    let status = status;
                     spawn_local(async move {
                         let msg = put_json("/api/config", &body).await
                             .unwrap_or_else(|| "request failed".into());
@@ -643,6 +585,62 @@ fn ConfigTab() -> View {
                 span(class="config-status") { (status.get_clone()) }
             }
         }
+    }
+}
+
+#[component(inline_props)]
+fn QuotasTab(quotas: Signal<Vec<QuotaDto>>) -> View {
+    view! {
+        (if quotas.get_clone().is_empty() {
+            view! { div(class="card") { div(class="empty") {
+                div(class="pix") { i {} i {} i {} i {} i {} i {} i {} i {} i {} }
+                "Quotas appear for OAuth providers (antigravity)"
+            } } }
+        } else {
+            view! {
+                div(class="quota-grid") {
+                    Indexed(
+                        list=quotas,
+                        view=|q: QuotaDto| view! {
+                            div(class="quota-card") {
+                                div(class="quota-card-head") {
+                                    b { (q.provider) }
+                                    span(class="badge raw") { (q.account) }
+                                }
+                                Indexed(
+                                    list=create_signal(q.models),
+                                    view=|m: QuotaModelDto| {
+                                        let pct = m.pct;
+                                        let cls = if m.low { "quota-fill low" } else { "quota-fill" };
+                                        let width = pct.map(|p| format!("width:{}%", p)).unwrap_or_default();
+                                        let reset = if m.reset.is_empty() {
+                                            String::new()
+                                        } else {
+                                            m.reset.get(..10).unwrap_or(&m.reset).to_string()
+                                        };
+                                        let id = m.id.clone();
+                                        let title = m.id.clone();
+                                        view! {
+                                            div(class="quota-row") {
+                                                span(class="quota-name", title=title) { (id) }
+                                                (match pct {
+                                                    Some(p) => view! {
+                                                        div(class="quota-bar") { div(class=cls, style=width) {} }
+                                                        span(class="quota-pct") { (format!("{}%", p)) }
+                                                    },
+                                                    None => view! { span(class="quota-pct") { "—" } },
+                                                })
+                                                span(class="quota-reset") { (reset) }
+                                            }
+                                        }
+                                    },
+                                )
+                            }
+                        },
+                    )
+                }
+            }
+        })
     }
 }
 
