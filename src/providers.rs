@@ -23,6 +23,9 @@ use crate::storage::Storage;
 
 const MODELS_CACHE_TTL: Duration = Duration::from_secs(600);
 
+/// (account label, per-model quotas)
+type AccountQuotas = Vec<(String, Vec<antigravity::ModelQuota>)>;
+
 pub struct Provider {
     pub name: String,
     pub kind: ProviderKind,
@@ -39,7 +42,7 @@ pub struct Provider {
     /// Codex (ChatGPT) OAuth accounts.
     codex_accounts: Vec<Arc<crate::codex::CodexAccount>>,
     models_cache: Mutex<Option<(Instant, Vec<String>)>>,
-    quota_cache: Mutex<Option<(Instant, Vec<(String, Vec<antigravity::ModelQuota>)>)>>,
+    quota_cache: Mutex<Option<(Instant, AccountQuotas)>>,
 }
 
 impl Provider {
@@ -195,7 +198,7 @@ impl Provider {
     }
 
     /// Per-account model quotas (antigravity only), cached for 60s.
-    pub async fn quotas(&self) -> Vec<(String, Vec<antigravity::ModelQuota>)> {
+    pub async fn quotas(&self) -> AccountQuotas {
         if !matches!(self.kind, ProviderKind::Antigravity) {
             return Vec::new();
         }
