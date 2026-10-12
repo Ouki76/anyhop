@@ -335,10 +335,16 @@ async fn run_target(
 
         match status.as_u16() {
             429 => {
-                // Antigravity quotas are per-model: parse exact reset time.
-                if matches!(provider.kind, ProviderKind::Antigravity)
-                    && let Some(until_ms) = antigravity::parse_quota_reset_ms(&text)
-                {
+                // Antigravity quotas are per-model: parse exact reset time,
+                // fallback to a short per-model cooldown when absent.
+                if matches!(provider.kind, ProviderKind::Antigravity) {
+                    let until_ms = antigravity::parse_quota_reset_ms(&text).unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64
+                            + 60_000
+                    });
                     provider
                         .pool
                         .report_failure(&key, FailKind::ModelQuota { until_ms }, model);
