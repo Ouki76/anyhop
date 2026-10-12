@@ -157,6 +157,17 @@ fn exhausted_response(provider: &str, attempts: usize) -> Response {
     )
 }
 
+/// Public wrapper for the FIM endpoint.
+pub async fn run_target_pub(
+    state: &AppState,
+    provider: &Provider,
+    model: &str,
+    payload: &Value,
+    is_stream: bool,
+) -> Option<Response> {
+    run_target(state, provider, model, payload, is_stream).await
+}
+
 /// Run the retry loop for one provider/model target.
 /// Some(resp) = definitive answer (success or client error), None = try next target.
 async fn run_target(

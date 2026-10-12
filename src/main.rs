@@ -4,6 +4,7 @@ mod codex;
 mod config;
 mod dashboard;
 mod events;
+mod fim;
 mod gemini;
 mod pool;
 mod storage;
@@ -157,6 +158,8 @@ async fn main() -> anyhow::Result<()> {
 
     let api = axum::Router::new()
         .route("/v1/chat/completions", post(proxy::chat_completions))
+        .route("/v1/fim/completions", post(fim::fim_completions))
+        .route("/v1/completions", post(fim::fim_completions))
         .route("/v1/models", get(proxy::list_models))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
