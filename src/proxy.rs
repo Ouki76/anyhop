@@ -77,27 +77,35 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Response {
-    let payload: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                format!("invalid JSON body: {e}"),
-                "invalid_request_error",
-            );
+    // Fast path: byte-level peek of model/stream; Value DOM only when a
+    // translating provider actually needs it.
+    let (model, is_stream, model_span, mut json) = match crate::scan::peek_request(&body) {
+        Some((m, s)) => (m, s, crate::scan::string_field_span(&body, b"model"), None),
+        None => {
+            let v: Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid JSON body: {e}"),
+                        "invalid_request_error",
+                    );
+                }
+            };
+            let m = v
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(str::to_string);
+            let Some(m) = m else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "missing or invalid 'model' field",
+                    "invalid_request_error",
+                );
+            };
+            let s = v.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+            (m, s, None, Some(v))
         }
-    };
-
-    let model = payload
-        .get("model")
-        .and_then(|m| m.as_str())
-        .map(str::to_string);
-    let Some(model) = model else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "missing or invalid 'model' field",
-            "invalid_request_error",
-        );
     };
 
     let router = state.router.load();
@@ -109,44 +117,55 @@ pub async fn chat_completions(
         );
     };
 
-    let is_stream = payload
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let targets: Vec<(&Provider, String)> = match &resolved {
+        Resolved::One(p, m) => vec![(*p, m.clone())],
+        Resolved::Chain(c) => c.clone(),
+    };
+
+    // Parse the Value DOM only when a target needs translation or the byte splice
+    // failed (non-string model value etc.).
+    if json.is_none()
+        && (model_span.is_none()
+            || targets.iter().any(|(p, _)| p.kind != ProviderKind::OpenaiCompat))
+    {
+        json = match serde_json::from_slice(&body) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid JSON body: {e}"),
+                    "invalid_request_error",
+                );
+            }
+        };
+    }
 
     let max_retries = state.rt().max_retries;
-    match resolved {
-        Resolved::One(provider, upstream_model) => {
-            match run_target(&state, provider, &upstream_model, &payload, is_stream).await {
-                Some(resp) => resp,
-                None => exhausted_response(&provider.name, max_retries),
+    let total = targets.len();
+    for (i, (provider, upstream_model)) in targets.iter().enumerate() {
+        let result = run_target(&state, provider, upstream_model, &body, model_span.clone(), json.as_ref(), is_stream).await;
+        if let Some(resp) = result {
+            if total > 1 && i > 0 {
+                info!(combo = %model, fallback = i + 1, of = total, "combo fallback succeeded");
             }
+            return resp;
         }
-        Resolved::Chain(chain) => {
-            let total = chain.len();
-            for (i, (provider, upstream_model)) in chain.iter().enumerate() {
-                if let Some(resp) =
-                    run_target(&state, provider, upstream_model, &payload, is_stream).await
-                {
-                    if i > 0 {
-                        info!(combo = %model, fallback = i + 1, of = total, "combo fallback succeeded");
-                    }
-                    return resp;
-                }
-                state.events.emit(crate::events::DashEvent::new(
-                    "combo",
-                    &model,
-                    "backoff",
-                    format!("target '{}/{}' exhausted, trying next", provider.name, upstream_model),
-                ));
-            }
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("combo '{model}': all {total} targets exhausted"),
-                "provider_unavailable",
-            )
+        if total > 1 {
+            state.events.emit(crate::events::DashEvent::new(
+                "combo",
+                &model,
+                "backoff",
+                format!("target '{}/{}' exhausted, trying next", provider.name, upstream_model),
+            ));
+        } else {
+            return exhausted_response(&provider.name, max_retries);
         }
     }
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("combo '{model}': all {total} targets exhausted"),
+        "provider_unavailable",
+    )
 }
 
 fn exhausted_response(provider: &str, attempts: usize) -> Response {
@@ -165,24 +184,37 @@ pub async fn run_target_pub(
     payload: &Value,
     is_stream: bool,
 ) -> Option<Response> {
-    run_target(state, provider, model, payload, is_stream).await
+    let body = Bytes::from(serde_json::to_vec(payload).unwrap_or_default());
+    let span = crate::scan::string_field_span(&body, b"model");
+    run_target(state, provider, model, &body, span, Some(payload), is_stream).await
 }
 
 /// Run the retry loop for one provider/model target.
 /// Some(resp) = definitive answer (success or client error), None = try next target.
+///
+/// `raw`/`model_span` drive the zero-copy pass-through path; `payload` is the
+/// lazily-parsed DOM for translating providers (None-safe: present whenever needed).
 async fn run_target(
     state: &AppState,
     provider: &Provider,
     model: &str,
-    payload: &Value,
+    raw: &Bytes,
+    model_span: Option<std::ops::Range<usize>>,
+    payload: Option<&Value>,
     is_stream: bool,
 ) -> Option<Response> {
     // Translated payloads are prebuilt once, before the retry loop
     // (the antigravity envelope additionally needs a per-account project id).
     let translated = match provider.kind {
-        ProviderKind::Gemini | ProviderKind::Antigravity => Some(gemini::translate_request(payload)),
-        ProviderKind::Anthropic => Some(anthropic::translate_request(payload)),
-        ProviderKind::Codex => Some(codex::translate_request(model, payload)),
+        ProviderKind::Gemini | ProviderKind::Antigravity => {
+            Some(gemini::translate_request(payload.expect("json dom")))
+        }
+        ProviderKind::Anthropic => {
+            let mut p = payload.expect("json dom").clone();
+            p["model"] = Value::String(model.to_string());
+            Some(anthropic::translate_request(&p))
+        }
+        ProviderKind::Codex => Some(codex::translate_request(model, payload.expect("json dom"))),
         _ => None,
     };
     let translated = match translated {
@@ -204,11 +236,19 @@ async fn run_target(
         };
 
         let mut req = match provider.kind {
-            ProviderKind::OpenaiCompat => provider
-                .client
-                .post(format!("{}/chat/completions", provider.base_url))
-                .bearer_auth(&key.secret)
-                .json(payload),
+            ProviderKind::OpenaiCompat => {
+                // Zero-copy splice: swap the model name directly in the body bytes.
+                let mut bytes = raw.to_vec();
+                if let Some(span) = &model_span {
+                    bytes.splice(span.clone(), model.as_bytes().iter().copied());
+                }
+                provider
+                    .client
+                    .post(format!("{}/chat/completions", provider.base_url))
+                    .bearer_auth(&key.secret)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes)
+            }
             ProviderKind::Gemini => provider
                 .client
                 .post(gemini::endpoint(&provider.base_url, model, is_stream))
