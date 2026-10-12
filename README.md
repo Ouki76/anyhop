@@ -13,6 +13,9 @@ OpenAI-совместимый LLM-шлюз с автоматической ро�
 - **Персистентность** (redb): health ключей, OAuth-токены и статистика переживают рестарт
 - **Дашборд** `/dashboard`: статусы ключей в реальном времени (htmx + SSE failover-ленты)
 - **Стриминг** без буферизации во всех режимах (SSE→SSE для gemini/antigravity с трансляцией)
+- **Tool calls**: полный цикл (tools, tool_choice, параллельные вызовы, functionResponse)
+- **Thinking**: reasoning_effort → thinkingConfig, мысли отдаются как reasoning_content,
+  thoughtSignature захватывается и реплеится обратно (Gemini 3)
 
 ## Быстрый старт
 

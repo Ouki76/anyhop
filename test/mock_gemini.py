@@ -22,6 +22,10 @@ class H(BaseHTTPRequestHandler):
             self.wfile.write(b'{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}')
             return
 
+        # Сохраняем последний запрос для проверок тестом
+        with open("/tmp/gemini-last-request.json", "w") as f:
+            json.dump(body, f)
+
         last_text = ""
         for c in reversed(body.get("contents", [])):
             for p in c.get("parts", []):
@@ -35,6 +39,34 @@ class H(BaseHTTPRequestHandler):
             for p in body.get("system_instruction", {}).get("parts", [])
         )
         reply = f"[sys:{sys_txt}] echo:{last_text} (key:{key[-4:]})"
+
+        # Режим tool call: юзер просит "call tool"
+        if "call tool" in last_text:
+            if ":streamGenerateContent" in self.path:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                thought = {"candidates": [{"content": {"role": "model", "parts": [{"text": "думаю...", "thought": True}]}}]}
+                self.wfile.write(f"data: {json.dumps(thought)}\n\n".encode())
+                call = {"candidates": [{"content": {"role": "model", "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Moscow"}}, "thoughtSignature": "sig-abc-123"}]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 4, "totalTokenCount": 9}}
+                self.wfile.write(f"data: {json.dumps(call)}\n\n".encode())
+                self.wfile.flush()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            resp = {
+                "candidates": [{
+                    "content": {"role": "model", "parts": [
+                        {"text": "думаю о погоде", "thought": True},
+                        {"functionCall": {"name": "get_weather", "args": {"city": "Moscow"}}, "thoughtSignature": "sig-abc-123"},
+                    ]},
+                    "finishReason": "STOP",
+                }],
+                "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 6, "totalTokenCount": 11},
+            }
+            self.wfile.write(json.dumps(resp).encode())
+            return
 
         if ":streamGenerateContent" in self.path:
             self.send_response(200)

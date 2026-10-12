@@ -144,7 +144,16 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
                         if !id.is_empty() {
                             call_names.insert(id.to_string(), name.clone());
                         }
-                        parts.push(json!({"functionCall": {"name": name, "args": args}}));
+                        let mut fc = json!({"name": name, "args": args});
+                        // Replay thoughtSignature if the client echoed it back
+                        // (required by Gemini 3 for function calls in history).
+                        if let Some(sig) = tc
+                            .pointer("/function/thought_signature")
+                            .and_then(|s| s.as_str())
+                        {
+                            fc["thoughtSignature"] = json!(sig);
+                        }
+                        parts.push(json!({"functionCall": fc}));
                     }
                 }
                 if parts.is_empty() {
@@ -218,6 +227,29 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
             gen_cfg.insert("stopSequences".into(), json!(seqs));
         }
     }
+    // Thinking: OpenAI reasoning_effort or Anthropic-style thinking.budget_tokens
+    // -> generationConfig.thinkingConfig.
+    let budget: Option<i64> = body
+        .get("reasoning_effort")
+        .and_then(|e| e.as_str())
+        .and_then(|e| match e {
+            "none" => Some(0),
+            "minimal" | "low" => Some(1024),
+            "medium" => Some(8192),
+            "high" | "xhigh" | "max" => Some(24576),
+            _ => None,
+        })
+        .or_else(|| {
+            body.pointer("/thinking/budget_tokens")
+                .and_then(|b| b.as_i64())
+        });
+    if let Some(b) = budget {
+        let mut tc = json!({"includeThoughts": b > 0});
+        if b > 0 {
+            tc["thinkingBudget"] = json!(b);
+        }
+        gen_cfg.insert("thinkingConfig".into(), tc);
+    }
 
     let mut req = json!({"contents": merged});
     if !system_parts.is_empty() {
@@ -274,25 +306,26 @@ fn usage_of(v: &Value) -> Value {
     })
 }
 
-/// Collect (content, tool_calls) from a Gemini candidate's parts.
-fn extract_parts(candidate: Option<&Value>) -> (String, Vec<Value>) {
+/// Collect (content, reasoning, tool_calls) from a Gemini candidate's parts.
+fn extract_parts(candidate: Option<&Value>) -> (String, String, Vec<Value>) {
     let mut content = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     let parts = candidate
         .and_then(|c| c.pointer("/content/parts"))
         .and_then(|p| p.as_array());
     if let Some(parts) = parts {
         for part in parts {
-            // Skip thought parts from thinking models.
-            if part
+            let is_thought = part
                 .get("thought")
                 .and_then(|t| t.as_bool())
-                .unwrap_or(false)
-            {
-                continue;
-            }
+                .unwrap_or(false);
             if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                content.push_str(t);
+                if is_thought {
+                    reasoning.push_str(t);
+                } else {
+                    content.push_str(t);
+                }
             }
             if let Some(fc) = part.get("functionCall") {
                 let id = fc
@@ -300,24 +333,34 @@ fn extract_parts(candidate: Option<&Value>) -> (String, Vec<Value>) {
                     .and_then(|i| i.as_str())
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("call_{:x}", now_secs()));
+                let mut function = json!({
+                    "name": fc.get("name").cloned().unwrap_or(json!("")),
+                    "arguments": fc.get("args").cloned().unwrap_or(json!({})).to_string(),
+                });
+                // Surface the thoughtSignature so clients can echo it back
+                // (Gemini 3 validates it on replayed function calls).
+                let sig = part
+                    .get("thoughtSignature")
+                    .or_else(|| fc.get("thoughtSignature"))
+                    .and_then(|s| s.as_str());
+                if let Some(sig) = sig {
+                    function["thought_signature"] = json!(sig);
+                }
                 tool_calls.push(json!({
                     "index": tool_calls.len(),
                     "id": id,
                     "type": "function",
-                    "function": {
-                        "name": fc.get("name").cloned().unwrap_or(json!("")),
-                        "arguments": fc.get("args").cloned().unwrap_or(json!({})).to_string(),
-                    },
+                    "function": function,
                 }));
             }
         }
     }
-    (content, tool_calls)
+    (content, reasoning, tool_calls)
 }
 
 pub fn translate_response(model: &str, v: &Value) -> Value {
     let candidate = v.pointer("/candidates/0");
-    let (content, tool_calls) = extract_parts(candidate);
+    let (content, reasoning, tool_calls) = extract_parts(candidate);
     let finish = candidate
         .and_then(|c| c.get("finishReason"))
         .and_then(|r| r.as_str())
@@ -330,6 +373,9 @@ pub fn translate_response(model: &str, v: &Value) -> Value {
     } else {
         msg["content"] = if content.is_empty() { Value::Null } else { json!(content) };
         msg["tool_calls"] = json!(tool_calls);
+    }
+    if !reasoning.is_empty() {
+        msg["reasoning_content"] = json!(reasoning);
     }
 
     json!({
@@ -353,12 +399,15 @@ struct SseState {
 
 fn translate_chunk(v: &Value, st: &mut SseState) -> Value {
     let candidate = v.pointer("/candidates/0");
-    let (content, tool_calls) = extract_parts(candidate);
+    let (content, reasoning, tool_calls) = extract_parts(candidate);
 
     let mut delta = json!({});
     if !st.sent_role {
         delta["role"] = json!("assistant");
         st.sent_role = true;
+    }
+    if !reasoning.is_empty() {
+        delta["reasoning_content"] = json!(reasoning);
     }
     if !content.is_empty() {
         delta["content"] = json!(content);
