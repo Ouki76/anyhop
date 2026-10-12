@@ -37,7 +37,8 @@ rust-embed = ["dep:rust-embed"]
 mime_guess = ["dep:mime_guess"]
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = true
 opt-level = 3
+panic = "abort"

@@ -9,6 +9,7 @@ mod events;
 mod fim;
 mod gemini;
 mod pool;
+mod sse;
 mod storage;
 mod providers;
 mod proxy;

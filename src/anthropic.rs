@@ -448,7 +448,8 @@ pub fn translate_sse_stream(
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
     struct State {
         inner: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-        buf: String,
+        parser: crate::sse::SseParser,
+        pending: std::collections::VecDeque<Bytes>,
         eof: bool,
         sent_done: bool,
         stats: Option<std::sync::Arc<crate::pool::KeyState>>,
@@ -457,7 +458,8 @@ pub fn translate_sse_stream(
 
     let state = State {
         inner: Box::pin(resp.bytes_stream()),
-        buf: String::new(),
+        parser: crate::sse::SseParser::new(),
+        pending: std::collections::VecDeque::new(),
         eof: false,
         sent_done: false,
         stats,
@@ -474,22 +476,13 @@ pub fn translate_sse_stream(
 
     futures::stream::unfold(state, move |mut s| async move {
         loop {
-            if let Some(pos) = s.buf.find("\n\n") {
-                let event: String = s.buf.drain(..pos + 2).collect();
-                let data: String = event
-                    .lines()
-                    .filter_map(|l| l.strip_prefix("data:"))
-                    .map(str::trim_start)
-                    .collect();
-                if data.is_empty() {
-                    continue;
-                }
-                let Ok(v) = serde_json::from_str::<Value>(&data) else {
+            if let Some(data) = s.pending.pop_front() {
+                let Ok(v) = serde_json::from_slice::<Value>(&data) else {
                     continue;
                 };
                 let is_stop = v.get("type").and_then(|t| t.as_str()) == Some("message_stop");
                 if let Some(chunk) = translate_event(&v, &mut s.st) {
-                    return Some((Ok(Bytes::from(format!("data: {chunk}\n\n"))), s));
+                    return Some((Ok(crate::sse::frame(&chunk)), s));
                 }
                 if is_stop {
                     if let Some(k) = &s.stats {
@@ -499,7 +492,7 @@ pub fn translate_sse_stream(
                         continue;
                     }
                     s.sent_done = true;
-                    return Some((Ok(Bytes::from_static(b"data: [DONE]\n\n")), s));
+                    return Some((Ok(Bytes::from_static(crate::sse::DONE_FRAME)), s));
                 }
                 continue;
             }
@@ -509,13 +502,16 @@ pub fn translate_sse_stream(
                     return None;
                 }
                 s.sent_done = true;
-                return Some((Ok(Bytes::from_static(b"data: [DONE]\n\n")), s));
+                return Some((Ok(Bytes::from_static(crate::sse::DONE_FRAME)), s));
             }
 
             match s.inner.next().await {
-                Some(Ok(b)) => s.buf.push_str(&String::from_utf8_lossy(&b)),
+                Some(Ok(b)) => s.pending.extend(s.parser.feed(&b)),
                 Some(Err(e)) => return Some((Err(io::Error::other(e)), s)),
-                None => s.eof = true,
+                None => {
+                    s.eof = true;
+                    s.pending.extend(s.parser.finish());
+                }
             }
         }
     })
