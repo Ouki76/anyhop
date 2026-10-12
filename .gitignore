@@ -1,1 +1,22 @@
+# Rust build artifacts
 /target
+
+# Локальный конфиг с секретами (для других — anyhop.example.toml)
+/anyhop.toml
+
+# Локальное состояние (токены, health, статистика)
+/anyhop.redb
+*.redb
+
+# Логи
+*.log
+
+# Pi agent рабочие файлы
+/.pi/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
