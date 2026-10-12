@@ -284,16 +284,29 @@ td.num { font-variant-numeric: tabular-nums; }
   display: inline-block; width: 90px; height: 5px; flex-shrink: 0;
   background: var(--bg); border-radius: 100px; overflow: hidden;
 }
+.quota-bar.empty { visibility: hidden; }
 .quota-fill { height: 100%; background: linear-gradient(90deg, var(--c1), var(--c3)); border-radius: 100px; transition: width .6s ease; }
 .quota-fill.low { background: var(--red-fg); }
 .quota-pct {
   font-family: var(--mono); font-size: 11px; color: var(--dim);
-  min-width: 36px; text-align: right; flex-shrink: 0;
+  width: 36px; text-align: right; flex-shrink: 0;
 }
 .quota-reset {
   font-family: var(--mono); font-size: 10px; color: var(--dim);
-  flex-shrink: 0;
+  width: 82px; flex-shrink: 0;
 }
+/* сворачиваемые карточки */
+.quota-card-head { cursor: pointer; user-select: none; margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
+.quota-card-head:hover b { color: var(--c3); }
+.quota-card.open .quota-card-head {
+  margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--border);
+}
+.quota-card .quota-body { display: none; }
+.quota-card.open .quota-body { display: block; }
+.quota-caret { font-family: var(--mono); font-size: 10px; color: var(--dim); margin-left: auto; }
+.quota-worst { font-family: var(--mono); font-size: 11px; color: var(--dim); margin-left: auto; }
+.quota-worst.low { color: var(--red-fg); }
+.quota-card.open .quota-worst { display: none; }
 
 /* events */
 .events { display: flex; flex-direction: column; }
