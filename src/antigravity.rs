@@ -562,32 +562,42 @@ pub async fn fetch_email(http: &reqwest::Client, access_token: &str) -> Option<S
     v.get("email").and_then(|e| e.as_str()).map(str::to_string)
 }
 
-/// Run the interactive OAuth flow: local callback server + browser. Prints the
-/// resulting TOML account snippet on success.
-pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// A started OAuth flow: URL for the user + listener waiting for the callback.
+pub struct PendingAuth {
+    pub url: String,
+    state: String,
+    listener: tokio::net::TcpListener,
+    http: reqwest::Client,
+}
 
+pub struct AuthOutcome {
+    pub refresh_token: String,
+    pub email: Option<String>,
+    pub project_id: Option<String>,
+}
+
+/// Start the OAuth flow (non-blocking): returns the URL to open.
+pub async fn start_auth(proxy: Option<&str>) -> anyhow::Result<PendingAuth> {
     let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(30));
-    if let Some(p) = &proxy {
+    if let Some(p) = proxy {
         builder = builder.proxy(reqwest::Proxy::all(p)?);
-        println!("Использую прокси: {p}");
     }
     let http = builder.build()?;
-
     let state = format!("{:x}", now_ms());
     let url = build_auth_url(&state);
-    let listener =
-        tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT)).await.map_err(|e| {
-            anyhow::anyhow!("cannot bind localhost:{CALLBACK_PORT}: {e} (another auth running?)")
-        })?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot bind localhost:{CALLBACK_PORT}: {e} (auth already running?)"))?;
+    Ok(PendingAuth { url, state, listener, http })
+}
 
-    println!("\nОткройте эту ссылку в браузере и войдите в Google-аккаунт:\n\n{url}\n");
-    let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
-    println!("Ожидаю callback на localhost:{CALLBACK_PORT} ...");
+/// Wait for the browser callback and complete the exchange.
+pub async fn complete_auth(p: PendingAuth) -> anyhow::Result<AuthOutcome> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (mut sock, _) = listener.accept().await?;
+    let (mut sock, _) = p.listener.accept().await?;
     let mut buf = vec![0u8; 8192];
     let n = sock.read(&mut buf).await?;
     let req = String::from_utf8_lossy(&buf[..n]);
@@ -609,10 +619,11 @@ pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
         }
     }
 
-    let (status, page) = if code.is_some() && got_state.as_deref() == Some(state.as_str()) {
-        ("200 OK", "<h1>anyhop: авторизация успешна</h1><p>Можно закрыть вкладку.</p>")
+    let ok = code.is_some() && got_state.as_deref() == Some(p.state.as_str());
+    let (status, page) = if ok {
+        ("200 OK", "<h1>anyhop: authorized</h1><p>You can close this tab.</p>")
     } else {
-        ("400 Bad Request", "<h1>anyhop: ошибка авторизации</h1>")
+        ("400 Bad Request", "<h1>anyhop: authorization failed</h1>")
     };
     let html = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{page}"
@@ -620,14 +631,10 @@ pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
     let _ = sock.write_all(html.as_bytes()).await;
 
     let code = code.ok_or_else(|| anyhow::anyhow!("callback without code"))?;
-    anyhow::ensure!(
-        got_state.as_deref() == Some(state.as_str()),
-        "state mismatch (possible CSRF), retry"
-    );
+    anyhow::ensure!(got_state.as_deref() == Some(p.state.as_str()), "state mismatch, retry");
 
-    println!("Обмениваю код на токены...");
-    let tokens = exchange_code(&http, &code).await?;
-    let email = fetch_email(&http, &tokens.access_token).await;
+    let tokens = exchange_code(&p.http, &code).await?;
+    let email = fetch_email(&p.http, &tokens.access_token).await;
 
     // Best-effort project discovery so the snippet is complete.
     let account = Account::new(
@@ -641,15 +648,34 @@ pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
         },
         "antigravity",
         None,
-        http.clone(),
+        p.http.clone(),
     );
     let project_id = match account.ensure_project_id(&tokens.access_token).await {
         Ok(p) => Some(p),
         Err(e) => {
-            warn!("project id not resolved: {e} (будет получен автоматически при первом запросе)");
+            warn!("project id not resolved: {e} (auto-resolved on first request)");
             None
         }
     };
+
+    Ok(AuthOutcome {
+        refresh_token: tokens.refresh_token,
+        email,
+        project_id,
+    })
+}
+
+/// CLI OAuth flow: prints a TOML snippet on success.
+pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
+    let pending = start_auth(proxy.as_deref()).await?;
+    if proxy.is_some() {
+        println!("Использую прокси: {}", proxy.unwrap());
+    }
+    println!("\nОткройте эту ссылку в браузере и войдите в Google-аккаунт:\n\n{}\n", pending.url);
+    let _ = std::process::Command::new("xdg-open").arg(&pending.url).spawn();
+    println!("Ожидаю callback на localhost:{CALLBACK_PORT} ...");
+    println!("Обмениваю код на токены после входа...");
+    let out = complete_auth(pending).await?;
 
     println!("\nГотово! Добавьте аккаунт в anyhop.toml:\n");
     println!("[[providers]]");
@@ -657,11 +683,11 @@ pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
     println!("type = \"antigravity\"");
     println!("strategy = \"fill_first\"");
     println!("\n[[providers.accounts]]");
-    if let Some(e) = &email {
+    if let Some(e) = &out.email {
         println!("email = \"{e}\"");
     }
-    println!("refresh_token = \"{}\"", tokens.refresh_token);
-    if let Some(p) = &project_id {
+    println!("refresh_token = \"{}\"", out.refresh_token);
+    if let Some(p) = &out.project_id {
         println!("project_id = \"{p}\"");
     }
     println!();
@@ -673,12 +699,14 @@ pub fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
         out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
         i += 1;
     }

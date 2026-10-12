@@ -158,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
         storage: storage.clone(),
         config_path: config_path.clone(),
         events: events_tx,
+        auth_state: std::sync::Mutex::new(None),
     });
 
     let api = axum::Router::new()
@@ -178,7 +179,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/events", get(api::events))
         .route("/api/keys/enable", post(api::key_enable))
         .route("/api/keys/disable", post(api::key_disable))
-        .route("/api/keys/add", post(api::key_add));
+        .route("/api/keys/add", post(api::key_add))
+        .route("/api/config", get(api::get_config).put(api::put_config))
+        .route("/api/reload", post(api::reload))
+        .route("/api/auth/start", post(api::auth_start))
+        .route("/api/auth/status", get(api::auth_status));
 
     #[cfg(feature = "dashboard")]
     let app = if cfg.server.dashboard {
@@ -231,7 +236,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Rebuild providers/router from the config file (state restored from storage).
-fn reload_config(state: &Arc<proxy::AppState>) -> anyhow::Result<usize> {
+pub fn reload_config(state: &Arc<proxy::AppState>) -> anyhow::Result<usize> {
     let cfg = config::Config::load(&state.config_path)?;
     let mut providers = Vec::new();
     for p in &cfg.providers {

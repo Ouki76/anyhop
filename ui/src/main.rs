@@ -57,6 +57,7 @@ enum Tab {
     Providers,
     Quotas,
     Events,
+    Config,
 }
 
 const TABS: &[(Tab, &str)] = &[
@@ -64,7 +65,16 @@ const TABS: &[(Tab, &str)] = &[
     (Tab::Providers, "Providers"),
     (Tab::Quotas, "Quotas"),
     (Tab::Events, "Events"),
+    (Tab::Config, "Config"),
 ];
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct AuthStateDto {
+    kind: String,
+    status: String,
+    url: String,
+    message: String,
+}
 
 fn fmt_time(ts: u64) -> String {
     let s = ts % 86400;
@@ -104,6 +114,7 @@ fn tab_from_hash() -> Tab {
         "providers" => Tab::Providers,
         "quotas" => Tab::Quotas,
         "events" => Tab::Events,
+        "config" => Tab::Config,
         _ => Tab::Overview,
     }
 }
@@ -261,6 +272,7 @@ fn App() -> View {
                                         Tab::Providers => "providers",
                                         Tab::Quotas => "quotas",
                                         Tab::Events => "events",
+                                        Tab::Config => "config",
                                     };
                                     if let Some(w) = web_sys::window() {
                                         let _ = w.location().set_hash(name);
@@ -278,6 +290,7 @@ fn App() -> View {
                     Tab::Providers => view! { ProvidersTab(providers=providers) },
                     Tab::Quotas => view! { QuotasTab(quotas=quotas) },
                     Tab::Events => view! { EventsTab(events=events) },
+                    Tab::Config => view! { ConfigTab() },
                 })
             }
 
@@ -360,9 +373,9 @@ fn ProvidersTab(providers: Signal<Vec<ProviderDto>>) -> View {
 
 #[component(inline_props)]
 fn ProviderCard(p: ProviderDto) -> View {
-    let new_key = create_signal(String::new());
     let pname_rows = p.name.clone();
-    let pname_add = p.name.clone();
+    let pname_footer = p.name.clone();
+    let pkind_footer = p.kind.clone();
     let oauth = p.kind == "antigravity" || p.kind == "codex";
 
     // Агрегированный статус провайдера: зелёный/жёлтый/красный квадратик
@@ -377,6 +390,13 @@ fn ProviderCard(p: ProviderDto) -> View {
         } else {
             "pdot pdot-ok"
         }
+    };
+
+    // Футер карточки собирается ДО view!, чтобы не тащить захваты в динамические замыкания.
+    let footer = if oauth {
+        view! { OAuthAddButton(kind=pkind_footer) }
+    } else {
+        view! { AddKeyForm(provider=pname_footer) }
     };
 
     view! {
@@ -415,28 +435,78 @@ fn ProviderCard(p: ProviderDto) -> View {
                     },
                 )
             }
-            (if !oauth {
-                let pname2 = pname_add.clone();
-                view! {
-                    div(class="addkey") {
-                        input(class="input", r#type="text", placeholder="add a key…",
-                              bind:value=new_key)
-                        button(class="btn btn-primary", on:click=move |_| {
-                            let secret = new_key.get_clone();
-                            if secret.len() >= 4 {
-                                new_key.set(String::new());
-                                let provider = pname2.clone();
-                                spawn_local(async move {
-                                    let body = serde_json::json!({"provider": provider, "secret": secret});
-                                    post_json("/api/keys/add", &body).await;
-                                });
-                            }
-                        }) { "Add" }
+            (footer)
+        }
+    }
+}
+
+#[component(inline_props)]
+fn OAuthAddButton(kind: String) -> View {
+    let auth = create_signal(Option::<AuthStateDto>::None);
+    let label = format!("Add {} account", kind);
+    view! {
+        div(class="addkey") {
+            button(class="btn btn-primary", on:click=move |_| {
+                let kind = kind.clone();
+                spawn_local(async move {
+                    let body = serde_json::json!({"kind": kind});
+                    let Ok(req) = Request::post("/api/auth/start").json(&body) else { return };
+                    let Ok(resp) = req.send().await else { return };
+                    let Ok(v) = resp.json::<serde_json::Value>().await else { return };
+                    let Some(url) = v.get("url").and_then(|u| u.as_str()).map(str::to_string) else { return };
+                    auth.set(Some(AuthStateDto {
+                        kind: kind.clone(),
+                        status: "waiting".into(),
+                        url: url.clone(),
+                        message: "waiting for browser callback".into(),
+                    }));
+                    if let Some(w) = web_sys::window() {
+                        let _ = w.open_with_url_and_target(&url, "_blank");
                     }
+                    loop {
+                        gloo_timers::future::sleep(std::time::Duration::from_secs(2)).await;
+                        if let Some(s) = fetch_json::<AuthStateDto>("/api/auth/status").await {
+                            let terminal = s.status != "waiting";
+                            auth.set(Some(s));
+                            if terminal { break; }
+                        }
+                    }
+                });
+            }) { (label) }
+        }
+        (match auth.get_clone() {
+            Some(a) => {
+                let cls = format!("auth-banner auth-{}", a.status);
+                let msg = if a.status == "waiting" {
+                    "Authorization opened in a new tab — complete the sign-in".to_string()
+                } else {
+                    a.message
+                };
+                view! { div(class=cls) { (msg) } }
+            }
+            None => view! {},
+        })
+    }
+}
+
+#[component(inline_props)]
+fn AddKeyForm(provider: String) -> View {
+    let new_key = create_signal(String::new());
+    view! {
+        div(class="addkey") {
+            input(class="input", r#type="text", placeholder="add a key…",
+                  bind:value=new_key)
+            button(class="btn btn-primary", on:click=move |_| {
+                let secret = new_key.get_clone();
+                if secret.len() >= 4 {
+                    new_key.set(String::new());
+                    let provider = provider.clone();
+                    spawn_local(async move {
+                        let body = serde_json::json!({"provider": provider, "secret": secret});
+                        post_json("/api/keys/add", &body).await;
+                    });
                 }
-            } else {
-                view! {}
-            })
+            }) { "Add" }
         }
     }
 }
@@ -511,6 +581,68 @@ fn QuotasTab(quotas: Signal<Vec<QuotaDto>>) -> View {
                 )
             }
         })
+    }
+}
+
+// ---------- Config ----------
+
+async fn fetch_text(url: &str) -> Option<String> {
+    Request::get(url).send().await.ok()?.text().await.ok()
+}
+
+async fn put_json<B: serde::Serialize>(url: &str, body: &B) -> Option<String> {
+    let req = Request::put(url).json(body).ok()?;
+    let resp = req.send().await.ok()?;
+    let ok = resp.status() == 200;
+    let text = resp.text().await.ok()?;
+    Some(if ok { "saved + reloaded".into() } else { text })
+}
+
+#[component]
+fn ConfigTab() -> View {
+    let toml = create_signal(String::new());
+    let status = create_signal(String::new());
+    let loaded = create_signal(false);
+
+    spawn_local({
+        let toml = toml;
+        let loaded = loaded;
+        async move {
+            if let Some(t) = fetch_text("/api/config").await {
+                toml.set(t);
+                loaded.set(true);
+            }
+        }
+    });
+
+    view! {
+        div(class="section-title") { "Config" }
+        div(class="card") {
+            (if loaded.get() {
+                view! {
+                    textarea(class="config-editor", bind:value=toml)
+                }
+            } else {
+                view! { div(class="loading") { "Loading…" } }
+            })
+            div(class="config-actions") {
+                button(class="btn btn-primary", on:click=move |_| {
+                    let body = serde_json::json!({"toml": toml.get_clone()});
+                    let status = status;
+                    spawn_local(async move {
+                        let msg = put_json("/api/config", &body).await
+                            .unwrap_or_else(|| "request failed".into());
+                        status.set(msg);
+                    });
+                }) { "Save & reload" }
+                button(class="btn", on:click=move |_| {
+                    spawn_local(async move {
+                        let _ = Request::post("/api/reload").send().await;
+                    });
+                }) { "Reload from disk" }
+                span(class="config-status") { (status.get_clone()) }
+            }
+        }
     }
 }
 

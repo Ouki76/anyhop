@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
@@ -124,6 +124,207 @@ pub async fn events(
             .interval(std::time::Duration::from_secs(15))
             .text("ping"),
     )
+}
+
+// ---------- config management ----------
+
+/// GET /api/config — raw TOML.
+pub async fn get_config(State(state): State<Arc<AppState>>) -> Response {
+    match std::fs::read_to_string(&state.config_path) {
+        Ok(toml) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], toml).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ConfigUpdate {
+    toml: String,
+}
+
+/// PUT /api/config — validate, write, hot-reload.
+pub async fn put_config(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ConfigUpdate>,
+) -> Response {
+    if let Err(e) = toml::from_str::<crate::config::Config>(&body.toml) {
+        return (StatusCode::BAD_REQUEST, format!("invalid config: {e}")).into_response();
+    }
+    if let Err(e) = std::fs::write(&state.config_path, &body.toml) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("cannot write config: {e}"))
+            .into_response();
+    }
+    match crate::reload_config(&state) {
+        Ok(n) => {
+            state
+                .events
+                .emit_simple("config", "", "backoff", format!("config saved, {n} providers reloaded"));
+            StatusCode::OK.into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("config saved but reload failed: {e}"))
+            .into_response(),
+    }
+}
+
+/// POST /api/reload — re-read config from disk.
+pub async fn reload(State(state): State<Arc<AppState>>) -> Response {
+    match crate::reload_config(&state) {
+        Ok(n) => (StatusCode::OK, format!("reloaded {n} providers")).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("reload failed: {e}")).into_response(),
+    }
+}
+
+// ---------- OAuth account onboarding from the dashboard ----------
+
+#[derive(Clone, serde::Serialize)]
+pub struct AuthStateDto {
+    kind: String,
+    status: String, // waiting | done | error
+    url: String,
+    message: String,
+}
+
+#[derive(Deserialize)]
+pub struct AuthStart {
+    kind: String,
+}
+
+pub async fn auth_start(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AuthStart>,
+) -> Response {
+    let is_ag = body.kind == "antigravity";
+    if !is_ag && body.kind != "codex" {
+        return (StatusCode::BAD_REQUEST, "kind must be antigravity|codex").into_response();
+    }
+    let kind = body.kind.clone();
+    let (url, wait): (String, std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(String, Option<String>, Option<String>, Option<String>)>> + Send>>) =
+        if is_ag {
+            let pending = match crate::antigravity::start_auth(None).await {
+                Ok(p) => p,
+                Err(e) => return (StatusCode::CONFLICT, e.to_string()).into_response(),
+            };
+            let url = pending.url.clone();
+            (url, Box::pin(async move {
+                crate::antigravity::complete_auth(pending)
+                    .await
+                    .map(|o| (o.refresh_token, o.email, o.project_id, None))
+            }))
+        } else {
+            let pending = match crate::codex::start_auth(None).await {
+                Ok(p) => p,
+                Err(e) => return (StatusCode::CONFLICT, e.to_string()).into_response(),
+            };
+            let url = pending.url.clone();
+            (url, Box::pin(async move {
+                crate::codex::complete_auth(pending)
+                    .await
+                    .map(|o| (o.refresh_token, o.email, None, o.account_id))
+            }))
+        };
+
+    *state.auth_state.lock().unwrap() = Some(AuthStateDto {
+        kind: kind.clone(),
+        status: "waiting".into(),
+        url: url.clone(),
+        message: "waiting for browser callback".into(),
+    });
+
+    let st = state.clone();
+    tokio::spawn(async move {
+        match wait.await {
+            Ok((refresh_token, email, project_id, account_id)) => {
+                let msg = match append_account(&st.config_path, &kind, &refresh_token, email.as_deref(), project_id.as_deref(), account_id.as_deref()) {
+                    Ok(()) => match crate::reload_config(&st) {
+                        Ok(_) => "account added and config reloaded".to_string(),
+                        Err(e) => format!("account saved, reload failed: {e}"),
+                    },
+                    Err(e) => format!("account obtained but config update failed: {e}"),
+                };
+                let mut g = st.auth_state.lock().unwrap();
+                if let Some(a) = g.as_mut() {
+                    a.status = "done".into();
+                    a.message = msg;
+                }
+                st.events.emit_simple("auth", "", "backoff", "account added via dashboard".into());
+            }
+            Err(e) => {
+                let mut g = st.auth_state.lock().unwrap();
+                if let Some(a) = g.as_mut() {
+                    a.status = "error".into();
+                    a.message = e.to_string();
+                }
+            }
+        }
+    });
+
+    Json(serde_json::json!({"url": url})).into_response()
+}
+
+pub async fn auth_status(State(state): State<Arc<AppState>>) -> Response {
+    let g = state.auth_state.lock().unwrap().clone();
+    Json(g).into_response()
+}
+
+/// Append an OAuth account to the config file, preserving existing content.
+fn append_account(
+    path: &str,
+    kind: &str,
+    refresh_token: &str,
+    email: Option<&str>,
+    project_id: Option<&str>,
+    account_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let raw = std::fs::read_to_string(path)?;
+    let mut doc: toml::Value = toml::from_str(&raw)?;
+    let providers = doc
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("config root is not a table"))?
+        .entry("providers")
+        .or_insert_with(|| toml::Value::Array(vec![]));
+    let arr = providers
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("'providers' is not an array"))?;
+
+    // Find the first provider of this kind, else create it.
+    let idx = arr.iter().position(|p| {
+        p.get("type").and_then(|t| t.as_str()) == Some(kind)
+    });
+    let idx = match idx {
+        Some(i) => i,
+        None => {
+            let mut t = toml::map::Map::new();
+            t.insert("name".into(), kind.into());
+            t.insert("type".into(), kind.into());
+            t.insert("strategy".into(), "fill_first".into());
+            arr.push(toml::Value::Table(t));
+            arr.len() - 1
+        }
+    };
+    let provider = arr[idx]
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("provider entry is not a table"))?;
+    let accounts = provider
+        .entry("accounts")
+        .or_insert_with(|| toml::Value::Array(vec![]));
+    let accounts = accounts
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("'accounts' is not an array"))?;
+
+    let mut acc = toml::map::Map::new();
+    if let Some(e) = email {
+        acc.insert("email".into(), e.into());
+    }
+    acc.insert("refresh_token".into(), refresh_token.into());
+    if let Some(p) = project_id {
+        acc.insert("project_id".into(), p.into());
+    }
+    if let Some(a) = account_id {
+        acc.insert("account_id".into(), a.into());
+    }
+    accounts.push(toml::Value::Table(acc));
+
+    std::fs::write(path, toml::to_string_pretty(&doc)?)?;
+    Ok(())
 }
 
 // ---------- key management ----------

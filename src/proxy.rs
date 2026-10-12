@@ -32,6 +32,8 @@ pub struct AppState {
     pub storage: Option<crate::storage::Storage>,
     pub config_path: String,
     pub events: crate::events::EventBus,
+    /// Ongoing dashboard-triggered OAuth flow (single at a time).
+    pub auth_state: std::sync::Mutex<Option<crate::api::AuthStateDto>>,
 }
 
 impl AppState {
