@@ -196,6 +196,15 @@ pub async fn auth_start(
     if !is_ag && body.kind != "codex" {
         return (StatusCode::BAD_REQUEST, "kind must be antigravity|codex").into_response();
     }
+    // A flow is already waiting: hand back its URL instead of re-binding the port.
+    {
+        let g = state.auth_state.lock().unwrap();
+        if let Some(a) = g.as_ref()
+            && a.status == "waiting"
+        {
+            return Json(serde_json::json!({"url": a.url, "resumed": true})).into_response();
+        }
+    }
     let kind = body.kind.clone();
     let (url, wait): (String, std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(String, Option<String>, Option<String>, Option<String>)>> + Send>>) =
         if is_ag {
@@ -231,7 +240,20 @@ pub async fn auth_start(
 
     let st = state.clone();
     tokio::spawn(async move {
-        match wait.await {
+        // Abandoned flows must not hold the callback port forever.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(300), wait).await;
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(_) => {
+                let mut g = st.auth_state.lock().unwrap();
+                if let Some(a) = g.as_mut() {
+                    a.status = "error".into();
+                    a.message = "authorization timed out (5 min)".into();
+                }
+                return;
+            }
+        };
+        match outcome {
             Ok((refresh_token, email, project_id, account_id)) => {
                 let msg = match append_account(&st.config_path, &kind, &refresh_token, email.as_deref(), project_id.as_deref(), account_id.as_deref()) {
                     Ok(()) => match crate::reload_config(&st) {
