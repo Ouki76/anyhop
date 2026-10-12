@@ -386,9 +386,11 @@ fn translate_chunk(v: &Value, st: &mut SseState) -> Value {
 }
 
 /// Convert a Gemini SSE upstream response into an OpenAI-style SSE byte stream.
+/// `envelope` unwraps Antigravity's `{"response": {...}}` chunk wrapper first.
 pub fn translate_sse_stream(
     resp: reqwest::Response,
     model: &str,
+    envelope: bool,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
     struct State {
         inner: std::pin::Pin<
@@ -413,7 +415,7 @@ pub fn translate_sse_stream(
         },
     };
 
-    futures::stream::unfold(state, |mut s| async move {
+    futures::stream::unfold(state, move |mut s| async move {
         loop {
             // Try to extract a complete SSE event.
             if let Some(pos) = s.buf.find("\n\n") {
@@ -429,6 +431,7 @@ pub fn translate_sse_stream(
                 let Ok(v) = serde_json::from_str::<Value>(&data) else {
                     continue;
                 };
+                let v = if envelope { crate::antigravity::unwrap_response(v) } else { v };
                 let chunk = translate_chunk(&v, &mut s.st);
                 return Some((Ok(Bytes::from(format!("data: {chunk}\n\n"))), s));
             }

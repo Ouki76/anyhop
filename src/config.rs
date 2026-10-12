@@ -48,9 +48,14 @@ pub struct ProviderConfig {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: ProviderKind,
+    /// Optional for antigravity (defaults to the daily cloudcode-pa endpoint).
+    #[serde(default)]
     pub base_url: String,
     #[serde(default)]
     pub keys: Vec<String>,
+    /// OAuth accounts (antigravity only).
+    #[serde(default)]
+    pub accounts: Vec<AntigravityAccountConfig>,
     /// Models served by this provider. Empty = wildcard (accept any model).
     #[serde(default)]
     pub models: Vec<String>,
@@ -61,11 +66,26 @@ pub struct ProviderConfig {
     pub headers: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AntigravityAccountConfig {
+    /// May be empty when `access_token` is provided (dev/testing shortcut).
+    #[serde(default)]
+    pub refresh_token: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Pre-seeded access token that never refreshes (for tests / imported tokens).
+    #[serde(default)]
+    pub access_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     OpenaiCompat,
     Gemini,
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]

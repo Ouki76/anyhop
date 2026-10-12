@@ -1,3 +1,4 @@
+mod antigravity;
 mod config;
 mod gemini;
 mod pool;
@@ -16,6 +17,20 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "auth" && args[2] == "antigravity" {
+        return antigravity::run_auth_flow().await;
+    }
+    if args.len() >= 2 && (args[1] == "--help" || args[1] == "-h") {
+        println!("anyhop — OpenAI-compatible LLM gateway with key rotation\n");
+        println!("USAGE:");
+        println!("  anyhop                            start the gateway");
+        println!("  anyhop auth antigravity           add an Antigravity account via Google OAuth");
+        println!("\nENV:");
+        println!("  ANYHOP_CONFIG   path to config (default: anyhop.toml)");
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

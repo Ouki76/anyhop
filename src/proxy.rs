@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use tracing::{info, warn};
 
+use crate::antigravity::{self, AuthError};
 use crate::config::ProviderKind;
 use crate::gemini;
 use crate::pool::FailKind;
@@ -35,7 +36,7 @@ fn error_response(status: StatusCode, message: impl Into<String>, ty: &str) -> R
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     let mut data = Vec::new();
     for p in &state.router.providers {
-        for m in &p.models {
+        for m in p.effective_models(&state.http).await {
             data.push(serde_json::json!({
                 "id": format!("{}/{}", p.name, m),
                 "object": "model",
@@ -87,8 +88,10 @@ pub async fn chat_completions(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Gemini payload is translated once, before the retry loop.
-    let gemini_body = if matches!(provider.kind, ProviderKind::Gemini) {
+    // Gemini-family payloads are translated once, before the retry loop
+    // (the antigravity envelope additionally needs a per-account project id,
+    // so only the inner Gemini body is prebuilt here).
+    let gemini_body = if matches!(provider.kind, ProviderKind::Gemini | ProviderKind::Antigravity) {
         match gemini::translate_request(&payload) {
             Ok(b) => Some(b),
             Err(e) => {
@@ -117,7 +120,56 @@ pub async fn chat_completions(
                 .http
                 .post(gemini::endpoint(&provider.base_url, &upstream_model, is_stream))
                 .header("x-goog-api-key", &key.secret)
-                .json(gemini_body.as_ref().expect("gemini body"))
+                .json(gemini_body.as_ref().expect("gemini body")),
+            ProviderKind::Antigravity => {
+                let Some(account) = provider.ag_account(&key.secret) else {
+                    provider.pool.report_failure(&key, FailKind::Auth);
+                    continue;
+                };
+                let token = match account.ensure_access_token(&state.http).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let kind = match &e {
+                            AuthError::Permanent(_) => FailKind::Auth,
+                            AuthError::Transient(_) => FailKind::Network,
+                        };
+                        warn!(provider = %provider.name, account = %account.label(), error = %e, "token refresh failed");
+                        provider.pool.report_failure(&key, kind);
+                        last_err = Some((StatusCode::UNAUTHORIZED, e.to_string()));
+                        continue;
+                    }
+                };
+                let project = match account.ensure_project_id(&state.http, &token).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let kind = match &e {
+                            AuthError::Permanent(_) => FailKind::Auth,
+                            AuthError::Transient(_) => FailKind::Network,
+                        };
+                        warn!(provider = %provider.name, account = %account.label(), error = %e, "project resolution failed");
+                        provider.pool.report_failure(&key, kind);
+                        last_err = Some((StatusCode::BAD_GATEWAY, e.to_string()));
+                        continue;
+                    }
+                };
+                let inner = gemini_body.as_ref().expect("gemini body").clone();
+                let envelope = match antigravity::translate_request_envelope(
+                    &upstream_model,
+                    inner,
+                    &project,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return error_response(StatusCode::BAD_REQUEST, e, "invalid_request_error");
+                    }
+                };
+                state
+                    .http
+                    .post(antigravity::endpoint(&provider.base_url, is_stream))
+                    .bearer_auth(token)
+                    .header(header::USER_AGENT, antigravity::USER_AGENT)
+                    .json(&envelope)
+            }
         };
         for (k, v) in &provider.extra_headers {
             req = req.header(k, v);
@@ -146,9 +198,10 @@ pub async fn chat_completions(
             info!(provider = %provider.name, key = %key.masked(), model = %upstream_model, "ok");
             return match provider.kind {
                 ProviderKind::OpenaiCompat => stream_upstream(resp),
-                ProviderKind::Gemini => {
+                ProviderKind::Gemini | ProviderKind::Antigravity => {
+                    let envelope = matches!(provider.kind, ProviderKind::Antigravity);
                     if is_stream {
-                        let stream = gemini::translate_sse_stream(resp, &upstream_model);
+                        let stream = gemini::translate_sse_stream(resp, &upstream_model, envelope);
                         Response::builder()
                             .status(StatusCode::OK)
                             .header(header::CONTENT_TYPE, "text/event-stream")
@@ -157,8 +210,15 @@ pub async fn chat_completions(
                             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
                     } else {
                         match resp.json::<serde_json::Value>().await {
-                            Ok(v) => Json(gemini::translate_response(&upstream_model, &v))
-                                .into_response(),
+                            Ok(v) => {
+                                let v = if envelope {
+                                    antigravity::unwrap_response(v)
+                                } else {
+                                    v
+                                };
+                                Json(gemini::translate_response(&upstream_model, &v))
+                                    .into_response()
+                            }
                             Err(e) => error_response(
                                 StatusCode::BAD_GATEWAY,
                                 format!("invalid upstream JSON: {e}"),

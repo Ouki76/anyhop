@@ -18,3 +18,20 @@ base_url = "http://127.0.0.1:9101/v1beta"
 strategy = "fill_first"
 keys = ["gkey-bad", "gkey-good"]
 models = ["test-gemini"]
+
+[[providers]]
+name = "ag"
+type = "antigravity"
+base_url = "http://127.0.0.1:9102"
+strategy = "fill_first"
+# models намеренно пустой — список подтягивается через fetchAvailableModels
+
+[[providers.accounts]]
+email = "bad@test.dev"
+access_token = "ag-bad"
+project_id = "test-project"
+
+[[providers.accounts]]
+email = "good@test.dev"
+access_token = "ag-good"
+project_id = "test-project"
