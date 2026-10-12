@@ -138,6 +138,7 @@ pub enum ProviderKind {
     OpenaiCompat,
     Gemini,
     Antigravity,
+    Anthropic,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]

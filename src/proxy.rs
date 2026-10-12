@@ -10,6 +10,7 @@ use futures::StreamExt;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::anthropic::{self};
 use crate::antigravity::{self, AuthError};
 use crate::config::ProviderKind;
 use crate::gemini;
@@ -147,17 +148,19 @@ async fn run_target(
     payload: &Value,
     is_stream: bool,
 ) -> Option<Response> {
-    // Gemini-family payloads are translated once, before the retry loop
+    // Translated payloads are prebuilt once, before the retry loop
     // (the antigravity envelope additionally needs a per-account project id).
-    let gemini_body = if matches!(provider.kind, ProviderKind::Gemini | ProviderKind::Antigravity) {
-        match gemini::translate_request(payload) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                return Some(error_response(StatusCode::BAD_REQUEST, e, "invalid_request_error"));
-            }
+    let translated = match provider.kind {
+        ProviderKind::Gemini | ProviderKind::Antigravity => Some(gemini::translate_request(payload)),
+        ProviderKind::Anthropic => Some(anthropic::translate_request(payload)),
+        _ => None,
+    };
+    let translated = match translated {
+        Some(Ok(b)) => Some(b),
+        Some(Err(e)) => {
+            return Some(error_response(StatusCode::BAD_REQUEST, e, "invalid_request_error"));
         }
-    } else {
-        None
+        None => None,
     };
 
     for _ in 0..state.max_retries.max(1) {
@@ -180,7 +183,19 @@ async fn run_target(
                 .client
                 .post(gemini::endpoint(&provider.base_url, model, is_stream))
                 .header("x-goog-api-key", &key.secret)
-                .json(gemini_body.as_ref().expect("gemini body")),
+                .json(translated.as_ref().expect("gemini body")),
+            ProviderKind::Anthropic => {
+                let mut body = translated.as_ref().expect("anthropic body").clone();
+                if is_stream {
+                    body["stream"] = Value::Bool(true);
+                }
+                provider
+                    .client
+                    .post(format!("{}/v1/messages", provider.base_url))
+                    .header("x-api-key", &key.secret)
+                    .header("anthropic-version", anthropic::API_VERSION)
+                    .json(&body)
+            }
             ProviderKind::Antigravity => {
                 let Some(account) = provider.ag_account(&key.secret) else {
                     provider.pool.report_failure(&key, FailKind::Auth, model);
@@ -210,7 +225,7 @@ async fn run_target(
                         continue;
                     }
                 };
-                let inner = gemini_body.as_ref().expect("gemini body").clone();
+                let inner = translated.as_ref().expect("gemini body").clone();
                 let envelope = match antigravity::translate_request_envelope(model, inner, &project)
                 {
                     Ok(v) => v,
@@ -415,10 +430,15 @@ async fn success_response(
                 }
             }
         }
-        ProviderKind::Gemini | ProviderKind::Antigravity => {
+        ProviderKind::Gemini | ProviderKind::Antigravity | ProviderKind::Anthropic => {
             let envelope = matches!(provider.kind, ProviderKind::Antigravity);
             if is_stream {
-                let stream = gemini::translate_sse_stream(resp, model, envelope, Some(key));
+                let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+                    if matches!(provider.kind, ProviderKind::Anthropic) {
+                        Box::pin(anthropic::translate_sse_stream(resp, model, Some(key)))
+                    } else {
+                        Box::pin(gemini::translate_sse_stream(resp, model, envelope, Some(key)))
+                    };
                 let stream = stream.map(move |item| {
                     let _ = &guard; // keep the in-flight slot until the stream ends
                     item
@@ -433,10 +453,20 @@ async fn success_response(
                 drop(guard);
                 match resp.json::<Value>().await {
                     Ok(v) => {
-                        let v = if envelope { antigravity::unwrap_response(v) } else { v };
-                        let (p, c) = gemini::usage_pair(&v);
-                        add_usage(&key, p, c);
-                        Json(gemini::translate_response(model, &v)).into_response()
+                        if matches!(provider.kind, ProviderKind::Anthropic) {
+                            let u = v.get("usage").cloned().unwrap_or(Value::Null);
+                            add_usage(
+                                &key,
+                                u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                                u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                            );
+                            Json(anthropic::translate_response(model, &v)).into_response()
+                        } else {
+                            let v = if envelope { antigravity::unwrap_response(v) } else { v };
+                            let (p, c) = gemini::usage_pair(&v);
+                            add_usage(&key, p, c);
+                            Json(gemini::translate_response(model, &v)).into_response()
+                        }
                     }
                     Err(e) => error_response(
                         StatusCode::BAD_GATEWAY,

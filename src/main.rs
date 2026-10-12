@@ -1,3 +1,4 @@
+mod anthropic;
 mod antigravity;
 mod config;
 mod dashboard;

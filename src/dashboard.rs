@@ -32,6 +32,7 @@ fn collect_providers(state: &AppState) -> Vec<ProviderView> {
                 crate::config::ProviderKind::OpenaiCompat => "openai_compat",
                 crate::config::ProviderKind::Gemini => "gemini",
                 crate::config::ProviderKind::Antigravity => "antigravity",
+                crate::config::ProviderKind::Anthropic => "anthropic",
             }
             .to_string(),
             strategy: match p.strategy {

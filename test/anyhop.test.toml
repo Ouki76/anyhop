@@ -50,3 +50,11 @@ models = ["drain-model"]
 [[combos]]
 name = "testcombo"
 chain = ["gemini/test-gemini", "mock/test-model"]
+
+[[providers]]
+name = "claude"
+type = "anthropic"
+base_url = "http://127.0.0.1:9103"
+strategy = "fill_first"
+keys = ["cl-bad", "cl-good"]
+models = ["claude-test"]

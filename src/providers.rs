@@ -50,14 +50,14 @@ impl Provider {
         let effective_proxy = cfg.proxy.as_deref().or(default_proxy);
         let base_url = cfg.base_url.trim_end_matches('/').to_string();
         let (secrets, ag_accounts) = match cfg.kind {
-            ProviderKind::OpenaiCompat | ProviderKind::Gemini => {
+            ProviderKind::OpenaiCompat | ProviderKind::Gemini | ProviderKind::Anthropic => {
                 anyhow::ensure!(
                     !cfg.keys.is_empty(),
                     "provider '{}': no keys configured",
                     cfg.name
                 );
                 anyhow::ensure!(
-                    !base_url.is_empty(),
+                    !base_url.is_empty() || matches!(cfg.kind, ProviderKind::Anthropic),
                     "provider '{}': base_url is required",
                     cfg.name
                 );
@@ -85,7 +85,11 @@ impl Provider {
             }
         };
         let base_url = if base_url.is_empty() {
-            antigravity::DAILY_ENDPOINT.to_string()
+            match cfg.kind {
+                ProviderKind::Antigravity => antigravity::DAILY_ENDPOINT.to_string(),
+                ProviderKind::Anthropic => crate::anthropic::DEFAULT_BASE_URL.to_string(),
+                _ => base_url,
+            }
         } else {
             base_url
         };
