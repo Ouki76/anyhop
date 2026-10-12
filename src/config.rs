@@ -53,6 +53,14 @@ pub struct ServerConfig {
     /// If set, /v1/* endpoints require `Authorization: Bearer <api_key>`.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Serve the web dashboard at /dashboard (the JSON API stays on regardless).
+    #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
+    #[serde(default = "default_true")]
+    pub dashboard: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_state_file() -> String {
@@ -68,6 +76,7 @@ impl Default for ServerConfig {
             state_file: default_state_file(),
             proxy: None,
             api_key: None,
+            dashboard: true,
         }
     }
 }

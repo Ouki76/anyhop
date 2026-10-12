@@ -24,34 +24,4 @@ impl DashEvent {
             detail,
         }
     }
-
-    pub fn time_hms(&self) -> String {
-        let s = self.ts % 86400;
-        format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
-    }
-
-    /// HTML fragment for the htmx SSE feed.
-    pub fn to_html(&self) -> String {
-        let cls = match self.kind {
-            "rate_limited" => "ev-warn",
-            "dead" => "ev-err",
-            _ => "ev-info",
-        };
-        format!(
-            "<div class=\"ev {cls}\"><span class=\"ev-ts\">{}</span> \
-             <b>{}</b> [{}] {} — {}</div>",
-            self.time_hms(),
-            html_escape(&self.provider),
-            self.kind,
-            html_escape(&self.key),
-            html_escape(&self.detail),
-        )
-    }
-}
-
-pub fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }

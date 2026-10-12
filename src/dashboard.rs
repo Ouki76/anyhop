@@ -1,225 +1,30 @@
-//! Web dashboard: askama templates + htmx (polled table) + SSE (live failover feed).
+//! Optional web dashboard: serves the embedded Sycamore WASM build (ui/dist).
+//! All logic lives in the JSON API (api.rs); this is static file serving only.
 
-use std::convert::Infallible;
-use std::sync::Arc;
-
-use askama::Template;
-use axum::Form;
-use axum::extract::State;
+use axum::extract::Path;
 use axum::http::{StatusCode, header};
-use axum::response::{Html, IntoResponse, Response};
-use axum::response::sse::{Event, Sse};
-use futures::StreamExt;
-use serde::Deserialize;
+use axum::response::{IntoResponse, Response};
+use rust_embed::Embed;
 
-use crate::pool::KeySnapshot;
-use crate::proxy::AppState;
+#[derive(Embed)]
+#[folder = "ui/dist"]
+struct UiAssets;
 
-struct ProviderView {
-    name: String,
-    kind: String,
-    strategy: String,
-    base_url: String,
-    keys: Vec<KeySnapshot>,
+pub async fn index() -> Response {
+    serve_file("index.html")
 }
 
-fn collect_providers(router: &crate::providers::ProviderRouter) -> Vec<ProviderView> {
-    router
-        .providers
-        .iter()
-        .map(|p| ProviderView {
-            name: p.name.clone(),
-            kind: match p.kind {
-                crate::config::ProviderKind::OpenaiCompat => "openai_compat",
-                crate::config::ProviderKind::Gemini => "gemini",
-                crate::config::ProviderKind::Antigravity => "antigravity",
-                crate::config::ProviderKind::Anthropic => "anthropic",
-                crate::config::ProviderKind::Codex => "codex",
-            }
-            .to_string(),
-            strategy: match p.strategy {
-                crate::config::Strategy::RoundRobin => "round_robin",
-                crate::config::Strategy::LeastUsed => "least_used",
-                crate::config::Strategy::FillFirst => "fill_first",
-            }
-            .to_string(),
-            base_url: p.base_url.clone(),
-            keys: p.pool.snapshot(),
-        })
-        .collect()
+pub async fn asset(Path(path): Path<String>) -> Response {
+    serve_file(&path)
 }
 
-#[derive(Template)]
-#[template(path = "dashboard.html")]
-struct DashboardTemplate {
-    providers: Vec<ProviderView>,
-}
-
-#[derive(Template)]
-#[template(path = "keys_table.html")]
-struct KeysTableTemplate {
-    providers: Vec<ProviderView>,
-}
-
-struct QuotaModelView {
-    id: String,
-    pct: Option<u64>,
-    low: bool,
-    reset: String,
-}
-
-struct QuotaView {
-    provider: String,
-    account: String,
-    models: Vec<QuotaModelView>,
-}
-
-#[derive(Template)]
-#[template(path = "quotas.html")]
-struct QuotasTemplate {
-    quotas: Vec<QuotaView>,
-}
-
-pub async fn quotas_partial(State(state): State<Arc<AppState>>) -> Response {
-    let router = state.router.load();
-    let mut quotas = Vec::new();
-    for p in &router.providers {
-        for (account, models) in p.quotas().await {
-            quotas.push(QuotaView {
-                provider: p.name.clone(),
-                account,
-                models: models
-                    .into_iter()
-                    .map(|m| {
-                        let pct = m.remaining_fraction.map(|f| (f * 100.0).round() as u64);
-                        QuotaModelView {
-                            id: m.id,
-                            pct,
-                            low: pct.map(|p| p < 10).unwrap_or(false),
-                            reset: m.reset_time.unwrap_or_default(),
-                        }
-                    })
-                    .collect(),
-            });
+fn serve_file(path: &str) -> Response {
+    match UiAssets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            ([(header::CONTENT_TYPE, mime.as_ref())], content.data.to_vec()).into_response()
         }
-    }
-    match (QuotasTemplate { quotas }).render() {
-        Ok(html) => Html(html).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        None => (StatusCode::NOT_FOUND, "ui not built; run `trunk build` in ui/").into_response(),
     }
 }
 
-pub async fn index(State(state): State<Arc<AppState>>) -> Response {
-    let router = state.router.load();
-    let tpl = DashboardTemplate {
-        providers: collect_providers(&router),
-    };
-    match tpl.render() {
-        Ok(html) => Html(html).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-pub async fn keys_partial(State(state): State<Arc<AppState>>) -> Response {
-    let router = state.router.load();
-    let tpl = KeysTableTemplate {
-        providers: collect_providers(&router),
-    };
-    match tpl.render() {
-        Ok(html) => Html(html).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-pub async fn events_sse(
-    State(state): State<Arc<AppState>>,
-) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let rx = state.events.subscribe();
-    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|ev| async move {
-        match ev {
-            Ok(e) => Some(Ok(Event::default().data(e.to_html()))),
-            Err(_) => None, // lagged — just drop
-        }
-    });
-    Sse::new(stream).keep_alive(
-        axum::response::sse::KeepAlive::new()
-            .interval(std::time::Duration::from_secs(15))
-            .text("ping"),
-    )
-}
-
-// ---------- key management ----------
-
-#[derive(Deserialize)]
-pub struct KeyAction {
-    provider: String,
-    id: String,
-}
-
-#[derive(Deserialize)]
-pub struct AddKey {
-    provider: String,
-    secret: String,
-}
-
-fn set_key(state: &AppState, form: &KeyAction, enabled: bool) -> Response {
-    let router = state.router.load();
-    let Some(p) = router.providers.iter().find(|p| p.name == form.provider) else {
-        return (StatusCode::NOT_FOUND, "unknown provider").into_response();
-    };
-    if p.pool.set_enabled(&form.id, enabled) {
-        StatusCode::OK.into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "unknown key").into_response()
-    }
-}
-
-pub async fn key_enable(State(state): State<Arc<AppState>>, Form(f): Form<KeyAction>) -> Response {
-    set_key(&state, &f, true)
-}
-
-pub async fn key_disable(State(state): State<Arc<AppState>>, Form(f): Form<KeyAction>) -> Response {
-    set_key(&state, &f, false)
-}
-
-pub async fn key_add(State(state): State<Arc<AppState>>, Form(f): Form<AddKey>) -> Response {
-    let secret = f.secret.trim();
-    if secret.len() < 4 {
-        return (StatusCode::BAD_REQUEST, "key too short").into_response();
-    }
-    let router = state.router.load();
-    let Some(p) = router.providers.iter().find(|p| p.name == f.provider) else {
-        return (StatusCode::NOT_FOUND, "unknown provider").into_response();
-    };
-    if matches!(
-        p.kind,
-        crate::config::ProviderKind::Antigravity | crate::config::ProviderKind::Codex
-    ) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "OAuth accounts are added via `anyhop auth …`",
-        )
-            .into_response();
-    }
-    p.pool.add_key(secret.to_string());
-    if let Some(s) = &state.storage {
-        s.save_extra_key(&p.name, secret);
-    }
-    StatusCode::OK.into_response()
-}
-
-pub async fn htmx_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-        include_str!("../assets/htmx.min.js"),
-    )
-        .into_response()
-}
-
-pub async fn htmx_sse_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-        include_str!("../assets/htmx-sse.js"),
-    )
-        .into_response()
-}

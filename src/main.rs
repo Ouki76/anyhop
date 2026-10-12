@@ -1,7 +1,9 @@
 mod anthropic;
 mod antigravity;
+mod api;
 mod codex;
 mod config;
+#[cfg(feature = "dashboard")]
 mod dashboard;
 mod events;
 mod fim;
@@ -169,17 +171,26 @@ async fn main() -> anyhow::Result<()> {
     let app = axum::Router::new()
         .merge(api)
         .route("/healthz", get(|| async { "ok" }))
-        .route("/", get(|| async { axum::response::Redirect::to("/dashboard") }))
-        .route("/dashboard", get(dashboard::index))
-        .route("/dashboard/partials/keys", get(dashboard::keys_partial))
-        .route("/dashboard/partials/quotas", get(dashboard::quotas_partial))
-        .route("/dashboard/events", get(dashboard::events_sse))
-        .route("/dashboard/static/htmx.min.js", get(dashboard::htmx_js))
-        .route("/dashboard/static/sse.js", get(dashboard::htmx_sse_js))
-        .route("/dashboard/keys/enable", post(dashboard::key_enable))
-        .route("/dashboard/keys/disable", post(dashboard::key_disable))
-        .route("/dashboard/keys/add", post(dashboard::key_add))
-        .with_state(state.clone());
+        .route("/api/providers", get(api::providers))
+        .route("/api/quotas", get(api::quotas))
+        .route("/api/events", get(api::events))
+        .route("/api/keys/enable", post(api::key_enable))
+        .route("/api/keys/disable", post(api::key_disable))
+        .route("/api/keys/add", post(api::key_add));
+
+    #[cfg(feature = "dashboard")]
+    let app = if cfg.server.dashboard {
+        info!("dashboard: /dashboard (Sycamore UI)");
+        app.route("/", get(|| async { axum::response::Redirect::to("/dashboard") }))
+            .route("/dashboard", get(dashboard::index))
+            .route("/dashboard/", get(dashboard::index))
+            .route("/dashboard/{*path}", get(dashboard::asset))
+    } else {
+        info!("dashboard disabled by config");
+        app
+    };
+
+    let app = app.with_state(state.clone());
 
     // Hot-reload on SIGHUP.
     #[cfg(unix)]

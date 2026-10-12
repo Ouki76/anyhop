@@ -17,8 +17,11 @@ OpenAI-совместимый LLM-шлюз с автоматической ро�
 - **Gateway auth**: `[server] api_key` защищает /v1/*
 - **Hot-reload**: `kill -HUP` перечитывает конфиг без рестарта
 - **Персистентность** (redb): health ключей, OAuth-токены, статистика, добавленные ключи
-- **Дашборд** `/dashboard`: статусы, токены, in-flight, enable/disable/add ключей,
-  SSE failover-лента
+- **JSON API** `/api/*`: providers, квоты, SSE-события, управление ключами — всегда доступен
+- **Дашборд** `/dashboard` (опционально): Sycamore (Rust→WASM) SPA поверх JSON API.
+  Рантайм: `[server] dashboard = false`. Сборка без UI: `cargo build --no-default-features`.
+  Сборка UI: `cd ui && trunk build --release`
+- **FIM-эндпоинт** `/v1/fim/completions` (+ алиас `/v1/completions`) для IDE-автодополнения
 - **Стриминг** без буферизации во всех режимах (SSE→SSE для gemini/antigravity с трансляцией)
 - **Tool calls**: полный цикл (tools, tool_choice, параллельные вызовы, functionResponse)
 - **Thinking**: reasoning_effort → thinkingConfig, мысли отдаются как reasoning_content,
