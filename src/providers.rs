@@ -36,6 +36,8 @@ pub struct Provider {
     /// Antigravity OAuth accounts, index-aligned with pool keys
     /// (pool secret == account refresh token).
     ag_accounts: Vec<Arc<Account>>,
+    /// Codex (ChatGPT) OAuth accounts.
+    codex_accounts: Vec<Arc<crate::codex::CodexAccount>>,
     models_cache: Mutex<Option<(Instant, Vec<String>)>>,
 }
 
@@ -49,6 +51,7 @@ impl Provider {
         // Priority: account.proxy > provider.proxy > server-wide proxy.
         let effective_proxy = cfg.proxy.as_deref().or(default_proxy);
         let base_url = cfg.base_url.trim_end_matches('/').to_string();
+        let mut codex_accounts: Vec<Arc<crate::codex::CodexAccount>> = Vec::new();
         let (secrets, ag_accounts) = match cfg.kind {
             ProviderKind::OpenaiCompat | ProviderKind::Gemini | ProviderKind::Anthropic => {
                 anyhow::ensure!(
@@ -63,31 +66,47 @@ impl Provider {
                 );
                 (cfg.keys.clone(), Vec::new())
             }
-            ProviderKind::Antigravity => {
+            ProviderKind::Antigravity | ProviderKind::Codex => {
+                let auth_cmd = if matches!(cfg.kind, ProviderKind::Antigravity) {
+                    "anyhop auth antigravity"
+                } else {
+                    "anyhop auth codex"
+                };
                 anyhow::ensure!(
                     !cfg.accounts.is_empty(),
-                    "provider '{}': no accounts configured (run `anyhop auth antigravity`)",
+                    "provider '{}': no accounts configured (run `{auth_cmd}`)",
                     cfg.name
                 );
                 let provider_client = build_http_client(effective_proxy)?;
-                let mut accounts = Vec::new();
+                let mut ag: Vec<Arc<Account>> = Vec::new();
                 for a in &cfg.accounts {
                     let client = match &a.proxy {
                         Some(p) => build_http_client(Some(p))?,
                         None => provider_client.clone(),
                     };
-                    accounts.push(Arc::new(Account::new(a, &cfg.name, storage, client)));
+                    if matches!(cfg.kind, ProviderKind::Antigravity) {
+                        ag.push(Arc::new(Account::new(a, &cfg.name, storage, client)));
+                    } else {
+                        codex_accounts.push(Arc::new(crate::codex::CodexAccount::new(
+                            a, &cfg.name, storage, client,
+                        )));
+                    }
                 }
-                let accounts: Vec<Arc<Account>> = accounts;
-                let secrets: Vec<String> =
-                    accounts.iter().map(|a| a.pool_secret().to_string()).collect();
-                (secrets, accounts)
+                let secrets: Vec<String> = if matches!(cfg.kind, ProviderKind::Antigravity) {
+                    ag.iter().map(|a| a.pool_secret().to_string()).collect()
+                } else {
+                    codex_accounts.iter().map(|a| a.pool_secret().to_string()).collect()
+                };
+                (secrets, ag)
             }
         };
         let base_url = if base_url.is_empty() {
             match cfg.kind {
                 ProviderKind::Antigravity => antigravity::DAILY_ENDPOINT.to_string(),
                 ProviderKind::Anthropic => crate::anthropic::DEFAULT_BASE_URL.to_string(),
+                ProviderKind::Codex => {
+                    "https://chatgpt.com/backend-api/codex".to_string()
+                }
                 _ => base_url,
             }
         } else {
@@ -115,6 +134,7 @@ impl Provider {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             ag_accounts,
+            codex_accounts,
             models_cache: Mutex::new(None),
         })
     }
@@ -122,6 +142,14 @@ impl Provider {
     /// Find the OAuth account behind a pool key (antigravity only).
     pub fn ag_account(&self, secret: &str) -> Option<Arc<Account>> {
         self.ag_accounts
+            .iter()
+            .find(|a| a.pool_secret() == secret)
+            .cloned()
+    }
+
+    /// Find the Codex account behind a pool key.
+    pub fn codex_account(&self, secret: &str) -> Option<Arc<crate::codex::CodexAccount>> {
+        self.codex_accounts
             .iter()
             .find(|a| a.pool_secret() == secret)
             .cloned()

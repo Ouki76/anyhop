@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use crate::anthropic::{self};
 use crate::antigravity::{self, AuthError};
+use crate::codex;
 use crate::config::ProviderKind;
 use crate::gemini;
 use crate::pool::{FailKind, KeyState};
@@ -170,6 +171,7 @@ async fn run_target(
     let translated = match provider.kind {
         ProviderKind::Gemini | ProviderKind::Antigravity => Some(gemini::translate_request(payload)),
         ProviderKind::Anthropic => Some(anthropic::translate_request(payload)),
+        ProviderKind::Codex => Some(codex::translate_request(model, payload)),
         _ => None,
     };
     let translated = match translated {
@@ -212,6 +214,36 @@ async fn run_target(
                     .header("x-api-key", &key.secret)
                     .header("anthropic-version", anthropic::API_VERSION)
                     .json(&body)
+            }
+            ProviderKind::Codex => {
+                let Some(account) = provider.codex_account(&key.secret) else {
+                    provider.pool.report_failure(&key, FailKind::Auth, model);
+                    continue;
+                };
+                let token = match account.ensure_access_token().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let kind = match &e {
+                            AuthError::Permanent(_) => FailKind::Auth,
+                            AuthError::Transient(_) => FailKind::Network,
+                        };
+                        warn!(provider = %provider.name, account = %account.label(), error = %e, "codex token refresh failed");
+                        provider.pool.report_failure(&key, kind, model);
+                        continue;
+                    }
+                };
+                let mut r = account
+                    .client()
+                    .post(format!("{}/responses", provider.base_url))
+                    .bearer_auth(token)
+                    .header("originator", "codex_cli_rs")
+                    .header("OpenAI-Beta", "responses=experimental")
+                    .header(header::ACCEPT, "text/event-stream")
+                    .json(translated.as_ref().expect("codex body"));
+                if let Some(acc_id) = &account.account_id {
+                    r = r.header("Chatgpt-Account-Id", acc_id);
+                }
+                r
             }
             ProviderKind::Antigravity => {
                 let Some(account) = provider.ag_account(&key.secret) else {
@@ -447,14 +479,19 @@ async fn success_response(
                 }
             }
         }
-        ProviderKind::Gemini | ProviderKind::Antigravity | ProviderKind::Anthropic => {
+        ProviderKind::Gemini | ProviderKind::Antigravity | ProviderKind::Anthropic
+        | ProviderKind::Codex => {
             let envelope = matches!(provider.kind, ProviderKind::Antigravity);
             if is_stream {
                 let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-                    if matches!(provider.kind, ProviderKind::Anthropic) {
-                        Box::pin(anthropic::translate_sse_stream(resp, model, Some(key)))
-                    } else {
-                        Box::pin(gemini::translate_sse_stream(resp, model, envelope, Some(key)))
+                    match provider.kind {
+                        ProviderKind::Anthropic => {
+                            Box::pin(anthropic::translate_sse_stream(resp, model, Some(key)))
+                        }
+                        ProviderKind::Codex => {
+                            Box::pin(codex::translate_sse_stream(resp, model, Some(key)))
+                        }
+                        _ => Box::pin(gemini::translate_sse_stream(resp, model, envelope, Some(key))),
                     };
                 let stream = stream.map(move |item| {
                     let _ = &guard; // keep the in-flight slot until the stream ends
@@ -468,6 +505,26 @@ async fn success_response(
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
             } else {
                 drop(guard);
+                if matches!(provider.kind, ProviderKind::Codex) {
+                    // Codex backend is stream-only; collect the SSE stream.
+                    return match codex::collect_non_stream(resp, model).await {
+                        Ok(v) => {
+                            if let Some(u) = v.get("usage") {
+                                add_usage(
+                                    &key,
+                                    u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                                    u.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                                );
+                            }
+                            Json(v).into_response()
+                        }
+                        Err(e) => error_response(
+                            StatusCode::BAD_GATEWAY,
+                            format!("codex stream collect failed: {e}"),
+                            "upstream_error",
+                        ),
+                    };
+                }
                 match resp.json::<Value>().await {
                     Ok(v) => {
                         if matches!(provider.kind, ProviderKind::Anthropic) {

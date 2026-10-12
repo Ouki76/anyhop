@@ -94,7 +94,7 @@ pub struct ProviderConfig {
     pub keys: Vec<String>,
     /// OAuth accounts (antigravity only).
     #[serde(default)]
-    pub accounts: Vec<AntigravityAccountConfig>,
+    pub accounts: Vec<OAuthAccountConfig>,
     /// Models served by this provider. Empty = wildcard (accept any model).
     #[serde(default)]
     pub models: Vec<String>,
@@ -116,14 +116,18 @@ pub struct ProviderConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct AntigravityAccountConfig {
+pub struct OAuthAccountConfig {
     /// May be empty when `access_token` is provided (dev/testing shortcut).
     #[serde(default)]
     pub refresh_token: String,
     #[serde(default)]
     pub email: Option<String>,
+    /// Antigravity: cloudcode project id.
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Codex: chatgpt account id (from id_token claims).
+    #[serde(default)]
+    pub account_id: Option<String>,
     /// Pre-seeded access token that never refreshes (for tests / imported tokens).
     #[serde(default)]
     pub access_token: Option<String>,
@@ -139,6 +143,7 @@ pub enum ProviderKind {
     Gemini,
     Antigravity,
     Anthropic,
+    Codex,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]

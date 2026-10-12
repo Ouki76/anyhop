@@ -58,3 +58,20 @@ base_url = "http://127.0.0.1:9103"
 strategy = "fill_first"
 keys = ["cl-bad", "cl-good"]
 models = ["claude-test"]
+
+[[providers]]
+name = "codex"
+type = "codex"
+base_url = "http://127.0.0.1:9104"
+strategy = "fill_first"
+models = ["gpt-codex-test"]
+
+[[providers.accounts]]
+email = "cx-bad@test.dev"
+access_token = "cx-bad"
+account_id = "acc-bad"
+
+[[providers.accounts]]
+email = "cx-good@test.dev"
+access_token = "cx-good"
+account_id = "acc-123"

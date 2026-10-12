@@ -1,5 +1,6 @@
 mod anthropic;
 mod antigravity;
+mod codex;
 mod config;
 mod dashboard;
 mod events;
@@ -51,18 +52,23 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() >= 3 && args[1] == "auth" && args[2] == "antigravity" {
+    if args.len() >= 3 && args[1] == "auth" && (args[2] == "antigravity" || args[2] == "codex") {
         let proxy = args
             .windows(2)
             .find(|w| w[0] == "--proxy")
             .map(|w| w[1].clone());
-        return antigravity::run_auth_flow(proxy).await;
+        return if args[2] == "antigravity" {
+            antigravity::run_auth_flow(proxy).await
+        } else {
+            codex::run_auth_flow(proxy).await
+        };
     }
     if args.len() >= 2 && (args[1] == "--help" || args[1] == "-h") {
         println!("anyhop — OpenAI-compatible LLM gateway with key rotation\n");
         println!("USAGE:");
         println!("  anyhop                                          start the gateway");
         println!("  anyhop auth antigravity [--proxy socks5://…]    add an Antigravity account via Google OAuth");
+        println!("  anyhop auth codex       [--proxy socks5://…]    add a ChatGPT/Codex account via OpenAI OAuth");
         println!("\nENV:");
         println!("  ANYHOP_CONFIG   path to config (default: anyhop.toml)");
         return Ok(());

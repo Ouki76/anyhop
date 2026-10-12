@@ -87,7 +87,7 @@ pub struct Account {
 
 impl Account {
     pub fn new(
-        cfg: &crate::config::AntigravityAccountConfig,
+        cfg: &crate::config::OAuthAccountConfig,
         provider: &str,
         storage: Option<&crate::storage::Storage>,
         client: reqwest::Client,
@@ -461,7 +461,7 @@ pub fn build_auth_url(state: &str) -> String {
     )
 }
 
-fn urlencoded(s: &str) -> String {
+pub fn urlencoded(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
@@ -594,10 +594,11 @@ pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
 
     // Best-effort project discovery so the snippet is complete.
     let account = Account::new(
-        &crate::config::AntigravityAccountConfig {
+        &crate::config::OAuthAccountConfig {
             refresh_token: tokens.refresh_token.clone(),
             email: email.clone(),
             project_id: None,
+            account_id: None,
             access_token: None,
             proxy: None,
         },
@@ -630,7 +631,7 @@ pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn percent_decode(s: &str) -> String {
+pub fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

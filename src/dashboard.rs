@@ -34,6 +34,7 @@ fn collect_providers(router: &crate::providers::ProviderRouter) -> Vec<ProviderV
                 crate::config::ProviderKind::Gemini => "gemini",
                 crate::config::ProviderKind::Antigravity => "antigravity",
                 crate::config::ProviderKind::Anthropic => "anthropic",
+                crate::config::ProviderKind::Codex => "codex",
             }
             .to_string(),
             strategy: match p.strategy {
@@ -142,8 +143,15 @@ pub async fn key_add(State(state): State<Arc<AppState>>, Form(f): Form<AddKey>) 
     let Some(p) = router.providers.iter().find(|p| p.name == f.provider) else {
         return (StatusCode::NOT_FOUND, "unknown provider").into_response();
     };
-    if matches!(p.kind, crate::config::ProviderKind::Antigravity) {
-        return (StatusCode::BAD_REQUEST, "antigravity accounts are added via `anyhop auth antigravity`").into_response();
+    if matches!(
+        p.kind,
+        crate::config::ProviderKind::Antigravity | crate::config::ProviderKind::Codex
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "OAuth accounts are added via `anyhop auth …`",
+        )
+            .into_response();
     }
     p.pool.add_key(secret.to_string());
     if let Some(s) = &state.storage {
