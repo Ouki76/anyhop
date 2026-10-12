@@ -6,13 +6,15 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 const HEALTH: TableDefinition<&str, &[u8]> = TableDefinition::new("health");
 const OAUTH: TableDefinition<&str, &[u8]> = TableDefinition::new("oauth");
 const STATS: TableDefinition<&str, &[u8]> = TableDefinition::new("stats");
+/// Keys added at runtime via the dashboard: "extra:{provider}" -> JSON [secret, ...].
+const EXTRAS: TableDefinition<&str, &[u8]> = TableDefinition::new("extras");
 
 /// Storage key for a pool credential: "{provider}:{sha256(secret)[..16]}".
 /// Secrets are never persisted, only their hashes.
@@ -49,14 +51,16 @@ enum StorageMsg {
     Health { key: String, rec: HealthRecord },
     OAuth { key: String, rec: OAuthRecord },
     Stats { key: String, rec: StatsRecord },
+    ExtraKey { provider: String, secret: String },
 }
 
 impl StorageMsg {
-    fn key(&self) -> &str {
+    fn key(&self) -> String {
         match self {
             StorageMsg::Health { key, .. }
             | StorageMsg::OAuth { key, .. }
-            | StorageMsg::Stats { key, .. } => key,
+            | StorageMsg::Stats { key, .. } => key.clone(),
+            StorageMsg::ExtraKey { provider, .. } => format!("extra:{provider}"),
         }
     }
 }
@@ -76,6 +80,7 @@ impl Storage {
             let _ = wtx.open_table(HEALTH)?;
             let _ = wtx.open_table(OAUTH)?;
             let _ = wtx.open_table(STATS)?;
+            let _ = wtx.open_table(EXTRAS)?;
         }
         wtx.commit()?;
 
@@ -89,9 +94,18 @@ impl Storage {
                 tokio::select! {
                     msg = rx.recv() => match msg {
                         Some(m) => {
-                            pending.insert(m.key().to_string(), m);
+                            // ExtraKey entries must not dedupe — collect them all.
+                            if let StorageMsg::ExtraKey { .. } = m {
+                                flush_extra(&writer_db, &m);
+                            } else {
+                                pending.insert(m.key(), m);
+                            }
                             while let Ok(m) = rx.try_recv() {
-                                pending.insert(m.key().to_string(), m);
+                                if let StorageMsg::ExtraKey { .. } = m {
+                                    flush_extra(&writer_db, &m);
+                                } else {
+                                    pending.insert(m.key(), m);
+                                }
                             }
                         }
                         None => {
@@ -149,6 +163,43 @@ impl Storage {
     pub fn load_stats(&self, provider: &str, secret: &str) -> Option<StatsRecord> {
         self.read_json(STATS, &key_id(provider, secret))
     }
+
+    /// Persist a runtime-added key (survives restarts).
+    pub fn save_extra_key(&self, provider: &str, secret: &str) {
+        let _ = self.tx.send(StorageMsg::ExtraKey {
+            provider: provider.to_string(),
+            secret: secret.to_string(),
+        });
+    }
+
+    pub fn list_extra_keys(&self, provider: &str) -> Vec<String> {
+        self.read_json(EXTRAS, &format!("extra:{provider}"))
+            .unwrap_or_default()
+    }
+}
+
+fn flush_extra(db: &Arc<Database>, msg: &StorageMsg) {
+    let StorageMsg::ExtraKey { provider, secret } = msg else {
+        return;
+    };
+    let Ok(wtx) = db.begin_write() else { return };
+    {
+        let Ok(mut t) = wtx.open_table(EXTRAS) else { return };
+        let key = format!("extra:{provider}");
+        let mut list: Vec<String> = t
+            .get(key.as_str())
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_slice(v.value()).ok())
+            .unwrap_or_default();
+        if !list.contains(secret) {
+            list.push(secret.clone());
+            if let Ok(j) = serde_json::to_vec(&list) {
+                let _ = t.insert(key.as_str(), j.as_slice());
+            }
+        }
+    }
+    let _ = wtx.commit();
 }
 
 fn flush(db: &Arc<Database>, pending: &mut HashMap<String, StorageMsg>) {

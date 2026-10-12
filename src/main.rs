@@ -26,7 +26,7 @@ async fn require_api_key(
     req: Request,
     next: Next,
 ) -> Response {
-    if let Some(expected) = &state.api_key {
+    if let Some(expected) = state.rt().api_key {
         let ok = req
             .headers()
             .get(header::AUTHORIZATION)
@@ -119,14 +119,33 @@ async fn main() -> anyhow::Result<()> {
         info!("gateway API key auth enabled for /v1/*");
     }
 
+    // Merge keys added at runtime via the dashboard.
+    if let Some(s) = &storage {
+        for p in &providers {
+            if matches!(p.kind, config::ProviderKind::Antigravity) {
+                continue;
+            }
+            for secret in s.list_extra_keys(&p.name) {
+                if !p.pool.contains(&secret) {
+                    info!("provider '{}': loaded extra key from state", p.name);
+                    p.pool.add_key(secret);
+                }
+            }
+        }
+    }
+
     let state = Arc::new(proxy::AppState {
-        router: providers::ProviderRouter {
+        router: arc_swap::ArcSwap::from_pointee(providers::ProviderRouter {
             providers,
             combos: cfg.combos.clone(),
-        },
-        max_retries: cfg.server.max_retries,
-        attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),
-        api_key: cfg.server.api_key.clone(),
+        }),
+        cfg: std::sync::RwLock::new(proxy::RtConfig {
+            max_retries: cfg.server.max_retries,
+            attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),
+            api_key: cfg.server.api_key.clone(),
+        }),
+        storage: storage.clone(),
+        config_path: config_path.clone(),
         events: events_tx,
     });
 
@@ -147,7 +166,27 @@ async fn main() -> anyhow::Result<()> {
         .route("/dashboard/events", get(dashboard::events_sse))
         .route("/dashboard/static/htmx.min.js", get(dashboard::htmx_js))
         .route("/dashboard/static/sse.js", get(dashboard::htmx_sse_js))
+        .route("/dashboard/keys/enable", post(dashboard::key_enable))
+        .route("/dashboard/keys/disable", post(dashboard::key_disable))
+        .route("/dashboard/keys/add", post(dashboard::key_add))
         .with_state(state.clone());
+
+    // Hot-reload on SIGHUP.
+    #[cfg(unix)]
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("SIGHUP handler");
+            loop {
+                sig.recv().await;
+                match reload_config(&st) {
+                    Ok(n) => info!("SIGHUP: config reloaded ({n} providers)"),
+                    Err(e) => tracing::warn!("SIGHUP: reload failed, keeping current config: {e}"),
+                }
+            }
+        });
+    }
 
     // Periodic stats persistence.
     tokio::spawn(async move {
@@ -155,7 +194,8 @@ async fn main() -> anyhow::Result<()> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            for p in &state.router.providers {
+            let router = state.router.load();
+            for p in &router.providers {
                 p.pool.persist_stats();
             }
         }
@@ -165,4 +205,41 @@ async fn main() -> anyhow::Result<()> {
     info!("anyhop listening on http://{}", cfg.server.listen);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Rebuild providers/router from the config file (state restored from storage).
+fn reload_config(state: &Arc<proxy::AppState>) -> anyhow::Result<usize> {
+    let cfg = config::Config::load(&state.config_path)?;
+    let mut providers = Vec::new();
+    for p in &cfg.providers {
+        providers.push(providers::Provider::from_config(
+            p,
+            state.storage.as_ref(),
+            Some(&state.events),
+            cfg.server.proxy.as_deref(),
+        )?);
+    }
+    if let Some(s) = &state.storage {
+        for p in &providers {
+            if matches!(p.kind, config::ProviderKind::Antigravity) {
+                continue;
+            }
+            for secret in s.list_extra_keys(&p.name) {
+                if !p.pool.contains(&secret) {
+                    p.pool.add_key(secret);
+                }
+            }
+        }
+    }
+    let n = providers.len();
+    state.router.store(Arc::new(providers::ProviderRouter {
+        providers,
+        combos: cfg.combos.clone(),
+    }));
+    *state.cfg.write().unwrap() = proxy::RtConfig {
+        max_retries: cfg.server.max_retries,
+        attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),
+        api_key: cfg.server.api_key.clone(),
+    };
+    Ok(n)
 }

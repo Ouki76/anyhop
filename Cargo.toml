@@ -26,6 +26,7 @@ hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mimalloc = "0.1"
+arc-swap = "1.9.2"
 
 [profile.release]
 lto = "thin"

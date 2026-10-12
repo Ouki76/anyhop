@@ -7,11 +7,18 @@ OpenAI-совместимый LLM-шлюз с автоматической ро�
 
 - **Единая точка** `POST /v1/chat/completions` (OpenAI-формат) для всех провайдеров
 - **Провайдеры**: `openai_compat` (OpenRouter, DeepSeek, Groq, ...), `gemini` (API-ключи),
-  `antigravity` (Google OAuth-аккаунты через cloudcode-pa)
+  `antigravity` (Google OAuth-аккаунты через cloudcode-pa), `anthropic` (API-ключи)
+- **Combos**: виртуальные модели с fallback-цепочкой между провайдерами (`[[combos]]`)
 - **Стратегии ротации**: `round_robin`, `least_used`, `fill_first` (дожать квоту ключа → следующий)
-- **Failover**: 429 + Retry-After → точный кулдаун, 401/403 → dead, 5xx/timeout → экспоненциальный бэкофф
-- **Персистентность** (redb): health ключей, OAuth-токены и статистика переживают рестарт
-- **Дашборд** `/dashboard`: статусы ключей в реальном времени (htmx + SSE failover-ленты)
+- **Failover**: 429 + Retry-After → точный кулдаун, 401/403 → dead, 5xx/timeout → бэкофф;
+  per-model кулдауны для Antigravity (квота одной модели не блокирует остальные)
+- **Проактивный drain**: чтение x-ratelimit-* заголовков, уход с ключа до исчерпания лимита
+- **Admission control**: `max_concurrent` на ключ
+- **Gateway auth**: `[server] api_key` защищает /v1/*
+- **Hot-reload**: `kill -HUP` перечитывает конфиг без рестарта
+- **Персистентность** (redb): health ключей, OAuth-токены, статистика, добавленные ключи
+- **Дашборд** `/dashboard`: статусы, токены, in-flight, enable/disable/add ключей,
+  SSE failover-лента
 - **Стриминг** без буферизации во всех режимах (SSE→SSE для gemini/antigravity с трансляцией)
 - **Tool calls**: полный цикл (tools, tool_choice, параллельные вызовы, functionResponse)
 - **Thinking**: reasoning_effort → thinkingConfig, мысли отдаются как reasoning_content,

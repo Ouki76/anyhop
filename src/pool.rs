@@ -335,6 +335,9 @@ impl KeyPool {
     // ----- dashboard management -----
 
     fn key_by_id(&self, id: &str) -> Option<Arc<KeyState>> {
+        if id.len() < 8 {
+            return None;
+        }
         self.keys
             .lock()
             .unwrap()
@@ -360,6 +363,10 @@ impl KeyPool {
             if enabled { "key enabled manually" } else { "key disabled manually" }.into(),
         );
         true
+    }
+
+    pub fn contains(&self, secret: &str) -> bool {
+        self.keys.lock().unwrap().iter().any(|k| k.secret == secret)
     }
 
     /// Add a key at runtime (dashboard). Restores persisted health/stats.

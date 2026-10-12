@@ -17,12 +17,26 @@ use crate::gemini;
 use crate::pool::{FailKind, KeyState};
 use crate::providers::{Provider, ProviderRouter, Resolved};
 
-pub struct AppState {
-    pub router: ProviderRouter,
+/// Hot-reloadable server settings.
+#[derive(Clone)]
+pub struct RtConfig {
     pub max_retries: usize,
     pub attempt_timeout: Duration,
     pub api_key: Option<String>,
+}
+
+pub struct AppState {
+    pub router: arc_swap::ArcSwap<ProviderRouter>,
+    pub cfg: std::sync::RwLock<RtConfig>,
+    pub storage: Option<crate::storage::Storage>,
+    pub config_path: String,
     pub events: tokio::sync::broadcast::Sender<crate::events::DashEvent>,
+}
+
+impl AppState {
+    pub fn rt(&self) -> RtConfig {
+        self.cfg.read().unwrap().clone()
+    }
 }
 
 pub fn error_response(status: StatusCode, message: impl Into<String>, ty: &str) -> Response {
@@ -37,8 +51,9 @@ pub fn error_response(status: StatusCode, message: impl Into<String>, ty: &str) 
 }
 
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
+    let router = state.router.load();
     let mut data = Vec::new();
-    for p in &state.router.providers {
+    for p in &router.providers {
         for m in p.effective_models().await {
             data.push(serde_json::json!({
                 "id": format!("{}/{}", p.name, m),
@@ -47,7 +62,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
             }));
         }
     }
-    for c in &state.router.combos {
+    for c in &router.combos {
         data.push(serde_json::json!({
             "id": c.name,
             "object": "model",
@@ -84,7 +99,8 @@ pub async fn chat_completions(
         );
     };
 
-    let Some(resolved) = state.router.resolve(&model) else {
+    let router = state.router.load();
+    let Some(resolved) = router.resolve(&model) else {
         return error_response(
             StatusCode::NOT_FOUND,
             format!("no provider serves model '{model}'"),
@@ -97,11 +113,12 @@ pub async fn chat_completions(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let max_retries = state.rt().max_retries;
     match resolved {
         Resolved::One(provider, upstream_model) => {
             match run_target(&state, provider, &upstream_model, &payload, is_stream).await {
                 Some(resp) => resp,
-                None => exhausted_response(&provider.name, state.max_retries),
+                None => exhausted_response(&provider.name, max_retries),
             }
         }
         Resolved::Chain(chain) => {
@@ -163,7 +180,7 @@ async fn run_target(
         None => None,
     };
 
-    for _ in 0..state.max_retries.max(1) {
+    for _ in 0..state.rt().max_retries.max(1) {
         let Some(key) = provider.pool.pick(model) else {
             warn!(provider = %provider.name, model, "no available keys (all busy/cooling down/dead)");
             break;
@@ -249,7 +266,7 @@ async fn run_target(
             req = req.header(k, v);
         }
 
-        let result = tokio::time::timeout(state.attempt_timeout, req.send()).await;
+        let result = tokio::time::timeout(state.rt().attempt_timeout, req.send()).await;
         let resp = match result {
             Err(_) => {
                 provider.pool.report_failure(&key, FailKind::Network, model);
