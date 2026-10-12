@@ -61,16 +61,13 @@ impl KeyState {
     fn is_available(&self) -> bool {
         match self.status.load(Ordering::Relaxed) {
             STATUS_ACTIVE => true,
-            STATUS_COOLDOWN => {
-                if now_ms() >= self.cooldown_until_ms.load(Ordering::Relaxed) {
-                    // Lazy promote back to active.
-                    self.status.store(STATUS_ACTIVE, Ordering::Relaxed);
-                    self.consecutive_failures.store(0, Ordering::Relaxed);
-                    true
-                } else {
-                    false
-                }
+            // Lazy promote back to active once cooldown expires.
+            STATUS_COOLDOWN if now_ms() >= self.cooldown_until_ms.load(Ordering::Relaxed) => {
+                self.status.store(STATUS_ACTIVE, Ordering::Relaxed);
+                self.consecutive_failures.store(0, Ordering::Relaxed);
+                true
             }
+            STATUS_COOLDOWN => false,
             _ => false,
         }
     }
