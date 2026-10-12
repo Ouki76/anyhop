@@ -9,6 +9,8 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use tracing::{info, warn};
 
+use crate::config::ProviderKind;
+use crate::gemini;
 use crate::pool::FailKind;
 use crate::providers::{Provider, ProviderRouter};
 
@@ -80,6 +82,23 @@ pub async fn chat_completions(
     };
     payload["model"] = serde_json::Value::String(upstream_model.clone());
 
+    let is_stream = payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Gemini payload is translated once, before the retry loop.
+    let gemini_body = if matches!(provider.kind, ProviderKind::Gemini) {
+        match gemini::translate_request(&payload) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                return error_response(StatusCode::BAD_REQUEST, e, "invalid_request_error");
+            }
+        }
+    } else {
+        None
+    };
+
     let mut last_err: Option<(StatusCode, String)> = None;
 
     for _ in 0..state.max_retries.max(1) {
@@ -88,12 +107,18 @@ pub async fn chat_completions(
             break;
         };
 
-        let url = format!("{}/chat/completions", provider.base_url);
-        let mut req = state
-            .http
-            .post(&url)
-            .bearer_auth(&key.secret)
-            .json(&payload);
+        let mut req = match provider.kind {
+            ProviderKind::OpenaiCompat => state
+                .http
+                .post(format!("{}/chat/completions", provider.base_url))
+                .bearer_auth(&key.secret)
+                .json(&payload),
+            ProviderKind::Gemini => state
+                .http
+                .post(gemini::endpoint(&provider.base_url, &upstream_model, is_stream))
+                .header("x-goog-api-key", &key.secret)
+                .json(gemini_body.as_ref().expect("gemini body"))
+        };
         for (k, v) in &provider.extra_headers {
             req = req.header(k, v);
         }
@@ -119,7 +144,30 @@ pub async fn chat_completions(
         if status.is_success() {
             provider.pool.report_success(&key);
             info!(provider = %provider.name, key = %key.masked(), model = %upstream_model, "ok");
-            return stream_upstream(resp);
+            return match provider.kind {
+                ProviderKind::OpenaiCompat => stream_upstream(resp),
+                ProviderKind::Gemini => {
+                    if is_stream {
+                        let stream = gemini::translate_sse_stream(resp, &upstream_model);
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .header(header::CACHE_CONTROL, "no-cache")
+                            .body(Body::from_stream(stream))
+                            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                    } else {
+                        match resp.json::<serde_json::Value>().await {
+                            Ok(v) => Json(gemini::translate_response(&upstream_model, &v))
+                                .into_response(),
+                            Err(e) => error_response(
+                                StatusCode::BAD_GATEWAY,
+                                format!("invalid upstream JSON: {e}"),
+                                "upstream_error",
+                            ),
+                        }
+                    }
+                }
+            };
         }
 
         let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -141,6 +189,13 @@ pub async fn chat_completions(
             401 | 403 => {
                 provider.pool.report_failure(&key, FailKind::Auth);
                 warn!(provider = %provider.name, key = %key.masked(), "auth failed, key marked dead");
+            }
+            // Gemini returns 400 INVALID_ARGUMENT for invalid API keys.
+            400 if matches!(provider.kind, ProviderKind::Gemini)
+                && snippet.contains("API key not valid") =>
+            {
+                provider.pool.report_failure(&key, FailKind::Auth);
+                warn!(provider = %provider.name, key = %key.masked(), "gemini key invalid, marked dead");
             }
             s if s >= 500 => {
                 provider.pool.report_failure(&key, FailKind::Server);

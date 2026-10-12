@@ -1,4 +1,5 @@
 mod config;
+mod gemini;
 mod pool;
 mod providers;
 mod proxy;

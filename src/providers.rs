@@ -15,12 +15,7 @@ impl Provider {
     pub fn from_config(cfg: &ProviderConfig) -> anyhow::Result<Self> {
         match cfg.kind {
             ProviderKind::OpenaiCompat => {}
-            ProviderKind::Gemini => {
-                anyhow::bail!(
-                    "provider '{}': gemini adapter is not implemented yet (step 2)",
-                    cfg.name
-                )
-            }
+            ProviderKind::Gemini => {}
         }
         anyhow::ensure!(
             !cfg.keys.is_empty(),
