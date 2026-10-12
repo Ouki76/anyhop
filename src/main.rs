@@ -67,7 +67,12 @@ async fn main() -> anyhow::Result<()> {
 
     let mut providers = Vec::new();
     for p in &cfg.providers {
-        let provider = providers::Provider::from_config(p, storage.as_ref(), Some(&events_tx))?;
+        let provider = providers::Provider::from_config(
+            p,
+            storage.as_ref(),
+            Some(&events_tx),
+            cfg.server.proxy.as_deref(),
+        )?;
         info!(
             "provider '{}' ({} keys, strategy {:?})",
             provider.name,

@@ -36,6 +36,9 @@ pub struct ServerConfig {
     /// redb state file (key health, OAuth tokens, stats). Empty = disabled.
     #[serde(default = "default_state_file")]
     pub state_file: String,
+    /// Global upstream proxy (http/https/socks5). Overridden per provider/account.
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 fn default_state_file() -> String {
@@ -49,6 +52,7 @@ impl Default for ServerConfig {
             max_retries: default_max_retries(),
             attempt_timeout_secs: default_attempt_timeout_secs(),
             state_file: default_state_file(),
+            proxy: None,
         }
     }
 }

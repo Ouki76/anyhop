@@ -43,7 +43,10 @@ impl Provider {
         cfg: &ProviderConfig,
         storage: Option<&Storage>,
         events: Option<&tokio::sync::broadcast::Sender<DashEvent>>,
+        default_proxy: Option<&str>,
     ) -> anyhow::Result<Self> {
+        // Priority: account.proxy > provider.proxy > server-wide proxy.
+        let effective_proxy = cfg.proxy.as_deref().or(default_proxy);
         let base_url = cfg.base_url.trim_end_matches('/').to_string();
         let (secrets, ag_accounts) = match cfg.kind {
             ProviderKind::OpenaiCompat | ProviderKind::Gemini => {
@@ -65,7 +68,7 @@ impl Provider {
                     "provider '{}': no accounts configured (run `anyhop auth antigravity`)",
                     cfg.name
                 );
-                let provider_client = build_http_client(cfg.proxy.as_deref())?;
+                let provider_client = build_http_client(effective_proxy)?;
                 let mut accounts = Vec::new();
                 for a in &cfg.accounts {
                     let client = match &a.proxy {
@@ -90,7 +93,7 @@ impl Provider {
             kind: cfg.kind,
             strategy: cfg.strategy,
             base_url,
-            client: build_http_client(cfg.proxy.as_deref())?,
+            client: build_http_client(effective_proxy)?,
             pool: KeyPool::new(
                 cfg.name.clone(),
                 secrets,

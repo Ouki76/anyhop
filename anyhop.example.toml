@@ -2,6 +2,8 @@
 listen = "127.0.0.1:8080"
 max_retries = 4
 attempt_timeout_secs = 120
+# Глобальный прокси для всех апстримов (переопределяется per-provider/per-account):
+# proxy = "socks5://user:pass@127.0.0.1:1080"
 
 # OpenAI-compatible provider (OpenRouter, DeepSeek, Groq, CatRouter, ...)
 [[providers]]
