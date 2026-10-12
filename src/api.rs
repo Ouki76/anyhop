@@ -101,8 +101,16 @@ pub async fn quotas(State(state): State<Arc<AppState>>) -> Response {
 pub async fn events(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let replay = futures::stream::iter(
+        state
+            .events
+            .recent()
+            .into_iter()
+            .filter_map(|e| serde_json::to_string(&e).ok())
+            .map(|j| Ok(Event::default().data(j))),
+    );
     let rx = state.events.subscribe();
-    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|ev| async move {
+    let live = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|ev| async move {
         match ev {
             Ok(e) => serde_json::to_string(&e)
                 .ok()
@@ -110,6 +118,7 @@ pub async fn events(
             Err(_) => None,
         }
     });
+    let stream = replay.chain(live);
     Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))

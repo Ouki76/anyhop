@@ -164,18 +164,41 @@ fn App() -> View {
     spawn_local({
         async move {
             loop {
-                if let Ok(mut es) = EventSource::new("/api/events")
-                    && let Ok(mut stream) = es.subscribe("message")
-                {
-                    while let Some(Ok((_ty, msg))) = stream.next().await {
-                        if let Some(data) = msg.as_string()
-                            && let Ok(ev) = serde_json::from_str::<EventDto>(&data)
-                        {
-                            events.update(|v| {
-                                v.insert(0, ev);
-                                v.truncate(200);
-                            });
+                web_sys::console::log_1(&"[anyhop] SSE connect".into());
+                match EventSource::new("/api/events") {
+                    Ok(mut es) => match es.subscribe("message") {
+                        Ok(mut stream) => {
+                            while let Some(item) = stream.next().await {
+                                match item {
+                                    Ok((_ty, msg)) => {
+                                        if let Some(data) = msg.data().as_string()
+                                            && let Ok(ev) = serde_json::from_str::<EventDto>(&data)
+                                        {
+                                            events.update(|v| {
+                                                v.insert(0, ev);
+                                                v.truncate(200);
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        web_sys::console::warn_1(
+                                            &format!("[anyhop] SSE item error: {:?}", e).into(),
+                                        );
+                                    }
+                                }
+                            }
+                            web_sys::console::warn_1(&"[anyhop] SSE stream ended".into());
                         }
+                        Err(e) => {
+                            web_sys::console::warn_1(
+                                &format!("[anyhop] SSE subscribe failed: {:?}", e).into(),
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        web_sys::console::warn_1(
+                            &format!("[anyhop] SSE new failed: {:?}", e).into(),
+                        );
                     }
                 }
                 gloo_timers::future::sleep(std::time::Duration::from_secs(3)).await;

@@ -17,7 +17,7 @@ pub fn build_http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client>
 
 use crate::antigravity::{self, Account};
 use crate::config::{ProviderConfig, ProviderKind};
-use crate::events::DashEvent;
+use crate::events::EventBus;
 use crate::pool::KeyPool;
 use crate::storage::Storage;
 
@@ -46,7 +46,7 @@ impl Provider {
     pub fn from_config(
         cfg: &ProviderConfig,
         storage: Option<&Storage>,
-        events: Option<&tokio::sync::broadcast::Sender<DashEvent>>,
+        events: Option<&EventBus>,
         default_proxy: Option<&str>,
     ) -> anyhow::Result<Self> {
         // Priority: account.proxy > provider.proxy > server-wide proxy.

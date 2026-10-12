@@ -10,5 +10,11 @@ fn main() {
         )
         .unwrap();
     }
+    // Track every file so hashed filename changes trigger a rebuild.
     println!("cargo:rerun-if-changed=ui/dist");
+    if let Ok(entries) = std::fs::read_dir(dist) {
+        for e in entries.flatten() {
+            println!("cargo:rerun-if-changed={}", e.path().display());
+        }
+    }
 }

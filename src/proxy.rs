@@ -31,7 +31,7 @@ pub struct AppState {
     pub cfg: std::sync::RwLock<RtConfig>,
     pub storage: Option<crate::storage::Storage>,
     pub config_path: String,
-    pub events: tokio::sync::broadcast::Sender<crate::events::DashEvent>,
+    pub events: crate::events::EventBus,
 }
 
 impl AppState {
@@ -133,7 +133,7 @@ pub async fn chat_completions(
                     }
                     return resp;
                 }
-                let _ = state.events.send(crate::events::DashEvent::new(
+                state.events.emit(crate::events::DashEvent::new(
                     "combo",
                     &model,
                     "backoff",

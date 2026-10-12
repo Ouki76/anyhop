@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let (events_tx, _) = tokio::sync::broadcast::channel::<events::DashEvent>(256);
+    let events_tx = events::EventBus::new();
 
     let mut providers = Vec::new();
     for p in &cfg.providers {

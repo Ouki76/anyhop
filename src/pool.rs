@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::Strategy;
-use crate::events::DashEvent;
 use crate::storage::{HealthRecord, StatsRecord, Storage};
 
 pub const STATUS_ACTIVE: u8 = 0;
@@ -169,7 +168,7 @@ pub struct KeyPool {
     keys: Mutex<Vec<Arc<KeyState>>>,
     cursor: AtomicUsize,
     storage: Option<Storage>,
-    events: Option<tokio::sync::broadcast::Sender<DashEvent>>,
+    events: Option<crate::events::EventBus>,
 }
 
 impl KeyPool {
@@ -179,7 +178,7 @@ impl KeyPool {
         strategy: Strategy,
         max_concurrent: u32,
         storage: Option<Storage>,
-        events: Option<tokio::sync::broadcast::Sender<DashEvent>>,
+        events: Option<crate::events::EventBus>,
     ) -> Self {
         let pool = Self {
             name,
@@ -244,8 +243,8 @@ impl KeyPool {
     }
 
     fn emit(&self, key: &KeyState, kind: &'static str, detail: String) {
-        if let Some(tx) = &self.events {
-            let _ = tx.send(DashEvent::new(&self.name, &key.masked(), kind, detail));
+        if let Some(bus) = &self.events {
+            bus.emit_simple(&self.name, &key.masked(), kind, detail);
         }
     }
 

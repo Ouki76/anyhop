@@ -14,7 +14,7 @@ wasm-bindgen-futures = "0.4"
 futures = "0.3"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
-web-sys = { version = "0.3.106", features = ["Window", "Document", "Element", "Storage"] }
+web-sys = { version = "0.3.106", features = ["Window", "Document", "Element", "Storage", "console"] }
 
 [profile.release]
 opt-level = "z"
