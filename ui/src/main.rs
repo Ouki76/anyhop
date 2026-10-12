@@ -96,6 +96,18 @@ fn main() {
     sycamore::render(App);
 }
 
+fn tab_from_hash() -> Tab {
+    let hash = web_sys::window()
+        .and_then(|w| w.location().hash().ok())
+        .unwrap_or_default();
+    match hash.trim_start_matches('#') {
+        "providers" => Tab::Providers,
+        "quotas" => Tab::Quotas,
+        "events" => Tab::Events,
+        _ => Tab::Overview,
+    }
+}
+
 fn current_theme() -> String {
     web_sys::window()
         .and_then(|w| w.document())
@@ -132,7 +144,7 @@ fn ThemeToggle() -> View {
 
 #[component]
 fn App() -> View {
-    let tab = create_signal(Tab::Overview);
+    let tab = create_signal(tab_from_hash());
     let providers = create_signal(Vec::<ProviderDto>::new());
     let quotas = create_signal(Vec::<QuotaDto>::new());
     let events = create_signal(Vec::<EventDto>::new());
@@ -164,7 +176,6 @@ fn App() -> View {
     spawn_local({
         async move {
             loop {
-                web_sys::console::log_1(&"[anyhop] SSE connect".into());
                 match EventSource::new("/api/events") {
                     Ok(mut es) => match es.subscribe("message") {
                         Ok(mut stream) => {
@@ -243,19 +254,38 @@ fn App() -> View {
                         view! {
                             button(
                                 class=if cur.get() == t { "tab active" } else { "tab" },
-                                on:click=move |_| cur.set(t),
+                                on:click=move |_| {
+                                    cur.set(t);
+                                    let name = match t {
+                                        Tab::Overview => "overview",
+                                        Tab::Providers => "providers",
+                                        Tab::Quotas => "quotas",
+                                        Tab::Events => "events",
+                                    };
+                                    if let Some(w) = web_sys::window() {
+                                        let _ = w.location().set_hash(name);
+                                    }
+                                },
                             ) { (label) }
                         }
                     },
                 )
             }
 
-            (match tab.get() {
-                Tab::Overview => view! { OverviewTab(providers=providers, events=events) },
-                Tab::Providers => view! { ProvidersTab(providers=providers) },
-                Tab::Quotas => view! { QuotasTab(quotas=quotas) },
-                Tab::Events => view! { EventsTab(events=events) },
-            })
+            div(class="tab-content") {
+                (match tab.get() {
+                    Tab::Overview => view! { OverviewTab(providers=providers, events=events) },
+                    Tab::Providers => view! { ProvidersTab(providers=providers) },
+                    Tab::Quotas => view! { QuotasTab(quotas=quotas) },
+                    Tab::Events => view! { EventsTab(events=events) },
+                })
+            }
+
+            div(class="footer") {
+                span { "anyhop v" (env!("CARGO_PKG_VERSION")) }
+                span(class="pix") { i {} i {} i {} i {} i {} }
+                span { "self-hosted · zero deps" }
+            }
         }
     }
 }
@@ -335,13 +365,28 @@ fn ProviderCard(p: ProviderDto) -> View {
     let pname_add = p.name.clone();
     let oauth = p.kind == "antigravity" || p.kind == "codex";
 
+    // Агрегированный статус провайдера: зелёный/жёлтый/красный квадратик
+    let health = {
+        let total = p.keys.len();
+        let dead = p.keys.iter().filter(|k| k.status == "dead").count();
+        let cool = p.keys.iter().filter(|k| k.status == "cooldown").count();
+        if total > 0 && dead == total {
+            "pdot pdot-err"
+        } else if dead + cool > 0 {
+            "pdot pdot-warn"
+        } else {
+            "pdot pdot-ok"
+        }
+    };
+
     view! {
         div(class="card") {
             div(class="card-head") {
+                span(class=health) {}
                 b { (p.name) }
                 span(class="badge accent") { (p.kind) }
                 span(class="badge") { (p.strategy) }
-                span(class="badge") { (p.base_url) }
+                span(class="badge raw") { (p.base_url) }
             }
             table {
                 tr {
@@ -418,7 +463,10 @@ fn KeyActionButton(provider: String, id: String, status: String) -> View {
 fn QuotasTab(quotas: Signal<Vec<QuotaDto>>) -> View {
     view! {
         (if quotas.get_clone().is_empty() {
-            view! { div(class="card") { div(class="empty") { "Quotas appear for OAuth providers (antigravity)" } } }
+            view! { div(class="card") { div(class="empty") {
+                div(class="pix") { i {} i {} i {} i {} i {} i {} i {} i {} i {} }
+                "Quotas appear for OAuth providers (antigravity)"
+            } } }
         } else {
             view! {
                 Indexed(
@@ -427,7 +475,7 @@ fn QuotasTab(quotas: Signal<Vec<QuotaDto>>) -> View {
                         div(class="card") {
                             div(class="card-head") {
                                 b { (q.provider) }
-                                span(class="badge") { (q.account) }
+                                span(class="badge raw") { (q.account) }
                             }
                             table {
                                 tr { th { "Model" } th { "Remaining" } th { "Reset" } }
@@ -484,7 +532,10 @@ fn EventList(events: Signal<Vec<EventDto>>, limit: usize) -> View {
     });
     view! {
         (if limited.get_clone().is_empty() {
-            view! { div(class="empty") { "No events yet — all quiet" } }
+            view! { div(class="empty") {
+                div(class="pix") { i {} i {} i {} i {} i {} i {} i {} i {} i {} }
+                "No events yet — all quiet"
+            } }
         } else {
             view! {
                 div(class="events") {

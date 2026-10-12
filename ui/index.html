@@ -119,6 +119,14 @@ body {
   font-family: var(--mono); font-size: 10.5px; text-transform: uppercase;
   letter-spacing: 0.12em; color: var(--dim); margin-top: 6px;
 }
+.stat { position: relative; }
+.stat::before {
+  content: ""; position: absolute; top: 0; left: 0;
+  width: 24px; height: 3px;
+  background: linear-gradient(90deg, var(--c1), var(--c3));
+  opacity: 0; transition: opacity .2s ease;
+}
+.stat:hover::before { opacity: 1; }
 
 /* section headers */
 .section-title {
@@ -132,7 +140,38 @@ body {
 .card {
   background: var(--panel); border: 1px solid var(--border);
   border-radius: 8px; margin-bottom: 20px; overflow: hidden;
+  transition: border-color .2s ease;
 }
+.card:hover { border-color: var(--dim); }
+
+/* появление контента вкладок */
+@keyframes tabin { from { opacity: 0; } to { opacity: 1; } }
+.tab-content { animation: tabin .12s ease-out; }
+
+/* статус-точка провайдера в заголовке карточки */
+.pdot { width: 8px; height: 8px; flex-shrink: 0; }
+.pdot-ok { background: var(--green-fg); }
+.pdot-warn { background: var(--yellow-fg); }
+.pdot-err { background: var(--red-fg); }
+
+/* hover по строкам таблиц */
+tbody tr, table tr td { transition: background .12s ease; }
+table tr:hover td { background: var(--bg); }
+
+/* footer */
+.footer {
+  margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--border);
+  display: flex; justify-content: space-between; align-items: center;
+  font-family: var(--mono); font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: 0.12em; color: var(--dim);
+}
+.footer .pix { display: flex; gap: 2px; }
+.footer .pix i { width: 5px; height: 5px; display: block; }
+.footer .pix i:nth-child(1) { background: var(--c1); }
+.footer .pix i:nth-child(2) { background: var(--c2); }
+.footer .pix i:nth-child(3) { background: var(--c3); }
+.footer .pix i:nth-child(4) { background: var(--c4); }
+.footer .pix i:nth-child(5) { background: var(--c5); }
 .card-head {
   display: flex; gap: 10px; align-items: center;
   padding: 18px 24px; border-bottom: 1px solid var(--border);
@@ -145,6 +184,7 @@ body {
   background: var(--bg); color: var(--dim); border: 1px solid var(--border);
 }
 .badge.accent { background: var(--accent-soft); color: var(--c3); border-color: transparent; }
+.badge.raw { text-transform: none; letter-spacing: 0.02em; font-size: 11.5px; }
 
 /* tables */
 table { width: 100%; border-collapse: collapse; }
@@ -153,9 +193,10 @@ th {
   font-family: var(--mono); font-size: 10.5px; text-transform: uppercase;
   letter-spacing: 0.12em; color: var(--dim); font-weight: 500;
   border-bottom: 1px solid var(--border); background: var(--bg);
+  white-space: nowrap;
 }
 tr + tr td { border-top: 1px solid var(--border); }
-td.mono { font-family: var(--mono); font-size: 12.5px; }
+td.mono { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
 td.num { font-variant-numeric: tabular-nums; }
 
 /* chips — квадратные, mono, uppercase */
@@ -217,7 +258,14 @@ td.num { font-variant-numeric: tabular-nums; }
 .ev-backoff, .ev-drain { color: var(--dim); background: var(--bg); }
 .ev-detail { color: var(--dim); }
 
-.empty { color: var(--dim); padding: 44px 24px; text-align: center; }
+.empty {
+  color: var(--dim); padding: 48px 24px; text-align: center;
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+}
+.empty .pix { display: grid; grid-template-columns: repeat(3, 8px); grid-auto-rows: 8px; gap: 2px; opacity: .55; }
+.empty .pix i { display: block; background: var(--border); }
+.empty .pix i:nth-child(2) { background: var(--c3); }
+.empty .pix i:nth-child(5) { background: var(--c2); }
 .loading { color: var(--dim); padding: 96px 0; text-align: center; font-family: var(--mono); font-size: 12px; text-transform: uppercase; letter-spacing: 0.12em; }
 </style>
 </head>
