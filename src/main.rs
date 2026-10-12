@@ -22,13 +22,17 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "auth" && args[2] == "antigravity" {
-        return antigravity::run_auth_flow().await;
+        let proxy = args
+            .windows(2)
+            .find(|w| w[0] == "--proxy")
+            .map(|w| w[1].clone());
+        return antigravity::run_auth_flow(proxy).await;
     }
     if args.len() >= 2 && (args[1] == "--help" || args[1] == "-h") {
         println!("anyhop — OpenAI-compatible LLM gateway with key rotation\n");
         println!("USAGE:");
-        println!("  anyhop                            start the gateway");
-        println!("  anyhop auth antigravity           add an Antigravity account via Google OAuth");
+        println!("  anyhop                                          start the gateway");
+        println!("  anyhop auth antigravity [--proxy socks5://…]    add an Antigravity account via Google OAuth");
         println!("\nENV:");
         println!("  ANYHOP_CONFIG   path to config (default: anyhop.toml)");
         return Ok(());
@@ -73,15 +77,8 @@ async fn main() -> anyhow::Result<()> {
         providers.push(provider);
     }
 
-    let http = reqwest::Client::builder()
-        .user_agent(concat!("anyhop/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(32)
-        .build()?;
-
     let state = Arc::new(proxy::AppState {
         router: providers::ProviderRouter { providers },
-        http,
         max_retries: cfg.server.max_retries,
         attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),
         events: events_tx,

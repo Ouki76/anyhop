@@ -14,7 +14,7 @@ models = ["openai/gpt-4o-mini", "deepseek/deepseek-chat"]
 # [providers.headers]
 # HTTP-Referer = "https://your-site.example"
 
-# Gemini — скоро (step 2)
+# Gemini API keys
 # [[providers]]
 # name = "gemini"
 # type = "gemini"
@@ -22,3 +22,17 @@ models = ["openai/gpt-4o-mini", "deepseek/deepseek-chat"]
 # strategy = "fill_first" # дожимаем дневную квоту ключа, потом следующий
 # keys = ["AIza...", "AIza..."]
 # models = ["gemini-2.5-flash"]
+# proxy = "socks5://127.0.0.1:1080"  # опционально: прокси для всего провайдера
+
+# Antigravity (Google OAuth-аккаунты). Добавить: anyhop auth antigravity [--proxy ...]
+# [[providers]]
+# name = "antigravity"
+# type = "antigravity"
+# strategy = "fill_first"
+# proxy = "socks5://127.0.0.1:1080"  # дефолтный прокси для всех аккаунтов
+#
+# [[providers.accounts]]
+# email = "user@gmail.com"
+# refresh_token = "1//..."
+# project_id = "..."           # опционально, резолвится автоматически
+# proxy = "http://1.2.3.4:3128"  # опционально: свой прокси для этого аккаунта

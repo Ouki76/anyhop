@@ -84,6 +84,9 @@ pub struct ProviderConfig {
     /// Extra headers sent to upstream on every request (e.g. OpenRouter referer).
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Upstream proxy: http://, https://, socks5://, socks5h://.
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,6 +101,9 @@ pub struct AntigravityAccountConfig {
     /// Pre-seeded access token that never refreshes (for tests / imported tokens).
     #[serde(default)]
     pub access_token: Option<String>,
+    /// Per-account proxy (overrides provider-level proxy).
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]

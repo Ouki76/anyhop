@@ -17,7 +17,6 @@ use crate::providers::{Provider, ProviderRouter};
 
 pub struct AppState {
     pub router: ProviderRouter,
-    pub http: reqwest::Client,
     pub max_retries: usize,
     pub attempt_timeout: Duration,
     pub events: tokio::sync::broadcast::Sender<crate::events::DashEvent>,
@@ -37,7 +36,7 @@ fn error_response(status: StatusCode, message: impl Into<String>, ty: &str) -> R
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     let mut data = Vec::new();
     for p in &state.router.providers {
-        for m in p.effective_models(&state.http).await {
+        for m in p.effective_models().await {
             data.push(serde_json::json!({
                 "id": format!("{}/{}", p.name, m),
                 "object": "model",
@@ -112,13 +111,13 @@ pub async fn chat_completions(
         };
 
         let mut req = match provider.kind {
-            ProviderKind::OpenaiCompat => state
-                .http
+            ProviderKind::OpenaiCompat => provider
+                .client
                 .post(format!("{}/chat/completions", provider.base_url))
                 .bearer_auth(&key.secret)
                 .json(&payload),
-            ProviderKind::Gemini => state
-                .http
+            ProviderKind::Gemini => provider
+                .client
                 .post(gemini::endpoint(&provider.base_url, &upstream_model, is_stream))
                 .header("x-goog-api-key", &key.secret)
                 .json(gemini_body.as_ref().expect("gemini body")),
@@ -127,7 +126,7 @@ pub async fn chat_completions(
                     provider.pool.report_failure(&key, FailKind::Auth);
                     continue;
                 };
-                let token = match account.ensure_access_token(&state.http).await {
+                let token = match account.ensure_access_token().await {
                     Ok(t) => t,
                     Err(e) => {
                         let kind = match &e {
@@ -140,7 +139,7 @@ pub async fn chat_completions(
                         continue;
                     }
                 };
-                let project = match account.ensure_project_id(&state.http, &token).await {
+                let project = match account.ensure_project_id(&token).await {
                     Ok(p) => p,
                     Err(e) => {
                         let kind = match &e {
@@ -164,8 +163,8 @@ pub async fn chat_completions(
                         return error_response(StatusCode::BAD_REQUEST, e, "invalid_request_error");
                     }
                 };
-                state
-                    .http
+                account
+                    .client()
                     .post(antigravity::endpoint(&provider.base_url, is_stream))
                     .bearer_auth(token)
                     .header(header::USER_AGENT, antigravity::USER_AGENT)

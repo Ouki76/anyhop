@@ -81,6 +81,7 @@ pub struct Account {
     project_id_static: Option<String>,
     provider: String,
     storage: Option<crate::storage::Storage>,
+    client: reqwest::Client,
     state: tokio::sync::Mutex<AccountState>,
 }
 
@@ -89,6 +90,7 @@ impl Account {
         cfg: &crate::config::AntigravityAccountConfig,
         provider: &str,
         storage: Option<&crate::storage::Storage>,
+        client: reqwest::Client,
     ) -> Self {
         let refresh_token = if cfg.refresh_token.is_empty() {
             None
@@ -131,6 +133,7 @@ impl Account {
             project_id_static: cfg.project_id.clone(),
             provider: provider.to_string(),
             storage: storage.cloned(),
+            client,
             state: tokio::sync::Mutex::new(AccountState {
                 access_token,
                 expires_at_ms,
@@ -158,6 +161,11 @@ impl Account {
         &self.identity
     }
 
+    /// HTTP client for this account (account proxy if configured).
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
     pub fn label(&self) -> String {
         self.email.clone().unwrap_or_else(|| {
             let t = &self.identity;
@@ -166,10 +174,7 @@ impl Account {
     }
 
     /// Returns a valid access token, refreshing it if expired.
-    pub async fn ensure_access_token(
-        &self,
-        http: &reqwest::Client,
-    ) -> Result<String, AuthError> {
+    pub async fn ensure_access_token(&self) -> Result<String, AuthError> {
         let mut st = self.state.lock().await;
         if let Some(t) = &st.access_token {
             let valid_until = st.expires_at_ms.saturating_sub(TOKEN_SAFETY_WINDOW.as_millis() as u64);
@@ -183,7 +188,8 @@ impl Account {
                 "static access token rejected and no refresh token configured".into(),
             ));
         };
-        let resp = http
+        let resp = self
+            .client
             .post(TOKEN_ENDPOINT)
             .form(&[
                 ("client_id", CLIENT_ID),
@@ -226,11 +232,7 @@ impl Account {
     }
 
     /// Returns the cloudcode project id, resolving it via loadCodeAssist on first use.
-    pub async fn ensure_project_id(
-        &self,
-        http: &reqwest::Client,
-        access_token: &str,
-    ) -> Result<String, AuthError> {
+    pub async fn ensure_project_id(&self, access_token: &str) -> Result<String, AuthError> {
         if let Some(p) = &self.project_id_static {
             return Ok(p.clone());
         }
@@ -239,7 +241,8 @@ impl Account {
             return Ok(p.clone());
         }
 
-        let resp = http
+        let resp = self
+            .client
             .post(format!("{PROD_ENDPOINT}/{API_VERSION}:loadCodeAssist"))
             .bearer_auth(access_token)
             .header("User-Agent", USER_AGENT)
@@ -459,13 +462,17 @@ pub async fn fetch_email(http: &reqwest::Client, access_token: &str) -> Option<S
 
 /// Run the interactive OAuth flow: local callback server + browser. Prints the
 /// resulting TOML account snippet on success.
-pub async fn run_auth_flow() -> anyhow::Result<()> {
+pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let http = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(30))
-        .build()?;
+        .timeout(Duration::from_secs(30));
+    if let Some(p) = &proxy {
+        builder = builder.proxy(reqwest::Proxy::all(p)?);
+        println!("Использую прокси: {p}");
+    }
+    let http = builder.build()?;
 
     let state = format!("{:x}", now_ms());
     let url = build_auth_url(&state);
@@ -527,11 +534,13 @@ pub async fn run_auth_flow() -> anyhow::Result<()> {
             email: email.clone(),
             project_id: None,
             access_token: None,
+            proxy: None,
         },
         "antigravity",
         None,
+        http.clone(),
     );
-    let project_id = match account.ensure_project_id(&http, &tokens.access_token).await {
+    let project_id = match account.ensure_project_id(&tokens.access_token).await {
         Ok(p) => Some(p),
         Err(e) => {
             warn!("project id not resolved: {e} (будет получен автоматически при первом запросе)");

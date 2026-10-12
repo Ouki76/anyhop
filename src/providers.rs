@@ -1,6 +1,20 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// HTTP client for upstream calls, optionally behind a proxy.
+pub fn build_http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder()
+        .user_agent(concat!("anyhop/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(32);
+    if let Some(p) = proxy {
+        let proxy = reqwest::Proxy::all(p)
+            .map_err(|e| anyhow::anyhow!("invalid proxy url '{p}': {e}"))?;
+        b = b.proxy(proxy);
+    }
+    Ok(b.build()?)
+}
+
 use crate::antigravity::{self, Account};
 use crate::config::{ProviderConfig, ProviderKind};
 use crate::events::DashEvent;
@@ -14,6 +28,7 @@ pub struct Provider {
     pub kind: ProviderKind,
     pub strategy: crate::config::Strategy,
     pub base_url: String,
+    pub client: reqwest::Client,
     pub pool: KeyPool,
     pub models: Vec<String>,
     pub extra_headers: Vec<(String, String)>,
@@ -50,12 +65,16 @@ impl Provider {
                     "provider '{}': no accounts configured (run `anyhop auth antigravity`)",
                     cfg.name
                 );
-                let accounts: Vec<Arc<Account>> = cfg
-                    .accounts
-                    .iter()
-                    .map(|a| Account::new(a, &cfg.name, storage))
-                    .map(Arc::new)
-                    .collect();
+                let provider_client = build_http_client(cfg.proxy.as_deref())?;
+                let mut accounts = Vec::new();
+                for a in &cfg.accounts {
+                    let client = match &a.proxy {
+                        Some(p) => build_http_client(Some(p))?,
+                        None => provider_client.clone(),
+                    };
+                    accounts.push(Arc::new(Account::new(a, &cfg.name, storage, client)));
+                }
+                let accounts: Vec<Arc<Account>> = accounts;
                 let secrets: Vec<String> =
                     accounts.iter().map(|a| a.pool_secret().to_string()).collect();
                 (secrets, accounts)
@@ -71,6 +90,7 @@ impl Provider {
             kind: cfg.kind,
             strategy: cfg.strategy,
             base_url,
+            client: build_http_client(cfg.proxy.as_deref())?,
             pool: KeyPool::new(
                 cfg.name.clone(),
                 secrets,
@@ -99,7 +119,7 @@ impl Provider {
 
     /// Configured models, or a dynamically fetched list for antigravity
     /// (cached for 10 minutes).
-    pub async fn effective_models(&self, http: &reqwest::Client) -> Vec<String> {
+    pub async fn effective_models(&self) -> Vec<String> {
         if !self.models.is_empty() {
             return self.models.clone();
         }
@@ -120,10 +140,10 @@ impl Provider {
         let Some(acc) = self.ag_account(&key.secret) else {
             return Vec::new();
         };
-        let Ok(token) = acc.ensure_access_token(http).await else {
+        let Ok(token) = acc.ensure_access_token().await else {
             return Vec::new();
         };
-        match antigravity::fetch_available_models(http, &self.base_url, &token).await {
+        match antigravity::fetch_available_models(acc.client(), &self.base_url, &token).await {
             Ok(list) if !list.is_empty() => {
                 let mut cache = self.models_cache.lock().unwrap();
                 *cache = Some((Instant::now(), list.clone()));
