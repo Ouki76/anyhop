@@ -349,6 +349,92 @@ fn append_account(
     Ok(())
 }
 
+// ---------- provider management ----------
+
+#[derive(Deserialize)]
+pub struct AddProvider {
+    kind: String,
+    name: Option<String>,
+    base_url: Option<String>,
+    key: Option<String>,
+}
+
+/// POST /api/providers/add — append a key-based provider to the config.
+pub async fn provider_add(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AddProvider>,
+) -> Response {
+    let default_base = match body.kind.as_str() {
+        "gemini" => Some("https://generativelanguage.googleapis.com/v1beta"),
+        "anthropic" => Some("https://api.anthropic.com"),
+        "openai_compat" => None,
+        _ => {
+            return (StatusCode::BAD_REQUEST, "kind must be gemini|anthropic|openai_compat")
+                .into_response();
+        }
+    };
+    let base_url = body.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let base_url = match base_url.or(default_base) {
+        Some(b) => b.to_string(),
+        None => {
+            return (StatusCode::BAD_REQUEST, "base_url is required for openai_compat")
+                .into_response();
+        }
+    };
+    let key = body.key.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    let raw = match std::fs::read_to_string(&state.config_path) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response(),
+    };
+    let mut doc: toml::Value = match toml::from_str(&raw) {
+        Ok(d) => d,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response(),
+    };
+    let providers = doc
+        .as_table_mut()
+        .expect("config root")
+        .entry("providers")
+        .or_insert_with(|| toml::Value::Array(vec![]));
+    let arr = providers.as_array_mut().expect("providers array");
+
+    // Уникальное имя: kind, kind-2, kind-3…
+    let base_name = body.name.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+        .unwrap_or_else(|| body.kind.clone());
+    let mut name = base_name.clone();
+    let mut n = 2;
+    while arr.iter().any(|p| p.get("name").and_then(|v| v.as_str()) == Some(&name)) {
+        name = format!("{base_name}-{n}");
+        n += 1;
+    }
+
+    let mut t = toml::map::Map::new();
+    t.insert("name".into(), name.clone().into());
+    t.insert("type".into(), body.kind.clone().into());
+    t.insert("base_url".into(), base_url.into());
+    t.insert("strategy".into(), "round_robin".into());
+    if let Some(k) = key {
+        t.insert("keys".into(), toml::Value::Array(vec![k.into()]));
+    }
+    arr.push(toml::Value::Table(t));
+
+    let serialized = match toml::to_string_pretty(&doc) {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if let Err(e) = std::fs::write(&state.config_path, serialized) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("cannot write config: {e}"))
+            .into_response();
+    }
+    match crate::reload_config(&state) {
+        Ok(_) => {
+            state.events.emit_simple("config", "", "backoff", format!("provider '{name}' added"));
+            Json(serde_json::json!({"name": name})).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("saved but reload failed: {e}")).into_response(),
+    }
+}
+
 // ---------- key management ----------
 
 #[derive(Deserialize)]

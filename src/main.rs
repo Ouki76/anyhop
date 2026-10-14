@@ -180,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/keys/enable", post(api::key_enable))
         .route("/api/keys/disable", post(api::key_disable))
         .route("/api/keys/add", post(api::key_add))
+        .route("/api/providers/add", post(api::provider_add))
         .route("/api/config", get(api::get_config).put(api::put_config))
         .route("/api/reload", post(api::reload))
         .route("/api/auth/start", post(api::auth_start))
