@@ -1,22 +1,21 @@
-//! Failover event feed: broadcast to live subscribers + ring buffer for replay.
+//! Failover event feed: broadcast to live subscribers + replayable recent buffer.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const RECENT_CAPACITY: usize = 100;
-
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DashEvent {
     pub ts: u64,
     pub provider: String,
     pub key: String,
-    pub kind: &'static str,
+    pub kind: String,
     pub detail: String,
 }
 
 impl DashEvent {
-    pub fn new(provider: &str, key: &str, kind: &'static str, detail: String) -> Self {
+    pub fn new(provider: &str, key: &str, kind: &str, detail: String) -> Self {
         Self {
             ts: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -24,14 +23,14 @@ impl DashEvent {
                 .as_secs(),
             provider: provider.to_string(),
             key: key.to_string(),
-            kind,
+            kind: kind.to_string(),
             detail,
         }
     }
 }
 
 /// One upstream attempt record for the Requests tab.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequestRecord {
     pub ts: u64,
     pub provider: String,
@@ -43,32 +42,39 @@ pub struct RequestRecord {
     pub stream: bool,
 }
 
-/// Shared event bus: live broadcast + replayable recent buffer.
+/// Shared event bus: live broadcast + replayable recent buffer with a runtime cap.
 #[derive(Clone)]
 pub struct EventBus {
     tx: tokio::sync::broadcast::Sender<DashEvent>,
     recent: Arc<Mutex<VecDeque<DashEvent>>>,
+    cap: Arc<AtomicUsize>,
 }
 
 impl EventBus {
-    pub fn new() -> Self {
+    pub fn new(cap: usize) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             tx,
-            recent: Arc::new(Mutex::new(VecDeque::with_capacity(RECENT_CAPACITY))),
+            recent: Arc::new(Mutex::new(VecDeque::with_capacity(cap.max(16)))),
+            cap: Arc::new(AtomicUsize::new(cap)),
         }
+    }
+
+    pub fn set_cap(&self, cap: usize) {
+        self.cap.store(cap, Ordering::Relaxed);
     }
 
     pub fn emit(&self, ev: DashEvent) {
         let _ = self.tx.send(ev.clone());
+        let cap = self.cap.load(Ordering::Relaxed);
         let mut buf = self.recent.lock().unwrap();
-        if buf.len() >= RECENT_CAPACITY {
+        while buf.len() >= cap.max(1) {
             buf.pop_front();
         }
         buf.push_back(ev);
     }
 
-    pub fn emit_simple(&self, provider: &str, key: &str, kind: &'static str, detail: String) {
+    pub fn emit_simple(&self, provider: &str, key: &str, kind: &str, detail: String) {
         self.emit(DashEvent::new(provider, key, kind, detail));
     }
 
@@ -78,5 +84,15 @@ impl EventBus {
 
     pub fn recent(&self) -> Vec<DashEvent> {
         self.recent.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Restore a persisted buffer (called once at startup).
+    pub fn restore(&self, events: Vec<DashEvent>) {
+        let cap = self.cap.load(Ordering::Relaxed);
+        let mut buf = self.recent.lock().unwrap();
+        *buf = events.into_iter().collect();
+        while buf.len() > cap.max(1) {
+            buf.pop_front();
+        }
     }
 }

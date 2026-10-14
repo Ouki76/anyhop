@@ -24,6 +24,8 @@ pub struct RtConfig {
     pub max_retries: usize,
     pub attempt_timeout: Duration,
     pub api_key: Option<String>,
+    pub events_history: usize,
+    pub requests_history: usize,
 }
 
 pub struct AppState {
@@ -40,8 +42,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn log_request(&self, rec: crate::events::RequestRecord) {
+        let cap = self.rt().requests_history.max(1);
         let mut log = self.request_log.lock().unwrap();
-        if log.len() >= 200 {
+        while log.len() >= cap {
             log.pop_front();
         }
         log.push_back(rec);

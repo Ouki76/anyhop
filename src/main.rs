@@ -104,7 +104,13 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let events_tx = events::EventBus::new();
+    let events_tx = events::EventBus::new(cfg.server.events_history);
+    if let Some(s) = &storage
+        && let Some(ev) = s.load_feed::<Vec<events::DashEvent>>("events")
+    {
+        events_tx.restore(ev);
+        info!("restored {} events from state", events_tx.recent().len());
+    }
 
     let mut providers = Vec::new();
     for p in &cfg.providers {
@@ -154,6 +160,8 @@ async fn main() -> anyhow::Result<()> {
             max_retries: cfg.server.max_retries,
             attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),
             api_key: cfg.server.api_key.clone(),
+            events_history: cfg.server.events_history,
+            requests_history: cfg.server.requests_history,
         }),
         storage: storage.clone(),
         config_path: config_path.clone(),
@@ -161,6 +169,13 @@ async fn main() -> anyhow::Result<()> {
         auth_state: std::sync::Mutex::new(None),
         request_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
     });
+    if let Some(s) = &state.storage
+        && let Some(reqs) = s.load_feed::<Vec<events::RequestRecord>>("requests")
+    {
+        let n = reqs.len();
+        *state.request_log.lock().unwrap() = reqs.into();
+        info!("restored {n} request records from state");
+    }
 
     let api = axum::Router::new()
         .route("/v1/chat/completions", post(proxy::chat_completions))
@@ -229,6 +244,13 @@ async fn main() -> anyhow::Result<()> {
             for p in &router.providers {
                 p.pool.persist_stats();
             }
+            if let Some(s) = &state.storage {
+                s.save_feed("events", &state.events.recent());
+                let log = state.request_log.lock().unwrap();
+                let v: Vec<_> = log.iter().cloned().collect();
+                drop(log);
+                s.save_feed("requests", &v);
+            }
         }
     });
 
@@ -271,6 +293,9 @@ pub fn reload_config(state: &Arc<proxy::AppState>) -> anyhow::Result<usize> {
         max_retries: cfg.server.max_retries,
         attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),
         api_key: cfg.server.api_key.clone(),
+        events_history: cfg.server.events_history,
+        requests_history: cfg.server.requests_history,
     };
+    state.events.set_cap(cfg.server.events_history);
     Ok(n)
 }

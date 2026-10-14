@@ -57,6 +57,19 @@ pub struct ServerConfig {
     #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
     #[serde(default = "default_true")]
     pub dashboard: bool,
+    /// Max events kept (and persisted). 0 = in-memory 100, no persistence.
+    #[serde(default = "default_events_history")]
+    pub events_history: usize,
+    /// Max request-log entries kept (and persisted). 0 = in-memory 200, no persistence.
+    #[serde(default = "default_requests_history")]
+    pub requests_history: usize,
+}
+
+fn default_events_history() -> usize {
+    100
+}
+fn default_requests_history() -> usize {
+    200
 }
 
 fn default_true() -> bool {
@@ -77,6 +90,8 @@ impl Default for ServerConfig {
             proxy: None,
             api_key: None,
             dashboard: true,
+            events_history: default_events_history(),
+            requests_history: default_requests_history(),
         }
     }
 }

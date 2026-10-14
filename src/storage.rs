@@ -15,6 +15,8 @@ const OAUTH: TableDefinition<&str, &[u8]> = TableDefinition::new("oauth");
 const STATS: TableDefinition<&str, &[u8]> = TableDefinition::new("stats");
 /// Keys added at runtime via the dashboard: "extra:{provider}" -> JSON [secret, ...].
 const EXTRAS: TableDefinition<&str, &[u8]> = TableDefinition::new("extras");
+/// Feed buffers: "feed:events" / "feed:requests" -> JSON array.
+const FEEDS: TableDefinition<&str, &[u8]> = TableDefinition::new("feeds");
 
 /// Storage key for a pool credential: "{provider}:{sha256(secret)[..16]}".
 /// Secrets are never persisted, only their hashes.
@@ -52,6 +54,7 @@ enum StorageMsg {
     OAuth { key: String, rec: OAuthRecord },
     Stats { key: String, rec: StatsRecord },
     ExtraKey { provider: String, secret: String },
+    Feed { key: String, data: Vec<u8> },
 }
 
 impl StorageMsg {
@@ -61,6 +64,7 @@ impl StorageMsg {
             | StorageMsg::OAuth { key, .. }
             | StorageMsg::Stats { key, .. } => key.clone(),
             StorageMsg::ExtraKey { provider, .. } => format!("extra:{provider}"),
+            StorageMsg::Feed { key, .. } => key.clone(),
         }
     }
 }
@@ -81,6 +85,7 @@ impl Storage {
             let _ = wtx.open_table(OAUTH)?;
             let _ = wtx.open_table(STATS)?;
             let _ = wtx.open_table(EXTRAS)?;
+            let _ = wtx.open_table(FEEDS)?;
         }
         wtx.commit()?;
 
@@ -176,6 +181,20 @@ impl Storage {
         self.read_json(EXTRAS, &format!("extra:{provider}"))
             .unwrap_or_default()
     }
+
+    /// Persist a feed buffer (events / requests).
+    pub fn save_feed<T: Serialize>(&self, name: &str, value: &T) {
+        if let Ok(data) = serde_json::to_vec(value) {
+            let _ = self.tx.send(StorageMsg::Feed {
+                key: format!("feed:{name}"),
+                data,
+            });
+        }
+    }
+
+    pub fn load_feed<T: for<'de> Deserialize<'de>>(&self, name: &str) -> Option<T> {
+        self.read_json(FEEDS, &format!("feed:{name}"))
+    }
 }
 
 fn flush_extra(db: &Arc<Database>, msg: &StorageMsg) {
@@ -226,6 +245,13 @@ fn flush(db: &Arc<Database>, pending: &mut HashMap<String, StorageMsg>) {
                     && let Ok(j) = serde_json::to_vec(rec)
                 {
                     let _ = t.insert(key.as_str(), j.as_slice());
+                }
+            }
+        }
+        if let Ok(mut t) = wtx.open_table(FEEDS) {
+            for m in &msgs {
+                if let StorageMsg::Feed { key, data } = m {
+                    let _ = t.insert(key.as_str(), data.as_slice());
                 }
             }
         }
