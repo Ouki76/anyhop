@@ -142,7 +142,9 @@ fn main() {
 /// делать синхронно: прилетевшее событие может попасть внутрь чужого эффекта,
 /// и sycamore упадёт с BorrowMutError. Откладываем в микротаску.
 fn defer(f: impl FnOnce() + 'static) {
-    spawn_local(async move { f() });
+    // Именно макротаска: spawn_local поллит фьючу синхронно до первого await,
+    // что ничего не откладывает и ловит BorrowMutError.
+    gloo_timers::callback::Timeout::new(0, f).forget();
 }
 
 fn tab_from_hash() -> Tab {
@@ -231,6 +233,9 @@ fn App() -> View {
         async move {
             loop {
                 if let Some(data) = fetch_json::<Vec<ProviderDto>>("/api/providers").await {
+                    if !providers.is_alive() {
+                        break;
+                    }
                     providers.set(data);
                     loaded.set(true);
                 }
@@ -243,6 +248,9 @@ fn App() -> View {
         async move {
             loop {
                 if let Some(data) = fetch_json::<Vec<QuotaDto>>("/api/quotas").await {
+                    if !quotas.is_alive() {
+                        break;
+                    }
                     quotas.set(data);
                 }
                 gloo_timers::future::sleep(std::time::Duration::from_secs(60)).await;
@@ -743,6 +751,9 @@ fn RequestsTab() -> View {
     let items = create_signal(Vec::<RequestDto>::new());
     spawn_local(async move {
         loop {
+            if !items.is_alive() {
+                break;
+            }
             if let Some(data) = fetch_json::<Vec<RequestDto>>("/api/requests").await {
                 items.set(data);
             }

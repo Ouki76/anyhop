@@ -64,8 +64,8 @@ try:
     print("4. providers again:", click_tab("PROVIDERS")); time.sleep(1); collect()
     print("   catalog visible:", js("!!document.querySelector('.provider-grid')"))
     print("5. overview/events/quotas roundtrip:")
-    for t in ["OVERVIEW", "EVENTS", "QUOTAS", "PROVIDERS"]:
-        click_tab(t); time.sleep(0.7); collect()
+    for t in ["OVERVIEW", "EVENTS", "QUOTAS", "REQUESTS", "CONFIG", "PROVIDERS"]:
+        click_tab(t); time.sleep(2.5); collect()  # даём поллинг-циклам тикнуть
     print("   alive:", js("!!document.querySelector('.wrap')"))
 
     if panics:
