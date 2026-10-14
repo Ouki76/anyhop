@@ -501,7 +501,6 @@ fn ProviderCard(p: ProviderDto) -> View {
     let pkind_footer = p.kind.clone();
     let oauth = p.kind == "antigravity" || p.kind == "codex";
 
-    // Агрегированный статус провайдера: зелёный/жёлтый/красный квадратик
     let health = {
         let total = p.keys.len();
         let dead = p.keys.iter().filter(|k| k.status == "dead").count();
@@ -530,34 +529,36 @@ fn ProviderCard(p: ProviderDto) -> View {
                 span(class="badge") { (p.strategy) }
                 span(class="badge raw") { (p.base_url) }
             }
-            div(class="table-scroll") {
-            table {
-                tr {
-                    th { "Key" } th { "Status" } th { "Cooldown" } th { "In-flight" }
-                    th { "Requests" } th { "Failures" } th { "Tokens in" } th { "Tokens out" } th { "" }
-                }
+            div(class="key-list") {
                 Indexed(
                     list=create_signal(p.keys),
                     view=move |k: KeyDto| {
                         let chip = format!("chip chip-{}", k.status);
                         let status = k.status.clone();
                         let prov = pname_rows.clone();
+                        let stats = format!(
+                            "{} req · {} fail · {} in / {} out",
+                            fmt_num(k.requests), fmt_num(k.failures),
+                            fmt_num(k.prompt_tokens), fmt_num(k.completion_tokens)
+                        );
+                        let cooldown_v = if k.cooldown_remaining_secs > 0 {
+                            view! { span(class="key-cooldown") { (format!("cooldown {}s", k.cooldown_remaining_secs)) } }
+                        } else { view! {} };
+                        let inflight_v = if k.in_flight > 0 {
+                            view! { span(class="key-inflight") { (format!("▶ {}", k.in_flight)) } }
+                        } else { view! {} };
                         view! {
-                            tr {
-                                td(class="mono") { (k.masked) }
-                                td { span(class=chip) { (k.status) } }
-                                td(class="num") { (if k.cooldown_remaining_secs > 0 { format!("{}s", k.cooldown_remaining_secs) } else { "—".into() }) }
-                                td(class="num") { (k.in_flight) }
-                                td(class="num") { (fmt_num(k.requests)) }
-                                td(class="num") { (fmt_num(k.failures)) }
-                                td(class="num") { (fmt_num(k.prompt_tokens)) }
-                                td(class="num") { (fmt_num(k.completion_tokens)) }
-                                td { KeyActionButton(provider=prov, id=k.id.clone(), status=status) }
+                            div(class="key-row") {
+                                span(class=chip) { (k.status) }
+                                span(class="mono key-id") { (k.masked) }
+                                (inflight_v)
+                                span(class="key-stats") { (stats) }
+                                (cooldown_v)
+                                KeyActionButton(provider=prov, id=k.id.clone(), status=status)
                             }
                         }
                     },
                 )
-            }
             }
             (footer)
         }
