@@ -22,7 +22,21 @@ fn serve_file(path: &str) -> Response {
     match UiAssets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            ([(header::CONTENT_TYPE, mime.as_ref())], content.data.to_vec()).into_response()
+            // index.html — без кэша (иначе браузер грузит старый wasm-хэш после обновления).
+            // Хэшированные ассеты можно кэшировать надолго.
+            let cache = if path == "index.html" {
+                "no-cache"
+            } else {
+                "public, max-age=31536000, immutable"
+            };
+            (
+                [
+                    (header::CONTENT_TYPE, mime.as_ref()),
+                    (header::CACHE_CONTROL, cache),
+                ],
+                content.data.to_vec(),
+            )
+                .into_response()
         }
         None => (StatusCode::NOT_FOUND, "ui not built; run `trunk build` in ui/").into_response(),
     }
