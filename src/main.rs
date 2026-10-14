@@ -159,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
         config_path: config_path.clone(),
         events: events_tx,
         auth_state: std::sync::Mutex::new(None),
+        request_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
     });
 
     let api = axum::Router::new()
@@ -175,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(api)
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/providers", get(api::providers))
+        .route("/api/requests", get(api::requests))
         .route("/api/quotas", get(api::quotas))
         .route("/api/events", get(api::events))
         .route("/api/keys/enable", post(api::key_enable))

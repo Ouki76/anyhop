@@ -60,6 +60,7 @@ enum Tab {
     Providers,
     Quotas,
     Events,
+    Requests,
     Config,
 }
 
@@ -68,8 +69,20 @@ const TABS: &[(Tab, &str)] = &[
     (Tab::Providers, "Providers"),
     (Tab::Quotas, "Quotas"),
     (Tab::Events, "Events"),
+    (Tab::Requests, "Requests"),
     (Tab::Config, "Config"),
 ];
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct RequestDto {
+    ts: u64,
+    provider: String,
+    model: String,
+    key: String,
+    status: String,
+    latency_ms: u64,
+    stream: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct AuthStateDto {
@@ -143,6 +156,7 @@ fn tab_from_hash() -> Tab {
         match h {
             "quotas" => Tab::Quotas,
             "events" => Tab::Events,
+            "requests" => Tab::Requests,
             "config" => Tab::Config,
             _ => Tab::Overview,
         }
@@ -309,6 +323,7 @@ fn App() -> View {
                                         Tab::Providers => "providers",
                                         Tab::Quotas => "quotas",
                                         Tab::Events => "events",
+                                        Tab::Requests => "requests",
                                         Tab::Config => "config",
                                     };
                                     if let Some(w) = web_sys::window() {
@@ -327,6 +342,7 @@ fn App() -> View {
                     Tab::Providers => view! { ProvidersTab(providers=providers, selected=selected_provider) },
                     Tab::Quotas => view! { QuotasTab(quotas=quotas) },
                     Tab::Events => view! { EventsTab(events=events) },
+                    Tab::Requests => view! { RequestsTab() },
                     Tab::Config => view! { ConfigTab() },
                 })
             }
@@ -526,7 +542,7 @@ fn ModelsCard(provider: String, models: Vec<String>) -> View {
 #[component(inline_props)]
 fn ProviderDetail(name: String, providers: Signal<Vec<ProviderDto>>) -> View {
     view! {
-        a(class="back-link", href="#providers") { "← all providers" }
+        a(class="back-link", href="#providers") { "all providers" }
         (match providers.get_clone().into_iter().find(|p| p.name == name) {
             Some(p) => {
                 let models = p.models.clone();
@@ -720,6 +736,60 @@ async fn put_json<B: serde::Serialize>(url: &str, body: &B) -> Option<String> {
     let ok = resp.status() == 200;
     let text = resp.text().await.ok()?;
     Some(if ok { "saved + reloaded".into() } else { text })
+}
+
+#[component]
+fn RequestsTab() -> View {
+    let items = create_signal(Vec::<RequestDto>::new());
+    spawn_local(async move {
+        loop {
+            if let Some(data) = fetch_json::<Vec<RequestDto>>("/api/requests").await {
+                items.set(data);
+            }
+            gloo_timers::future::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+
+    view! {
+        div(class="card") {
+            (if items.get_clone().is_empty() {
+                view! { div(class="empty") {
+                    div(class="pix") { i {} i {} i {} i {} i {} i {} i {} i {} i {} }
+                    "No requests yet"
+                } }
+            } else {
+                view! {
+                    div(class="table-scroll") {
+                        table {
+                            tr {
+                                th { "Time" } th { "Provider" } th { "Model" } th { "Key" }
+                                th { "Status" } th { "Latency" } th { "" }
+                            }
+                            Indexed(
+                                list=create_signal(items.get_clone()),
+                                view=|r: RequestDto| {
+                                    let chip = if r.status == "200" { "chip chip-active" }
+                                        else if r.status == "429" { "chip chip-cooldown" }
+                                        else { "chip chip-dead" };
+                                    view! {
+                                        tr {
+                                            td(class="mono") { (fmt_time(r.ts)) }
+                                            td { (r.provider) }
+                                            td(class="mono") { (r.model) }
+                                            td(class="mono") { (r.key) }
+                                            td { span(class=chip) { (r.status) } }
+                                            td(class="num") { (format!("{}ms", r.latency_ms)) }
+                                            td { (if r.stream { "stream" } else { "" }) }
+                                        }
+                                    }
+                                },
+                            )
+                        }
+                    }
+                }
+            })
+        }
+    }
 }
 
 #[component]

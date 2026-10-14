@@ -103,6 +103,13 @@ pub async fn quotas(State(state): State<Arc<AppState>>) -> Response {
     Json(out).into_response()
 }
 
+/// GET /api/requests — recent upstream attempts (newest first).
+pub async fn requests(State(state): State<Arc<AppState>>) -> Response {
+    let log = state.request_log.lock().unwrap();
+    let data: Vec<_> = log.iter().rev().cloned().collect::<Vec<_>>();
+    Json(data).into_response()
+}
+
 pub async fn events(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {

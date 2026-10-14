@@ -30,6 +30,19 @@ impl DashEvent {
     }
 }
 
+/// One upstream attempt record for the Requests tab.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RequestRecord {
+    pub ts: u64,
+    pub provider: String,
+    pub model: String,
+    pub key: String,
+    /// HTTP status as string ("200", "429") or "timeout"/"network".
+    pub status: String,
+    pub latency_ms: u64,
+    pub stream: bool,
+}
+
 /// Shared event bus: live broadcast + replayable recent buffer.
 #[derive(Clone)]
 pub struct EventBus {

@@ -34,6 +34,18 @@ pub struct AppState {
     pub events: crate::events::EventBus,
     /// Ongoing dashboard-triggered OAuth flow (single at a time).
     pub auth_state: std::sync::Mutex<Option<crate::api::AuthStateDto>>,
+    /// Ring buffer of recent upstream attempts for the Requests tab.
+    pub request_log: std::sync::Mutex<std::collections::VecDeque<crate::events::RequestRecord>>,
+}
+
+impl AppState {
+    pub fn log_request(&self, rec: crate::events::RequestRecord) {
+        let mut log = self.request_log.lock().unwrap();
+        if log.len() >= 200 {
+            log.pop_front();
+        }
+        log.push_back(rec);
+    }
 }
 
 impl AppState {
@@ -351,14 +363,32 @@ async fn run_target(
             req = req.header(k, v);
         }
 
+        let t0 = std::time::Instant::now();
         let result = tokio::time::timeout(state.rt().attempt_timeout, req.send()).await;
+        let latency_ms = t0.elapsed().as_millis() as u64;
+        let log_req = |status: &str| {
+            state.log_request(crate::events::RequestRecord {
+                ts: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                provider: provider.name.clone(),
+                model: model.to_string(),
+                key: key.masked(),
+                status: status.to_string(),
+                latency_ms,
+                stream: is_stream,
+            });
+        };
         let resp = match result {
             Err(_) => {
+                log_req("timeout");
                 provider.pool.report_failure(&key, FailKind::Network, model);
                 warn!(provider = %provider.name, key = %key.masked(), "attempt timed out");
                 continue;
             }
             Ok(Err(e)) => {
+                log_req("network");
                 provider.pool.report_failure(&key, FailKind::Network, model);
                 warn!(provider = %provider.name, key = %key.masked(), error = %e, "network error");
                 continue;
@@ -367,6 +397,7 @@ async fn run_target(
         };
 
         let status = resp.status();
+        log_req(status.as_str());
         if status.is_success() {
             provider.pool.report_success(&key);
             info!(provider = %provider.name, key = %key.masked(), model, "ok");
