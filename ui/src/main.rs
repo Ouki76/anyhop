@@ -110,13 +110,28 @@ fn tab_from_hash() -> Tab {
     let hash = web_sys::window()
         .and_then(|w| w.location().hash().ok())
         .unwrap_or_default();
-    match hash.trim_start_matches('#') {
-        "providers" => Tab::Providers,
-        "quotas" => Tab::Quotas,
-        "events" => Tab::Events,
-        "config" => Tab::Config,
-        _ => Tab::Overview,
+    let h = hash.trim_start_matches('#');
+    if h.starts_with("providers") {
+        Tab::Providers
+    } else {
+        match h {
+            "quotas" => Tab::Quotas,
+            "events" => Tab::Events,
+            "config" => Tab::Config,
+            _ => Tab::Overview,
+        }
     }
+}
+
+/// #providers/<name> -> Some(name)
+fn provider_from_hash() -> Option<String> {
+    let hash = web_sys::window()
+        .and_then(|w| w.location().hash().ok())
+        .unwrap_or_default();
+    hash.trim_start_matches('#')
+        .strip_prefix("providers/")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn current_theme() -> String {
@@ -346,13 +361,120 @@ fn OverviewTab(providers: Signal<Vec<ProviderDto>>, events: Signal<Vec<EventDto>
 
 // ---------- Провайдеры ----------
 
+/// Каталог известных типов провайдеров (включая несконфигурированные).
+const KNOWN_TYPES: &[(&str, &str, &str)] = &[
+    ("antigravity", "Antigravity", "Google OAuth-аккаунты · Gemini/Claude"),
+    ("codex", "Codex", "ChatGPT OAuth-аккаунты"),
+    ("gemini", "Gemini", "API-ключи Google AI"),
+    ("anthropic", "Anthropic", "API-ключи Claude"),
+    ("openai_compat", "OpenAI-compatible", "OpenRouter, DeepSeek, Groq…"),
+];
+
 #[component(inline_props)]
 fn ProvidersTab(providers: Signal<Vec<ProviderDto>>) -> View {
+    let selected = create_signal(provider_from_hash());
+
+    let go = move |name: Option<String>| {
+        selected.set(name.clone());
+        if let Some(w) = web_sys::window() {
+            let h = match &name {
+                Some(n) => format!("providers/{n}"),
+                None => "providers".into(),
+            };
+            let _ = w.location().set_hash(&h);
+        }
+    };
+
     view! {
-        Indexed(
-            list=providers,
-            view=|p| view! { ProviderCard(p=p) },
-        )
+        (match selected.get_clone() {
+            Some(name) => view! { ProviderDetail(name=name, providers=providers) },
+            None => view! { ProviderCatalog(providers=providers, go=go) },
+        })
+    }
+}
+
+#[component(inline_props)]
+fn ProviderCatalog(providers: Signal<Vec<ProviderDto>>, go: impl Fn(Option<String>) + Copy + 'static) -> View {
+    view! {
+        div(class="provider-grid") {
+            (move || build_tiles(providers.get_clone(), go))
+        }
+    }
+}
+
+fn build_tiles(configured: Vec<ProviderDto>, go: impl Fn(Option<String>) + Copy + 'static) -> Vec<View> {
+    KNOWN_TYPES
+        .iter()
+        .map(|(kind, title, desc)| {
+            let instances: Vec<ProviderDto> = configured
+                .iter()
+                .filter(|p| p.kind == *kind)
+                .cloned()
+                .collect();
+            let kind_s = kind.to_string();
+            if instances.is_empty() {
+                let k2 = kind_s.clone();
+                view! {
+                    div(class="provider-tile empty-tile") {
+                        div(class="tile-title") { (*title) }
+                        div(class="tile-desc") { (*desc) }
+                        div(class="tile-hint") { "not configured" }
+                        (if kind_s == "antigravity" || kind_s == "codex" {
+                            view! { OAuthAddButton(kind=k2) }
+                        } else {
+                            view! { div(class="tile-hint dim") { "add via Config tab" } }
+                        })
+                    }
+                }
+            } else {
+                let inner: Vec<View> = instances
+                    .into_iter()
+                    .map(|p| {
+                        let total = p.keys.len();
+                        let active = p.keys.iter().filter(|k| k.status == "active").count();
+                        let name = p.name.clone();
+                        let name2 = p.name.clone();
+                        let health = if total > 0 && active == 0 {
+                            "pdot pdot-err"
+                        } else if active < total {
+                            "pdot pdot-warn"
+                        } else {
+                            "pdot pdot-ok"
+                        };
+                        view! {
+                            div(class="provider-tile", on:click=move |_| go(Some(name.clone()))) {
+                                div(class="tile-head") {
+                                    span(class=health) {}
+                                    span(class="tile-title") { (name2) }
+                                }
+                                div(class="tile-desc") { (*desc) }
+                                div(class="tile-meta") { (format!("{} keys · {} active", total, active)) }
+                            }
+                        }
+                    })
+                    .collect();
+                view! { (inner) }
+            }
+        })
+        .collect()
+}
+
+#[component(inline_props)]
+fn ProviderDetail(name: String, providers: Signal<Vec<ProviderDto>>) -> View {
+    view! {
+        a(class="back-link", href="#providers") { "← all providers" }
+        (match providers.get_clone().into_iter().find(|p| p.name == name) {
+            Some(p) => view! { ProviderCard(p=p) },
+            None => {
+                let msg = format!("provider '{name}' not found in config — add it via Config tab");
+                view! {
+                    div(class="card") { div(class="empty") {
+                        div(class="pix") { i {} i {} i {} i {} i {} i {} i {} i {} i {} }
+                        (msg)
+                    } }
+                }
+            }
+        })
     }
 }
 
@@ -377,7 +499,6 @@ fn ProviderCard(p: ProviderDto) -> View {
         }
     };
 
-    // Футер карточки собирается ДО view!, чтобы не тащить захваты в динамические замыкания.
     let footer = if oauth {
         view! { OAuthAddButton(kind=pkind_footer) }
     } else {
@@ -428,6 +549,28 @@ fn ProviderCard(p: ProviderDto) -> View {
 }
 
 #[component(inline_props)]
+fn AddKeyForm(provider: String) -> View {
+    let new_key = create_signal(String::new());
+    view! {
+        div(class="addkey") {
+            input(class="input", r#type="text", placeholder="add a key…",
+                  bind:value=new_key)
+            button(class="btn btn-primary", on:click=move |_| {
+                let secret = new_key.get_clone();
+                if secret.len() >= 4 {
+                    new_key.set(String::new());
+                    let provider = provider.clone();
+                    spawn_local(async move {
+                        let body = serde_json::json!({"provider": provider, "secret": secret});
+                        post_json("/api/keys/add", &body).await;
+                    });
+                }
+            }) { "Add" }
+        }
+    }
+}
+
+#[component(inline_props)]
 fn OAuthAddButton(kind: String) -> View {
     let auth = create_signal(Option::<AuthStateDto>::None);
     let label = format!("Add {} account", kind);
@@ -473,28 +616,6 @@ fn OAuthAddButton(kind: String) -> View {
             }
             None => view! {},
         })
-    }
-}
-
-#[component(inline_props)]
-fn AddKeyForm(provider: String) -> View {
-    let new_key = create_signal(String::new());
-    view! {
-        div(class="addkey") {
-            input(class="input", r#type="text", placeholder="add a key…",
-                  bind:value=new_key)
-            button(class="btn btn-primary", on:click=move |_| {
-                let secret = new_key.get_clone();
-                if secret.len() >= 4 {
-                    new_key.set(String::new());
-                    let provider = provider.clone();
-                    spawn_local(async move {
-                        let body = serde_json::json!({"provider": provider, "secret": secret});
-                        post_json("/api/keys/add", &body).await;
-                    });
-                }
-            }) { "Add" }
-        }
     }
 }
 
