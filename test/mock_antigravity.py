@@ -32,7 +32,7 @@ class H(BaseHTTPRequestHandler):
         ua = self.headers.get("User-Agent", "")
         assert ua.startswith("antigravity/"), f"bad UA: {ua}"
 
-        if "ag-bad" in auth:
+        if "ag-bad" in auth and ":fetchAvailableModels" not in self.path:
             self.send_response(429)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -43,11 +43,12 @@ class H(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
+            frac = 0.11 if "ag-bad" in auth else 0.73
             self.wfile.write(json.dumps({
                 "models": {
                     "gemini-3-pro-high": {
                         "displayName": "Gemini 3 Pro High",
-                        "quotaInfo": {"remainingFraction": 0.73, "resetTime": "2026-10-13T00:00:00Z"},
+                        "quotaInfo": {"remainingFraction": frac, "resetTime": "2026-10-13T00:00:00Z"},
                     },
                     "gemini-3-flash": {
                         "displayName": "Gemini 3 Flash",

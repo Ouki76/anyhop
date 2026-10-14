@@ -107,8 +107,8 @@ impl CodexAccount {
 
     pub fn label(&self) -> String {
         self.email.clone().unwrap_or_else(|| {
-            let t = &self.identity;
-            if t.len() <= 8 { "****".into() } else { format!("{}…", &t[..8]) }
+            let digest = sha2::Sha256::digest(self.identity.as_bytes());
+            format!("acct:{}", hex::encode(&digest[..4]))
         })
     }
 

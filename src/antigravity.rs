@@ -10,6 +10,8 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use sha2::Digest;
+
 use serde_json::{Value, json};
 use tracing::warn;
 
@@ -168,8 +170,10 @@ impl Account {
 
     pub fn label(&self) -> String {
         self.email.clone().unwrap_or_else(|| {
-            let t = &self.identity;
-            if t.len() <= 8 { "****".into() } else { format!("{}…", &t[..8]) }
+            // Refresh-токены Google почти все начинаются одинаково («1//0c…»),
+            // поэтому маскируем по хэшу — иначе лейблы разных аккаунтов совпадают.
+            let digest = sha2::Sha256::digest(self.identity.as_bytes());
+            format!("acct:{}", hex::encode(&digest[..4]))
         })
     }
 

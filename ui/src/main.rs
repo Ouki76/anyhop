@@ -599,9 +599,10 @@ fn QuotasTab(quotas: Signal<Vec<QuotaDto>>) -> View {
         } else {
             view! {
                 div(class="quota-grid") {
-                    Indexed(
+                    Keyed(
                         list=quotas,
                         view=|q: QuotaDto| view! { QuotaCard(q=q) },
+                        key=|q: &QuotaDto| format!("{}:{}", q.provider, q.account),
                     )
                 }
             }
