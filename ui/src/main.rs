@@ -228,17 +228,6 @@ fn App() -> View {
         }
     });
 
-    let active_keys = create_memo(move || {
-        providers
-            .get_clone()
-            .iter()
-            .map(|p| p.keys.iter().filter(|k| k.status == "active").count())
-            .sum::<usize>()
-    });
-    let total_keys = create_memo(move || {
-        providers.get_clone().iter().map(|p| p.keys.len()).sum::<usize>()
-    });
-
     view! {
         div(class="topbar") {}
         div(class="wrap") {
@@ -249,10 +238,6 @@ fn App() -> View {
                         span(class="logo-text") { "anyhop" }
                     }
                     div(class="tagline") { "LLM Gateway · Rotation · Failover" }
-                }
-                div(class="status-pill") {
-                    div(class="pulse") {}
-                    (format!("{}/{} keys active", active_keys.get_clone(), total_keys.get_clone()))
                 }
                 ThemeToggle()
             }

@@ -270,7 +270,13 @@ td.num { font-variant-numeric: tabular-nums; }
   display: flex; align-items: center; gap: 10px;
   margin-bottom: 12px; padding-bottom: 10px;
   border-bottom: 1px solid var(--border);
+  min-width: 0;
 }
+.quota-card-head .badge {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; flex-shrink: 1;
+}
+.quota-worst, .quota-caret { flex-shrink: 0; }
 .quota-card-head b { font-size: 14px; font-weight: 600; }
 .quota-card-head .badge { font-size: 10px; }
 .quota-row {
@@ -304,7 +310,7 @@ td.num { font-variant-numeric: tabular-nums; }
 }
 .quota-card .quota-body { display: none; }
 .quota-card.open .quota-body { display: block; }
-.quota-caret { font-family: var(--mono); font-size: 10px; color: var(--dim); margin-left: auto; }
+.quota-caret { font-family: var(--mono); font-size: 10px; color: var(--dim); }
 .quota-worst { font-family: var(--mono); font-size: 11px; color: var(--dim); margin-left: auto; white-space: nowrap; }
 .quota-worst.low { color: var(--red-fg); }
 .quota-card.open .quota-worst { display: none; }
@@ -341,3 +347,6 @@ td.num { font-variant-numeric: tabular-nums; }
 </head>
 <body></body>
 </html>
+
+/* theme toggle прижат вправо */
+.top .theme-btn { margin-left: auto; }
