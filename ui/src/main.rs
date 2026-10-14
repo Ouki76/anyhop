@@ -4,6 +4,7 @@ use serde::Deserialize;
 use sycamore::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 use futures::StreamExt;
+use wasm_bindgen::JsCast;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct KeyDto {
@@ -373,6 +374,14 @@ const KNOWN_TYPES: &[(&str, &str, &str)] = &[
 #[component(inline_props)]
 fn ProvidersTab(providers: Signal<Vec<ProviderDto>>) -> View {
     let selected = create_signal(provider_from_hash());
+    // Реагируем на смену хэша (back-линк, кнопки браузера).
+    if let Some(w) = web_sys::window() {
+        let cb = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
+            selected.set(provider_from_hash());
+        }) as Box<dyn Fn()>);
+        let _ = w.add_event_listener_with_callback("hashchange", cb.as_ref().unchecked_ref());
+        cb.forget(); // живёт весь рантайм приложения
+    }
 
     let go = move |name: Option<String>| {
         selected.set(name.clone());
@@ -413,14 +422,13 @@ fn build_tiles(configured: Vec<ProviderDto>, go: impl Fn(Option<String>) + Copy 
                 .collect();
             let kind_s = kind.to_string();
             if instances.is_empty() {
-                let k2 = kind_s.clone();
                 view! {
                     div(class="provider-tile empty-tile") {
                         div(class="tile-title") { (*title) }
                         div(class="tile-desc") { (*desc) }
                         div(class="tile-hint") { "not configured" }
                         (if kind_s == "antigravity" || kind_s == "codex" {
-                            view! { OAuthAddButton(kind=k2) }
+                            view! { div(class="tile-hint dim") { "add account via Config tab" } }
                         } else {
                             view! { div(class="tile-hint dim") { "add via Config tab" } }
                         })
