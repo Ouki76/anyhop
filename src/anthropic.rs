@@ -36,9 +36,15 @@ fn content_blocks(content: Option<&Value>) -> Result<Vec<Value>, String> {
             let mut blocks = Vec::new();
             for p in arr {
                 match p.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => blocks.push(
-                        json!({"type": "text", "text": p.get("text").cloned().unwrap_or(json!(""))}),
-                    ),
+                    Some("text") => {
+                        let mut b =
+                            json!({"type": "text", "text": p.get("text").cloned().unwrap_or(json!(""))});
+                        // Prompt caching: прокидываем cache_control breakpoints как есть.
+                        if let Some(cc) = p.get("cache_control") {
+                            b["cache_control"] = cc.clone();
+                        }
+                        blocks.push(b);
+                    }
                     Some("image_url") => {
                         let url = p
                             .pointer("/image_url/url")

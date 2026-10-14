@@ -134,6 +134,14 @@ pub async fn chat_completions(
         );
     };
 
+    // Sticky sessions: хэш (модель + начало тела) → один и тот же ключ для диалога,
+    // чтобы ловить KV-cache провайдера. Только для чатов с messages.
+    let session = if body.windows(8).any(|w| w == b"messages") {
+        Some(session_key(&model, &body))
+    } else {
+        None
+    };
+
     let targets: Vec<(&Provider, String)> = match &resolved {
         Resolved::One(p, m) => vec![(*p, m.clone())],
         Resolved::Chain(c) => c.clone(),
@@ -160,7 +168,7 @@ pub async fn chat_completions(
     let max_retries = state.rt().max_retries;
     let total = targets.len();
     for (i, (provider, upstream_model)) in targets.iter().enumerate() {
-        let result = run_target(&state, provider, upstream_model, &body, model_span.clone(), json.as_ref(), is_stream).await;
+        let result = run_target(&state, provider, upstream_model, &body, model_span.clone(), json.as_ref(), is_stream, session).await;
         if let Some(resp) = result {
             if total > 1 && i > 0 {
                 info!(combo = %model, fallback = i + 1, of = total, "combo fallback succeeded");
@@ -185,6 +193,16 @@ pub async fn chat_completions(
     )
 }
 
+/// Sticky session hash: модель + первые 4KB тела (покрывает system+первые сообщения).
+fn session_key(model: &str, body: &Bytes) -> u64 {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(model.as_bytes());
+    h.update(&body[..body.len().min(4096)]);
+    let d = h.finalize();
+    u64::from_le_bytes(d[..8].try_into().unwrap())
+}
+
 fn exhausted_response(provider: &str, attempts: usize) -> Response {
     error_response(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -203,7 +221,7 @@ pub async fn run_target_pub(
 ) -> Option<Response> {
     let body = Bytes::from(serde_json::to_vec(payload).unwrap_or_default());
     let span = crate::scan::string_field_span(&body, b"model");
-    run_target(state, provider, model, &body, span, Some(payload), is_stream).await
+    run_target(state, provider, model, &body, span, Some(payload), is_stream, None).await
 }
 
 /// Run the retry loop for one provider/model target.
@@ -219,6 +237,7 @@ async fn run_target(
     model_span: Option<std::ops::Range<usize>>,
     payload: Option<&Value>,
     is_stream: bool,
+    session: Option<u64>,
 ) -> Option<Response> {
     // Translated payloads are prebuilt once, before the retry loop
     // (the antigravity envelope additionally needs a per-account project id).
@@ -243,7 +262,7 @@ async fn run_target(
     };
 
     for _ in 0..state.rt().max_retries.max(1) {
-        let Some(key) = provider.pool.pick(model) else {
+        let Some(key) = provider.pool.pick(model, session) else {
             warn!(provider = %provider.name, model, "no available keys (all busy/cooling down/dead)");
             break;
         };

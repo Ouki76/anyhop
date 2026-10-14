@@ -177,7 +177,7 @@ impl Provider {
                 return list.clone();
             }
         }
-        let Some(key) = self.pool.pick("") else {
+        let Some(key) = self.pool.pick("", None) else {
             return Vec::new();
         };
         let Some(acc) = self.ag_account(&key.secret) else {

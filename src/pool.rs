@@ -169,6 +169,9 @@ pub struct KeyPool {
     cursor: AtomicUsize,
     storage: Option<Storage>,
     events: Option<crate::events::EventBus>,
+    /// Sticky sessions: session hash -> (key id hash, last seen unix ms).
+    /// Keeps a conversation on one key so the provider-side KV cache hits.
+    sticky: Mutex<HashMap<u64, (String, u64)>>,
 }
 
 impl KeyPool {
@@ -193,6 +196,7 @@ impl KeyPool {
             cursor: AtomicUsize::new(0),
             storage,
             events,
+            sticky: Mutex::new(HashMap::new()),
         };
         pool.restore();
         pool
@@ -253,7 +257,48 @@ impl KeyPool {
     }
 
     /// Pick the next key available for this model according to the strategy.
-    pub fn pick(&self, model: &str) -> Option<Arc<KeyState>> {
+    /// `session` enables sticky routing: the same session hash sticks to one key.
+    pub fn pick(&self, model: &str, session: Option<u64>) -> Option<Arc<KeyState>> {
+        // Sticky lookup first (round_robin/least_used; fill_first is sticky by design).
+        if let Some(s) = session
+            && !matches!(self.strategy, Strategy::FillFirst)
+        {
+            let now = now_ms();
+            {
+                let mut map = self.sticky.lock().unwrap();
+                // Ленивая эвикция устаревших (30 мин без активности).
+                map.retain(|_, (_, seen)| now - *seen < 30 * 60 * 1000);
+                if let Some((kid, seen)) = map.get_mut(&s) {
+                    *seen = now;
+                    let kid = kid.clone();
+                    drop(map);
+                    let keys = self.keys.lock().unwrap();
+                    if let Some(k) = keys
+                        .iter()
+                        .find(|k| {
+                            crate::storage::key_id(&self.name, &k.secret) == kid
+                                && k.is_available(model)
+                        })
+                    {
+                        return Some(k.clone());
+                    }
+                    // Ключ ушёл в кулдаун/умер — перевыберем ниже.
+                }
+            }
+            let picked = self.pick_inner(model);
+            if let Some(k) = &picked {
+                let mut map = self.sticky.lock().unwrap();
+                if map.len() >= 10_000 {
+                    map.clear(); // грубая эвикция при переполнении
+                }
+                map.insert(s, (crate::storage::key_id(&self.name, &k.secret), now));
+            }
+            return picked;
+        }
+        self.pick_inner(model)
+    }
+
+    fn pick_inner(&self, model: &str) -> Option<Arc<KeyState>> {
         let keys = self.keys.lock().unwrap();
         if keys.is_empty() {
             return None;
