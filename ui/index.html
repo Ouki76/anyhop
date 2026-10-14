@@ -265,7 +265,9 @@ td.num { font-variant-numeric: tabular-nums; }
   background: var(--panel); border: 1px solid var(--border);
   border-radius: 8px; padding: 16px 20px;
   transition: border-color .2s ease;
+  min-width: 0; /* grid-item: иначе контент распирает трек за viewport */
 }
+.quota-body { min-width: 0; }
 .quota-card:hover { border-color: var(--dim); }
 .quota-card-head {
   display: flex; align-items: center; gap: 10px;
