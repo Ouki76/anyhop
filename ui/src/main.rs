@@ -104,6 +104,22 @@ async fn post_json<B: serde::Serialize>(url: &str, body: &B) {
     }
 }
 
+thread_local! {
+    /// Состояние свёрнутых секций переживает пересоздание компонентов при поллинге.
+    static COLLAPSE_STATE: std::cell::RefCell<std::collections::HashMap<String, bool>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn collapse_get(key: &str) -> bool {
+    COLLAPSE_STATE.with(|c| c.borrow().get(key).copied().unwrap_or(false))
+}
+
+fn collapse_set(key: &str, v: bool) {
+    COLLAPSE_STATE.with(|c| {
+        c.borrow_mut().insert(key.to_string(), v);
+    });
+}
+
 fn main() {
     console_error_panic_hook::set_once();
     sycamore::render(App);
@@ -478,26 +494,31 @@ fn build_tiles(configured: Vec<ProviderDto>, go: impl Fn(Option<String>) + Copy 
 }
 
 #[component(inline_props)]
-fn ModelsCard(models: Vec<String>) -> View {
-    let open = create_signal(false);
+fn ModelsCard(provider: String, models: Vec<String>) -> View {
+    let key = format!("models:{provider}");
+    let open = create_signal(collapse_get(&key));
     let n = models.len();
-    let body = if open.get() {
-        let chips: Vec<View> = models
-            .into_iter()
-            .map(|m| view! { span(class="model-chip") { (m) } })
-            .collect();
-        view! { div(class="model-cloud") { (chips) } }
-    } else {
-        view! {}
-    };
     view! {
-        div(class=if open.get() { "card open" } else { "card" }) {
-            div(class="card-head clickable", on:click=move |_| open.set(!open.get())) {
+        div(class=create_memo(move || if open.get() { "card open" } else { "card" })) {
+            div(class="card-head clickable", on:click=move |_| {
+                let nv = !open.get();
+                open.set(nv);
+                collapse_set(&key, nv);
+            }) {
                 b { "Models" }
                 span(class="badge") { (n) }
                 span(class="quota-caret") { (if open.get() { "−" } else { "+" }) }
             }
-            (body)
+            (if open.get() {
+                let chips: Vec<View> = models
+                    .clone()
+                    .into_iter()
+                    .map(|m| view! { span(class="model-chip") { (m) } })
+                    .collect();
+                view! { div(class="model-cloud") { (chips) } }
+            } else {
+                view! {}
+            })
         }
     }
 }
@@ -509,9 +530,10 @@ fn ProviderDetail(name: String, providers: Signal<Vec<ProviderDto>>) -> View {
         (match providers.get_clone().into_iter().find(|p| p.name == name) {
             Some(p) => {
                 let models = p.models.clone();
+                let pname = p.name.clone();
                 view! {
                     ProviderCard(p=p)
-                    ModelsCard(models=models)
+                    ModelsCard(provider=pname, models=models)
                 }
             }
             None => {
