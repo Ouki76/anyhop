@@ -438,7 +438,7 @@ fn build_tiles(configured: Vec<ProviderDto>, go: impl Fn(Option<String>) + Copy 
                         (if kind_s == "antigravity" || kind_s == "codex" {
                             view! { div(class="tile-hint dim") { "add account via Config tab" } }
                         } else {
-                            view! { QuickAddProvider(kind=kind_s) }
+                            view! { div(class="tile-hint dim") { "add via Config tab" } }
                         })
                     }
                 }
@@ -473,45 +473,6 @@ fn build_tiles(configured: Vec<ProviderDto>, go: impl Fn(Option<String>) + Copy 
             }
         })
         .collect()
-}
-
-#[component(inline_props)]
-fn QuickAddProvider(kind: String) -> View {
-    let base_url = create_signal(String::new());
-    let key = create_signal(String::new());
-    let status = create_signal(String::new());
-    let placeholder = match kind.as_str() {
-        "gemini" => "https://generativelanguage.googleapis.com/v1beta",
-        "anthropic" => "https://api.anthropic.com",
-        _ => "https://your-endpoint/v1",
-    };
-    view! {
-        div(class="quick-add") {
-            input(class="input", r#type="text", placeholder=placeholder, bind:value=base_url)
-            input(class="input", r#type="text", placeholder="api key (optional now)", bind:value=key)
-            button(class="btn btn-primary", on:click=move |_| {
-                let kind = kind.clone();
-                let bu = base_url.get_clone();
-                let k = key.get_clone();
-                spawn_local(async move {
-                    let body = serde_json::json!({"kind": kind, "base_url": bu, "key": k});
-                    match Request::post("/api/providers/add").json(&body) {
-                        Ok(req) => match req.send().await {
-                            Ok(resp) if resp.status() == 200 => status.set("added ✓".into()),
-                            Ok(resp) => status.set(resp.text().await.unwrap_or_else(|_| "error".into())),
-                            Err(e) => status.set(format!("error: {e}")),
-                        },
-                        Err(e) => status.set(format!("error: {e}")),
-                    }
-                });
-            }) { "Add" }
-            (if !status.get_clone().is_empty() {
-                view! { div(class="tile-hint") { (status.get_clone()) } }
-            } else {
-                view! {}
-            })
-        }
-    }
 }
 
 #[component(inline_props)]
