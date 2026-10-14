@@ -258,6 +258,7 @@ td.num { font-variant-numeric: tabular-nums; }
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 16px;
+  align-items: start; /* иначе свёрнутые карточки растягиваются до высоты открытых */
 }
 .quota-card {
   background: var(--panel); border: 1px solid var(--border);
@@ -304,7 +305,7 @@ td.num { font-variant-numeric: tabular-nums; }
 .quota-card .quota-body { display: none; }
 .quota-card.open .quota-body { display: block; }
 .quota-caret { font-family: var(--mono); font-size: 10px; color: var(--dim); margin-left: auto; }
-.quota-worst { font-family: var(--mono); font-size: 11px; color: var(--dim); margin-left: auto; }
+.quota-worst { font-family: var(--mono); font-size: 11px; color: var(--dim); margin-left: auto; white-space: nowrap; }
 .quota-worst.low { color: var(--red-fg); }
 .quota-card.open .quota-worst { display: none; }
 
