@@ -393,6 +393,7 @@ fn ProviderCard(p: ProviderDto) -> View {
                 span(class="badge") { (p.strategy) }
                 span(class="badge raw") { (p.base_url) }
             }
+            div(class="table-scroll") {
             table {
                 tr {
                     th { "Key" } th { "Status" } th { "Cooldown" } th { "In-flight" }
@@ -419,6 +420,7 @@ fn ProviderCard(p: ProviderDto) -> View {
                         }
                     },
                 )
+            }
             }
             (footer)
         }
