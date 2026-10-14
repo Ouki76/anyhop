@@ -29,14 +29,18 @@ pub struct ProviderDto {
     strategy: &'static str,
     base_url: String,
     keys: Vec<KeySnapshot>,
+    models: Vec<String>,
 }
 
 pub async fn providers(State(state): State<Arc<AppState>>) -> Response {
     let router = state.router.load();
-    let data: Vec<ProviderDto> = router
-        .providers
+    let mut data = Vec::new();
+    for p in &router.providers {
+        data.push((p, p.effective_models().await));
+    }
+    let data: Vec<ProviderDto> = data
         .iter()
-        .map(|p| ProviderDto {
+        .map(|(p, models)| ProviderDto {
             name: p.name.clone(),
             kind: match p.kind {
                 ProviderKind::OpenaiCompat => "openai_compat",
@@ -52,6 +56,7 @@ pub async fn providers(State(state): State<Arc<AppState>>) -> Response {
             },
             base_url: p.base_url.clone(),
             keys: p.pool.snapshot(),
+            models: models.clone(),
         })
         .collect();
     Json(data).into_response()

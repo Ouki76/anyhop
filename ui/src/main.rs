@@ -26,6 +26,8 @@ struct ProviderDto {
     strategy: String,
     base_url: String,
     keys: Vec<KeyDto>,
+    #[serde(default)]
+    models: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -476,11 +478,42 @@ fn build_tiles(configured: Vec<ProviderDto>, go: impl Fn(Option<String>) + Copy 
 }
 
 #[component(inline_props)]
+fn ModelsCard(models: Vec<String>) -> View {
+    let open = create_signal(false);
+    let n = models.len();
+    let body = if open.get() {
+        let chips: Vec<View> = models
+            .into_iter()
+            .map(|m| view! { span(class="model-chip") { (m) } })
+            .collect();
+        view! { div(class="model-cloud") { (chips) } }
+    } else {
+        view! {}
+    };
+    view! {
+        div(class=if open.get() { "card open" } else { "card" }) {
+            div(class="card-head clickable", on:click=move |_| open.set(!open.get())) {
+                b { "Models" }
+                span(class="badge") { (n) }
+                span(class="quota-caret") { (if open.get() { "−" } else { "+" }) }
+            }
+            (body)
+        }
+    }
+}
+
+#[component(inline_props)]
 fn ProviderDetail(name: String, providers: Signal<Vec<ProviderDto>>) -> View {
     view! {
         a(class="back-link", href="#providers") { "← all providers" }
         (match providers.get_clone().into_iter().find(|p| p.name == name) {
-            Some(p) => view! { ProviderCard(p=p) },
+            Some(p) => {
+                let models = p.models.clone();
+                view! {
+                    ProviderCard(p=p)
+                    ModelsCard(models=models)
+                }
+            }
             None => {
                 let msg = format!("provider '{name}' not found in config — add it via Config tab");
                 view! {

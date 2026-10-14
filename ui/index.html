@@ -376,6 +376,20 @@ td.num { font-variant-numeric: tabular-nums; }
   .key-stats { margin-left: 0; width: 100%; text-align: left; }
 }
 
+/* models cloud */
+.card-head.clickable { cursor: pointer; user-select: none; }
+.card-head.clickable:hover b { color: var(--c3); }
+.card-head .quota-caret { margin-left: auto; }
+.model-cloud {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  padding: 16px 24px; border-top: 1px solid var(--border);
+}
+.model-chip {
+  font-family: var(--mono); font-size: 11.5px;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 10px;
+}
+
 /* provider catalog */
 .provider-grid {
   display: grid;
