@@ -614,7 +614,7 @@ fn QuotaCard(q: QuotaDto) -> View {
                 b { (q.provider) }
                 span(class="badge raw") { (q.account) }
                 span(class=if worst_low { "quota-worst low" } else { "quota-worst" }) { (worst_txt) }
-                span(class="quota-caret") { (if open.get() { "–" } else { "+" }) }
+                span(class="quota-caret") { (if open.get() { "−" } else { "+" }) }
             }
             div(class="quota-body") {
                 Indexed(
