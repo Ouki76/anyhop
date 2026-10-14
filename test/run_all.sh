@@ -64,6 +64,17 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/chat/completions" -H "$C
 echo "== api =="
 curl -s "$BASE/api/providers" | grep -q '"name":"mock"' && ok "/api/providers" || fail "/api/providers"
 
+echo "== ui navigation (CDP) =="
+if command -v chromium-browser >/dev/null && python3 -c 'import websocket' 2>/dev/null; then
+    if python3 test/cdp_nav_test.py > /tmp/cdp-nav.out 2>&1; then
+        ok "ui navigation, no panics"
+    else
+        fail "ui navigation"; tail -5 /tmp/cdp-nav.out
+    fi
+else
+    echo "  skip (chromium/websocket-client missing)"
+fi
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ]

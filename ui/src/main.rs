@@ -107,6 +107,13 @@ fn main() {
     sycamore::render(App);
 }
 
+/// Записи в сигналы из внешних источников (SSE, таймеры, hashchange) нельзя
+/// делать синхронно: прилетевшее событие может попасть внутрь чужого эффекта,
+/// и sycamore упадёт с BorrowMutError. Откладываем в микротаску.
+fn defer(f: impl FnOnce() + 'static) {
+    spawn_local(async move { f() });
+}
+
 fn tab_from_hash() -> Tab {
     let hash = web_sys::window()
         .and_then(|w| w.location().hash().ok())
@@ -172,6 +179,17 @@ fn ThemeToggle() -> View {
 #[component]
 fn App() -> View {
     let tab = create_signal(tab_from_hash());
+    // Выбранный провайдер (detail-страница) — в root scope, чтобы переживал
+    // перемонтирование вкладок; hashchange-листенер один на всё приложение.
+    let selected_provider = create_signal(provider_from_hash());
+    if let Some(w) = web_sys::window() {
+        let cb = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
+            let sp = selected_provider;
+            defer(move || sp.set(provider_from_hash()));
+        }) as Box<dyn Fn()>);
+        let _ = w.add_event_listener_with_callback("hashchange", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
     let providers = create_signal(Vec::<ProviderDto>::new());
     let quotas = create_signal(Vec::<QuotaDto>::new());
     let events = create_signal(Vec::<EventDto>::new());
@@ -288,7 +306,7 @@ fn App() -> View {
             div(class="tab-content") {
                 (match tab.get() {
                     Tab::Overview => view! { OverviewTab(providers=providers, events=events) },
-                    Tab::Providers => view! { ProvidersTab(providers=providers) },
+                    Tab::Providers => view! { ProvidersTab(providers=providers, selected=selected_provider) },
                     Tab::Quotas => view! { QuotasTab(quotas=quotas) },
                     Tab::Events => view! { EventsTab(events=events) },
                     Tab::Config => view! { ConfigTab() },
@@ -372,17 +390,7 @@ const KNOWN_TYPES: &[(&str, &str, &str)] = &[
 ];
 
 #[component(inline_props)]
-fn ProvidersTab(providers: Signal<Vec<ProviderDto>>) -> View {
-    let selected = create_signal(provider_from_hash());
-    // Реагируем на смену хэша (back-линк, кнопки браузера).
-    if let Some(w) = web_sys::window() {
-        let cb = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
-            selected.set(provider_from_hash());
-        }) as Box<dyn Fn()>);
-        let _ = w.add_event_listener_with_callback("hashchange", cb.as_ref().unchecked_ref());
-        cb.forget(); // живёт весь рантайм приложения
-    }
-
+fn ProvidersTab(providers: Signal<Vec<ProviderDto>>, selected: Signal<Option<String>>) -> View {
     let go = move |name: Option<String>| {
         selected.set(name.clone());
         if let Some(w) = web_sys::window() {
@@ -592,12 +600,13 @@ fn OAuthAddButton(kind: String) -> View {
                     let Ok(resp) = req.send().await else { return };
                     let Ok(v) = resp.json::<serde_json::Value>().await else { return };
                     let Some(url) = v.get("url").and_then(|u| u.as_str()).map(str::to_string) else { return };
-                    auth.set(Some(AuthStateDto {
+                    let url2 = url.clone();
+                    defer(move || auth.set(Some(AuthStateDto {
                         kind: kind.clone(),
                         status: "waiting".into(),
-                        url: url.clone(),
+                        url: url2,
                         message: "waiting for browser callback".into(),
-                    }));
+                    })));
                     if let Some(w) = web_sys::window() {
                         let _ = w.open_with_url_and_target(&url, "_blank");
                     }
