@@ -24,6 +24,8 @@ pub struct RtConfig {
     pub max_retries: usize,
     pub attempt_timeout: Duration,
     pub api_key: Option<String>,
+    /// Admin key for /api/* and /dashboard (falls back to api_key).
+    pub admin_key: Option<String>,
     pub events_history: usize,
     pub requests_history: usize,
 }

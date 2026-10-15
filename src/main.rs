@@ -26,27 +26,61 @@ use axum::routing::{get, post};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+fn bearer_ok(req: &Request, expected: &str) -> bool {
+    let header_ok = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t == expected)
+        .unwrap_or(false);
+    // EventSource не умеет заголовки — для GET допускаем ?key=
+    let query_ok = req
+        .uri()
+        .query()
+        .and_then(|q| {
+            q.split('&')
+                .find_map(|p| p.strip_prefix("key="))
+                .map(str::to_string)
+        })
+        .map(|k| k == expected)
+        .unwrap_or(false);
+    header_ok || query_ok
+}
+
 /// Gateway auth: /v1/* requires Bearer <api_key> when configured.
 async fn require_api_key(
     State(state): State<Arc<proxy::AppState>>,
     req: Request,
     next: Next,
 ) -> Response {
-    if let Some(expected) = state.rt().api_key {
-        let ok = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|t| t == expected)
-            .unwrap_or(false);
-        if !ok {
-            return proxy::error_response(
-                StatusCode::UNAUTHORIZED,
-                "invalid or missing gateway API key",
-                "authentication_error",
-            );
-        }
+    if let Some(expected) = state.rt().api_key
+        && !bearer_ok(&req, &expected)
+    {
+        return proxy::error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing gateway API key",
+            "authentication_error",
+        );
+    }
+    next.run(req).await
+}
+
+/// Admin auth: /api/* and /dashboard require Bearer <admin_key> (or api_key) when set.
+async fn require_admin_key(
+    State(state): State<Arc<proxy::AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let rt = state.rt();
+    if let Some(expected) = rt.admin_key.or(rt.api_key)
+        && !bearer_ok(&req, &expected)
+    {
+        return proxy::error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing admin key",
+            "authentication_error",
+        );
     }
     next.run(req).await
 }
@@ -88,6 +122,15 @@ async fn main() -> anyhow::Result<()> {
     let config_path = std::env::var("ANYHOP_CONFIG").unwrap_or_else(|_| "anyhop.toml".into());
     let cfg = config::Config::load(&config_path)?;
     info!("loaded config from {config_path}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&config_path)
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            tracing::warn!("config {config_path} is readable by others — секреты! chmod 600 рекомендую");
+        }
+    }
 
     let storage = if cfg.server.state_file.is_empty() {
         None
@@ -160,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
             max_retries: cfg.server.max_retries,
             attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),
             api_key: cfg.server.api_key.clone(),
+            admin_key: cfg.server.admin_key.clone().or(cfg.server.api_key.clone()),
             events_history: cfg.server.events_history,
             requests_history: cfg.server.requests_history,
         }),
@@ -185,11 +229,10 @@ async fn main() -> anyhow::Result<()> {
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
-        ));
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(cfg.server.max_body_bytes));
 
-    let app = axum::Router::new()
-        .merge(api)
-        .route("/healthz", get(|| async { "ok" }))
+    let admin_base = axum::Router::new()
         .route("/api/providers", get(api::providers))
         .route("/api/requests", get(api::requests))
         .route("/api/quotas", get(api::quotas))
@@ -201,7 +244,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/config", get(api::get_config).put(api::put_config))
         .route("/api/reload", post(api::reload))
         .route("/api/auth/start", post(api::auth_start))
-        .route("/api/auth/status", get(api::auth_status));
+        .route("/api/auth/status", get(api::auth_status))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_key,
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(cfg.server.max_body_bytes));
+
+    let app = axum::Router::new()
+        .merge(api)
+        .merge(admin_base)
+        .route("/healthz", get(|| async { "ok" }));
 
     #[cfg(feature = "dashboard")]
     let app = if cfg.server.dashboard {
@@ -256,7 +309,24 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&cfg.server.listen).await?;
     info!("anyhop listening on http://{}", cfg.server.listen);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            #[cfg(unix)]
+            {
+                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            info!("shutting down gracefully");
+        })
+        .await?;
     Ok(())
 }
 
@@ -293,6 +363,7 @@ pub fn reload_config(state: &Arc<proxy::AppState>) -> anyhow::Result<usize> {
         max_retries: cfg.server.max_retries,
         attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),
         api_key: cfg.server.api_key.clone(),
+        admin_key: cfg.server.admin_key.clone().or(cfg.server.api_key.clone()),
         events_history: cfg.server.events_history,
         requests_history: cfg.server.requests_history,
     };

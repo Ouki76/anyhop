@@ -53,6 +53,12 @@ pub struct ServerConfig {
     /// If set, /v1/* endpoints require `Authorization: Bearer <api_key>`.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Admin key for /api/* and /dashboard. Defaults to api_key when unset.
+    #[serde(default)]
+    pub admin_key: Option<String>,
+    /// Max request body size (bytes).
+    #[serde(default = "default_max_body")]
+    pub max_body_bytes: usize,
     /// Serve the web dashboard at /dashboard (the JSON API stays on regardless).
     #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
     #[serde(default = "default_true")]
@@ -63,6 +69,10 @@ pub struct ServerConfig {
     /// Max request-log entries kept (and persisted). 0 = in-memory 200, no persistence.
     #[serde(default = "default_requests_history")]
     pub requests_history: usize,
+}
+
+fn default_max_body() -> usize {
+    32 * 1024 * 1024 // 32 MiB
 }
 
 fn default_events_history() -> usize {
@@ -92,6 +102,8 @@ impl Default for ServerConfig {
             dashboard: true,
             events_history: default_events_history(),
             requests_history: default_requests_history(),
+            admin_key: None,
+            max_body_bytes: default_max_body(),
         }
     }
 }

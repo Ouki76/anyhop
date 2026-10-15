@@ -107,12 +107,36 @@ fn fmt_num(n: u64) -> String {
     }
 }
 
+fn stored_key() -> Option<String> {
+    web_sys::window()?
+        .local_storage()
+        .ok()??
+        .get_item("anyhop_admin_key")
+        .ok()??
+        .into()
+}
+
+/// 401 от API → нужен admin key.
+static NEED_AUTH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str) -> Option<T> {
-    Request::get(url).send().await.ok()?.json::<T>().await.ok()
+    let mut req = Request::get(url);
+    if let Some(k) = stored_key() {
+        req = req.header("Authorization", &format!("Bearer {k}"));
+    }
+    let resp = req.send().await.ok()?;
+    if resp.status() == 401 {
+        NEED_AUTH.store(true, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    resp.json::<T>().await.ok()
 }
 
 async fn post_json<B: serde::Serialize>(url: &str, body: &B) {
     if let Ok(req) = Request::post(url).json(body) {
+        if let Some(k) = stored_key() {
+            req.headers().set("Authorization", &format!("Bearer {k}"));
+        }
         let _ = req.send().await;
     }
 }
@@ -196,6 +220,29 @@ fn set_theme(t: &str) {
 }
 
 #[component]
+fn AuthBanner() -> View {
+    let key = create_signal(String::new());
+    view! {
+        div(class="auth-banner auth-waiting", style="margin: 0 0 20px") {
+            "Admin key required: "
+            input(class="input", r#type="password", placeholder="admin key…", bind:value=key,
+                style="max-width: 280px; margin: 0 10px;")
+            button(class="btn btn-primary", on:click=move |_| {
+                let k = key.get_clone();
+                if !k.is_empty() {
+                    if let Some(w) = web_sys::window() {
+                        if let Ok(Some(s)) = w.local_storage() {
+                            let _ = s.set_item("anyhop_admin_key", &k);
+                        }
+                        let _ = w.location().reload();
+                    }
+                }
+            }) { "Save" }
+        }
+    }
+}
+
+#[component]
 fn ThemeToggle() -> View {
     let theme = create_signal(current_theme());
     view! {
@@ -213,6 +260,8 @@ fn ThemeToggle() -> View {
 #[component]
 fn App() -> View {
     let tab = create_signal(tab_from_hash());
+    let need_auth = create_signal(stored_key().is_none()
+        && NEED_AUTH.load(std::sync::atomic::Ordering::Relaxed));
     // Выбранный провайдер (detail-страница) — в root scope, чтобы переживал
     // перемонтирование вкладок; hashchange-листенер один на всё приложение.
     let selected_provider = create_signal(provider_from_hash());
@@ -238,6 +287,10 @@ fn App() -> View {
                     }
                     providers.set(data);
                     loaded.set(true);
+                }
+                let na = NEED_AUTH.load(std::sync::atomic::Ordering::Relaxed);
+                if na && need_auth.is_alive() {
+                    need_auth.set(true);
                 }
                 gloo_timers::future::sleep(std::time::Duration::from_secs(3)).await;
             }
@@ -315,6 +368,12 @@ fn App() -> View {
                 }
                 ThemeToggle()
             }
+
+            (if need_auth.get() {
+                view! { AuthBanner() }
+            } else {
+                view! {}
+            })
 
             nav(class="tabs") {
                 Indexed(
@@ -740,6 +799,9 @@ async fn fetch_text(url: &str) -> Option<String> {
 
 async fn put_json<B: serde::Serialize>(url: &str, body: &B) -> Option<String> {
     let req = Request::put(url).json(body).ok()?;
+    if let Some(k) = stored_key() {
+        req.headers().set("Authorization", &format!("Bearer {k}"));
+    }
     let resp = req.send().await.ok()?;
     let ok = resp.status() == 200;
     let text = resp.text().await.ok()?;

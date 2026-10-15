@@ -62,7 +62,7 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/chat/completions" -H "$C
 [ "$CODE" = 401 ] && ok "401 without key" || fail "auth: got $CODE"
 
 echo "== api =="
-curl -s "$BASE/api/providers" | grep -q '"name":"mock"' && ok "/api/providers" || fail "/api/providers"
+curl -s "$BASE/api/providers" -H "$AUTH" | grep -q '"name":"mock"' && ok "/api/providers" || fail "/api/providers"
 
 echo "== ui navigation (CDP) =="
 if command -v chromium-browser >/dev/null && python3 -c 'import websocket' 2>/dev/null; then

@@ -42,4 +42,4 @@ lto = "fat"
 codegen-units = 1
 strip = true
 opt-level = 3
-panic = "abort"
+# unwind: паника хендлера рвёт только его соединение, не процесс
