@@ -86,9 +86,15 @@ async fn require_admin_key(
 }
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[tokio::main]
+// jemalloc: фоновый поток возвращает неиспользуемые страницы ОС (5с decay).
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "malloc_conf")]
+static malloc_conf: &[u8] =
+    b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "auth" && (args[2] == "antigravity" || args[2] == "codex") {

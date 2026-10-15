@@ -6,7 +6,7 @@ pub fn build_http_client(proxy: Option<&str>) -> anyhow::Result<reqwest::Client>
     let mut b = reqwest::Client::builder()
         .user_agent(concat!("anyhop/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(32);
+        .pool_max_idle_per_host(8);
     if let Some(p) = proxy {
         let proxy = reqwest::Proxy::all(p)
             .map_err(|e| anyhow::anyhow!("invalid proxy url '{p}': {e}"))?;
