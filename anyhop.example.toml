@@ -6,6 +6,13 @@ attempt_timeout_secs = 120
 # proxy = "socks5://user:pass@127.0.0.1:1080"
 # Входящая авторизация: клиенты обязаны слать Authorization: Bearer <api_key>
 # api_key = "sk-anyhop-change-me"
+# Отдельный ключ для /api/* и дашборда (по умолчанию = api_key):
+# admin_key = "admin-secret"
+# Макс. размер тела запроса (байт):
+# max_body_bytes = 33554432
+# Глубина историй (0 = минимум в памяти, без персистентности):
+# events_history = 100
+# requests_history = 200
 
 # OpenAI-compatible provider (OpenRouter, DeepSeek, Groq, CatRouter, ...)
 [[providers]]
