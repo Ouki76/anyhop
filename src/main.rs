@@ -85,8 +85,13 @@ async fn require_admin_key(
     next.run(req).await
 }
 
+#[cfg(not(feature = "alloc-mimalloc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "alloc-mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // jemalloc: фоновый поток возвращает неиспользуемые страницы ОС (5с decay).
 #[allow(non_upper_case_globals)]
@@ -94,8 +99,19 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let workers = std::env::var("ANYHOP_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "auth" && (args[2] == "antigravity" || args[2] == "codex") {
         let proxy = args

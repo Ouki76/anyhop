@@ -30,9 +30,11 @@ rust-embed = { version = "8.13.0", optional = true }
 mime_guess = { version = "2.0.5", optional = true }
 memchr = "2.8.3"
 tikv-jemallocator = "0.7.0"
+mimalloc = { version = "0.1", optional = true }
 
 [features]
 default = ["dashboard"]
+alloc-mimalloc = ["dep:mimalloc"]
 dashboard = ["dep:rust-embed", "dep:mime_guess"]
 rust-embed = ["dep:rust-embed"]
 mime_guess = ["dep:mime_guess"]
