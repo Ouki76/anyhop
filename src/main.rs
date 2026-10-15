@@ -103,7 +103,12 @@ fn main() -> anyhow::Result<()> {
     let workers = std::env::var("ANYHOP_WORKERS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
+        .unwrap_or_else(|| {
+            // По умолчанию: не больше 4 и не больше ядер машины.
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(4))
+                .unwrap_or(2)
+        });
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
