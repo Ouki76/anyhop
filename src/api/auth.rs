@@ -29,15 +29,30 @@ pub async fn auth_start(
     if !is_ag && body.kind != "codex" {
         return (StatusCode::BAD_REQUEST, "kind must be antigravity|codex").into_response();
     }
-    // A flow is already waiting: hand back its URL instead of re-binding the port.
-    {
+    // A flow for the same provider is already waiting: hand its URL back instead
+    // of re-binding the callback port. A flow for a *different* provider is stale
+    // from the operator's point of view — cancel it, otherwise "add antigravity"
+    // would silently open the abandoned codex URL.
+    // (The snapshot is taken and the guard dropped before any await: a
+    // MutexGuard held across .await would make this handler non-Send.)
+    let waiting: Option<(String, String)> = {
         let g = state.auth_state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(a) = g.as_ref()
-            && a.status == "waiting"
-        {
-            return Json(serde_json::json!({"url": a.url, "resumed": true})).into_response();
+        g.as_ref()
+            .filter(|a| a.status == "waiting")
+            .map(|a| (a.kind.clone(), a.url.clone()))
+    };
+    if let Some((pending_kind, pending_url)) = waiting {
+        if pending_kind == body.kind {
+            return Json(serde_json::json!({"url": pending_url, "resumed": true})).into_response();
         }
+        cancel_flow(&state, &pending_kind).await;
+        tracing::info!(
+            cancelled = %pending_kind,
+            starting = %body.kind,
+            "replaced a pending OAuth flow"
+        );
     }
+
     let kind = body.kind.clone();
     // (refresh_token, email, project_id, account_id)
     type AuthOutcome = anyhow::Result<(String, Option<String>, Option<String>, Option<String>)>;
@@ -75,10 +90,10 @@ pub async fn auth_start(
     });
 
     let st = state.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         // Abandoned flows must not hold the callback port forever.
         // An abandoned OAuth tab must not hold the callback port forever.
-        let outcome = tokio::time::timeout(state.tuning.oauth_http_timeout() * 10, wait).await;
+        let outcome = tokio::time::timeout(st.tuning.oauth_http_timeout() * 10, wait).await;
         let outcome = match outcome {
             Ok(o) => o,
             Err(_) => {
@@ -119,8 +134,54 @@ pub async fn auth_start(
             }
         }
     });
+    // Keep the handle so /api/auth/cancel (and a flow for another provider) can
+    // abort it: aborting drops the pending listener and frees the callback port.
+    *state
+        .auth_task
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(handle);
 
     Json(serde_json::json!({"url": url})).into_response()
+}
+
+/// Stop a pending OAuth flow (if the kind matches) and free the callback port.
+async fn cancel_flow(state: &Arc<AppState>, kind: &str) {
+    let handle = {
+        let mut g = state.auth_state.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_mut() {
+            Some(a) if a.status == "waiting" && (kind.is_empty() || a.kind == kind) => {
+                a.status = "cancelled".into();
+                a.message = "cancelled".into();
+                state
+                    .auth_task
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+            }
+            _ => None,
+        }
+    };
+    if let Some(h) = handle {
+        h.abort();
+        // Let the aborted task drop its listener before the port is re-bound.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
+/// POST /api/auth/cancel — stop the pending flow (the user closed the tab).
+pub async fn auth_cancel(State(state): State<Arc<AppState>>) -> Response {
+    let pending = state
+        .auth_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|a| a.status == "waiting")
+        .map(|a| a.kind.clone());
+    let Some(kind) = pending else {
+        return Json(serde_json::json!({"cancelled": false})).into_response();
+    };
+    cancel_flow(&state, &kind).await;
+    Json(serde_json::json!({"cancelled": true, "kind": kind})).into_response()
 }
 
 pub async fn auth_status(State(state): State<Arc<AppState>>) -> Response {
@@ -210,4 +271,24 @@ fn append_account(
 
     crate::config::write_atomic(path, &doc.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod auth_flow_tests {
+    /// The guard that used to hijack a new flow: a waiting flow for another
+    /// provider must not be handed back to the caller.
+    fn resume_or_replace(pending: Option<(&str, &str)>, requested: &str) -> &'static str {
+        match pending {
+            Some((kind, _)) if kind == requested => "resume",
+            Some(_) => "replace",
+            None => "start",
+        }
+    }
+
+    #[test]
+    fn a_pending_flow_is_only_resumed_for_the_same_provider() {
+        assert_eq!(resume_or_replace(Some(("codex", "u")), "codex"), "resume");
+        assert_eq!(resume_or_replace(Some(("codex", "u")), "antigravity"), "replace");
+        assert_eq!(resume_or_replace(None, "antigravity"), "start");
+    }
 }

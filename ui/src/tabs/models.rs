@@ -18,6 +18,8 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
     let prov_filter = create_signal("all".to_string());
     let copied_id = create_signal(String::new());
     let is_refreshing = create_signal(false);
+    // "Disable all" is one click away from taking every model offline: confirm it.
+    let confirm_disable_all = create_signal(false);
 
     spawn_local(async move {
         if let Some(list) = fetch_json::<Vec<ComboDto>>("/api/combos").await
@@ -104,14 +106,43 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                         reload_models(models).await;
                     });
                 }) { "Enable all" }
-                button(class="btn btn-sm", on:click=move |_| {
-                    spawn_local(async move {
-                        post_json("/api/models/disable-all", &serde_json::json!({})).await;
-                        reload_models(models).await;
-                    });
-                }) { "Disable all" }
+                button(class="btn btn-sm", on:click=move |_| confirm_disable_all.set(true)) {
+                    "Disable all"
+                }
             }
         }
+
+        (if confirm_disable_all.get_clone() {
+            view! {
+                div(class="modal-overlay", on:click=move |_| confirm_disable_all.set(false)) {
+                    div(class="modal", on:click=move |e: web_sys::MouseEvent| e.stop_propagation()) {
+                        div(class="modal-head") { b { "Disable every model?" } }
+                        div(class="modal-body") {
+                            div(class="dim-text mb-12") {
+                                (format!(
+                                    "All {} models stop being served immediately: clients get 404 until you re-enable them.",
+                                    total.get_clone(),
+                                ))
+                            }
+                        }
+                        div(class="modal-actions") {
+                            button(class="btn", on:click=move |_| confirm_disable_all.set(false)) { "Cancel" }
+                            button(class="btn btn-danger", on:click=move |_| {
+                                spawn_local(async move {
+                                    post_json("/api/models/disable-all", &serde_json::json!({})).await;
+                                    reload_models(models).await;
+                                    if confirm_disable_all.is_alive() {
+                                        confirm_disable_all.set(false);
+                                    }
+                                });
+                            }) { "Disable all" }
+                        }
+                    }
+                }
+            }
+        } else {
+            view! {}
+        })
 
         div(class="search-bar") {
             input(class="input", r#type="text", placeholder="Filter by name or provider…", bind:value=search)
@@ -176,7 +207,7 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
             })
         }
             // ---- combos: virtual models with a fallback chain ----
-            div(class="section-title mt-40") {
+            div(class="section-title") {
                 "Combos"
                 span(class="cnt") {
                     (match combos.get_clone().len() {

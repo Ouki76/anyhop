@@ -45,6 +45,9 @@ pub struct AppState {
     pub events: crate::events::EventBus,
     /// Ongoing dashboard-triggered OAuth flow (single at a time).
     pub auth_state: std::sync::Mutex<Option<crate::api::AuthStateDto>>,
+    /// Handle of the task serving that flow, so it can be aborted (frees the
+    /// local callback port when the operator switches provider or cancels).
+    pub auth_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Ring buffer of recent upstream attempts for the Requests tab.
     pub request_log: std::sync::Mutex<std::collections::VecDeque<crate::events::RequestRecord>>,
     /// Client API keys: key -> ClientKeyConfig.

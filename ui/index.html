@@ -144,8 +144,14 @@ body {
 /* section headings inside a page */
 .section-title {
   font-size: 22px; font-weight: 650; letter-spacing: -0.02em;
+  /* Rhythm: a section heading always gets air above it. Adjacent block margins
+     collapse, so this reads the same after a big .bignums gap and after a card
+     that carries no bottom margin (previously "Recent events" sat flush against
+     the quota cards). */
+  margin-top: 44px;
   margin-bottom: 18px; display: flex; align-items: baseline; gap: 12px;
 }
+.section-title:first-child { margin-top: 0; }
 .section-title .cnt { font-family: var(--mono); font-size: 11px; font-weight: 400; letter-spacing: 0.08em; color: var(--dim); }
 
 /* status band — "all systems operational" */
@@ -519,6 +525,7 @@ a.quota-card { display: block; }
 
 /* layout utilities */
 .row { display: flex; align-items: center; gap: 8px; }
+.wrap { flex-wrap: wrap; }
 .row-between { display: flex; align-items: center; justify-content: space-between; }
 .row-end { display: flex; justify-content: flex-end; }
 .gap-10 { gap: 10px; }
@@ -779,6 +786,12 @@ input[type="checkbox"]:focus-visible { outline: 2px solid var(--c3); outline-off
   .modal-actions { flex-wrap: wrap; }
   .modal-actions .btn { flex: 1 1 auto; }
   .section-title { font-size: 20px; }
+
+  /* Touch targets: row actions were 23px tall, too small to hit reliably */
+  .btn-ghost { padding: 8px 10px; min-height: 34px; min-width: 40px; }
+  .model-row { padding: 11px 14px; }
+  .model-row-actions { gap: 4px; }
+  .key-row .btn-ghost, .combo-row .btn-ghost, .combo-row .btn-ghost-danger { opacity: 1; }
 
   /* tables become stacked cards — a 720px-wide table cannot be read on a phone */
   .table-scroll { overflow: visible; }

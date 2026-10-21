@@ -173,6 +173,7 @@ async fn async_main() -> anyhow::Result<()> {
         config_path: config_path.clone(),
         events: events_tx,
         auth_state: std::sync::Mutex::new(None),
+        auth_task: std::sync::Mutex::new(None),
         request_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
         client_keys: std::sync::RwLock::new(client_keys_map),
         disabled_models: std::sync::RwLock::new(disabled_models_set),
@@ -408,6 +409,7 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
         .route("/api/server/update", post(api::update_server))
         .route("/api/auth/start", post(api::auth_start))
         .route("/api/auth/status", get(api::auth_status))
+        .route("/api/auth/cancel", post(api::auth_cancel))
         // Prometheus exposition: under the admin layer like the rest — a scraper
         // authenticates with `bearer_token` (or `?key=`, allowed for GET).
         .route("/metrics", get(api::metrics))

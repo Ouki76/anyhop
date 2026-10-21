@@ -161,11 +161,33 @@ def main():
             .find(t => t.textContent.trim().toUpperCase() === 'PROVIDERS')?.click(), 'ok'
         """)
         time.sleep(1.5)
-        rows = js("document.querySelectorAll('.prov-row').length")
+        # Configured providers + the "Available" list, which now always offers every
+        # known type (a second provider of an existing kind is legitimate).
+        rows = js("""
+          (() => {
+            const sections = [...document.querySelectorAll('.section-title')];
+            const configured = sections.find(s => /Configured/i.test(s.textContent));
+            let n = 0;
+            for (let el = configured?.nextElementSibling; el; el = el.nextElementSibling) {
+              if (el.classList.contains('section-title')) break;
+              n += el.querySelectorAll('.prov-row').length;
+            }
+            return n;
+          })()
+        """)
+        available = js("""
+          (() => {
+            const sections = [...document.querySelectorAll('.section-title')];
+            const avail = sections.find(s => /Available/i.test(s.textContent));
+            return avail ? avail.nextElementSibling.querySelectorAll('.prov-row').length : 0;
+          })()
+        """)
         collect()
         if rows != expected:
-            fail(f"providers tab shows {rows} rows, API reports {expected}")
-        print(f"  ok providers list ({rows} rows)")
+            fail(f"configured list shows {rows} rows, API reports {expected}")
+        if available == 0:
+            fail("no available provider types listed — 'add provider' is unreachable")
+        print(f"  ok providers list ({rows} configured rows, {available} available types)")
         if rows == 0:
             fail("no providers rendered — the dashboard is not authenticated")
 

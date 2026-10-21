@@ -143,6 +143,14 @@ pub async fn client_key_add(
         },
     };
 
+    if let Err((code, msg)) = super::validate_secret_len("client key", &key_str) {
+        return (code, msg).into_response();
+    }
+    if let Some(n) = body.name.as_deref().map(str::trim).filter(|n| !n.is_empty())
+        && let Err((code, msg)) = super::validate_name("client key", n)
+    {
+        return (code, msg).into_response();
+    }
     if key_str.len() < 4 {
         return (StatusCode::BAD_REQUEST, "key must be at least 4 characters").into_response();
     }

@@ -30,6 +30,8 @@
 //! Gateway surface (not here): POST /v1/chat/completions, /v1/embeddings,
 //! /v1/fim/completions, GET /v1/models.
 
+use axum::http::StatusCode;
+
 pub mod auth;
 pub mod client_keys;
 pub mod combos;
@@ -66,6 +68,43 @@ pub(crate) fn mask_proxy(url: &str) -> String {
         Some((_, host)) => format!("{scheme}://***:***@{host}{}", &rest[authority_end..]),
         None => url.to_string(),
     }
+}
+
+/// Names end up in model ids (`provider/model`), config keys and log lines, so
+/// they are restricted to a short, safe alphabet. Bounding the length matters:
+/// without it a 70 KB "name" is happily written into anyhop.toml.
+pub(crate) fn validate_name(kind: &str, name: &str) -> Result<(), (StatusCode, String)> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, format!("{kind} name must not be empty")));
+    }
+    if n.chars().count() > 64 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{kind} name must be at most 64 characters"),
+        ));
+    }
+    if let Some(bad) = n
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{kind} name may only contain letters, digits, '-', '_' and '.' (found '{bad}')"),
+        ));
+    }
+    Ok(())
+}
+
+/// Guard against multi-megabyte secrets and URLs in the config file.
+pub(crate) fn validate_secret_len(kind: &str, value: &str) -> Result<(), (StatusCode, String)> {
+    if value.len() > 8192 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{kind} must be at most 8192 characters"),
+        ));
+    }
+    Ok(())
 }
 
 /// A masked value sent back by a form means "unchanged".

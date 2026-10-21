@@ -109,11 +109,15 @@ pub fn OverviewTab(
             }
             div(class="bignum") {
                 div(class="n") {
+                    // Unknown quota (no snapshot yet, or no metered provider):
+                    // a lone dash, not "—%" which reads like a broken number.
                     (match quota_min.get_clone() {
-                        Some(p) => format!("{p}"),
-                        None => "—".to_string(),
+                        Some(p) => {
+                            let v = view! { (format!("{p}")) span(class="u") { "%" } };
+                            v
+                        }
+                        None => view! { span(class="u") { "n/a" } },
                     })
-                    span(class="u") { "%" }
                 }
                 div(
                     class="l",

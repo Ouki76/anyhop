@@ -97,33 +97,34 @@ pub fn ProviderCatalog(providers: Signal<Vec<ProviderDto>>, go: impl Fn(Option<S
         })())
 
         ((move || {
-            // only types with no configured instance yet
-            let available: Vec<(&'static str, &'static str, &'static str)> = KNOWN_TYPES
-                .iter()
-                .filter(|(kind, _, _)| {
-                    !providers.get_clone().iter().any(|p| p.kind == *kind)
-                })
-                .copied()
-                .collect();
-            if available.is_empty() {
-                view! {}
-            } else {
+            // Every type is offered: a second provider of the same kind is
+            // legitimate (two OpenAI-compatible endpoints, two Anthropic keys
+            // with different base URLs). The suggested name is made unique so
+            // the backend's duplicate-name check does not reject it.
+            let available: Vec<(&'static str, &'static str, &'static str)> =
+                KNOWN_TYPES.to_vec();
+            {
                 let n = available.len();
                 let rows: Vec<View> = available
                     .into_iter()
                     .map(|(kind, title, desc)| {
+                        let existing = providers
+                            .get_clone()
+                            .iter()
+                            .any(|p| p.kind == kind);
+                        let action = if existing { "Add another" } else { "Set up" };
                         view! {
                             div(class="key-row prov-row", on:click=move |_| adding.set(Some(kind))) {
                                 span(class="pdot pdot-dim") {}
                                 b { (title) }
                                 span(class="ev-detail") { (desc) }
-                                span(class="setup-link") { "Set up" }
+                                span(class="setup-link") { (action) }
                             }
                         }
                     })
                     .collect();
                 view! {
-                    div(class="section-title mt-40") {
+                    div(class="section-title") {
                         "Available"
                         span(class="cnt") { (format!("{n} types")) }
                     }
@@ -141,7 +142,24 @@ pub fn ProviderCatalog(providers: Signal<Vec<ProviderDto>>, go: impl Fn(Option<S
                     .copied()
                     .find(|(k, _, _)| *k == kind)
                     .unwrap_or((kind, kind, ""));
-                view! { AddProviderModal(kind=kind, title=title, desc=desc, close=adding, go=go) }
+                // provider names are unique: suffix a second instance
+                let existing: Vec<String> = providers
+                    .get_clone()
+                    .into_iter()
+                    .map(|p| p.name)
+                    .collect();
+                let mut suggested = kind.to_string();
+                let mut n = 2;
+                while existing.contains(&suggested) {
+                    suggested = format!("{kind}-{n}");
+                    n += 1;
+                }
+                view! {
+                    AddProviderModal(
+                        kind=kind, title=title, desc=desc,
+                        default_name=suggested, close=adding, go=go,
+                    )
+                }
             }
             None => view! {},
         })
@@ -156,11 +174,12 @@ pub fn AddProviderModal(
     kind: &'static str,
     title: &'static str,
     desc: &'static str,
+    default_name: String,
     close: Signal<Option<&'static str>>,
     go: impl Fn(Option<String>) + Copy + 'static,
 ) -> View {
     let oauth = kind == "antigravity" || kind == "codex";
-    let name = create_signal(kind.to_string());
+    let name = create_signal(default_name);
     let default_url = match kind {
         "gemini" => "https://generativelanguage.googleapis.com/v1beta",
         "anthropic" => "https://api.anthropic.com",
@@ -202,6 +221,14 @@ pub fn AddProviderModal(
                     break; // modal closed mid-flow
                 }
                 match fetch_json::<AuthStateDto>("/api/auth/status").await {
+                    Some(s) if s.kind != kind && s.status == "waiting" => {
+                        // Another tab started a different provider's flow; do not
+                        // adopt it, just keep waiting for ours.
+                        failures += 1;
+                        if failures >= 10 {
+                            break;
+                        }
+                    }
                     Some(s) => {
                         failures = 0;
                         let done = s.status == "done";
@@ -353,7 +380,31 @@ pub fn AddProviderModal(
                     })
                 }
                 div(class="modal-actions") {
-                    button(class="btn", on:click=move |_| close.set(None)) { "Cancel" }
+                    button(class="btn", on:click=move |_| {
+                        let waiting = auth
+                            .get_clone()
+                            .is_some_and(|a| a.status == "waiting");
+                        spawn_local(async move {
+                            // Abandoning the dialog must abandon the flow: a waiting
+                            // flow holds the local callback port and would hijack the
+                            // next "add account".
+                            if waiting {
+                                let _ = post_json("/api/auth/cancel", &serde_json::json!({})).await;
+                            }
+                            if auth.is_alive() {
+                                auth.set(None);
+                            }
+                            if close.is_alive() {
+                                close.set(None);
+                            }
+                        });
+                    }) {
+                        (if auth.get_clone().is_some_and(|a| a.status == "waiting") {
+                            "Cancel sign-in"
+                        } else {
+                            "Cancel"
+                        })
+                    }
                     (if oauth {
                         view! {
                             button(class="btn btn-primary", on:click=start_oauth) { "Authorize account" }
@@ -534,7 +585,7 @@ pub fn ProviderCard(p: ProviderDto) -> View {
 
         ProviderSettings(provider=p_settings)
 
-        div(class="section-title mt-40") { "Danger zone" }
+        div(class="section-title") { "Danger zone" }
         div(class="card danger-card") {
             div(class="row-between") {
                 div {
@@ -564,7 +615,7 @@ pub fn ProviderSettings(provider: ProviderDto) -> View {
     let error = create_signal(String::new());
 
     view! {
-        div(class="section-title mt-40") { "Settings" }
+        div(class="section-title") { "Settings" }
         div(class="card") {
             div(class="card-head") { b { "Provider" } }
             div(class="settings-grid cols-2") {
@@ -771,8 +822,11 @@ pub fn OAuthAddButton(kind: String) -> View {
         div(class="addkey") {
             button(class="btn btn-primary", on:click=move |_| {
                 let kind = kind.clone();
+                let kind_for_kind = kind.clone();
+                let kind_in_defer = kind.clone();
+                let kind_for_poll = kind.clone();
                 spawn_local(async move {
-                    let body = serde_json::json!({"kind": kind});
+                    let body = serde_json::json!({"kind": kind_for_kind});
                     let Ok(req) = Request::post("/api/auth/start").json(&body) else { return };
                     if let Some(k) = stored_key() {
                         req.headers().set("Authorization", &format!("Bearer {k}"));
@@ -784,7 +838,7 @@ pub fn OAuthAddButton(kind: String) -> View {
                     defer(move || {
                         if auth.is_alive() {
                             auth.set(Some(AuthStateDto {
-                                kind: kind.clone(),
+                                kind: kind_in_defer,
                                 status: "waiting".into(),
                                 url: url2,
                                 message: "waiting for browser callback".into(),
@@ -804,6 +858,13 @@ pub fn OAuthAddButton(kind: String) -> View {
                             break;
                         }
                         match fetch_json::<AuthStateDto>("/api/auth/status").await {
+                            Some(s) if s.kind != kind_for_poll && s.status == "waiting" => {
+                                // Someone else's flow is pending; do not adopt it.
+                                failures += 1;
+                                if failures >= 10 {
+                                    break;
+                                }
+                            }
                             Some(s) => {
                                 failures = 0;
                                 let terminal = s.status != "waiting";
@@ -824,12 +885,34 @@ pub fn OAuthAddButton(kind: String) -> View {
         (match auth.get_clone() {
             Some(a) => {
                 let cls = format!("auth-banner auth-{}", a.status);
-                let msg = if a.status == "waiting" {
+                let waiting = a.status == "waiting";
+                let msg = if waiting {
                     "Authorization opened in a new tab — complete the sign-in".to_string()
                 } else {
                     a.message
                 };
-                view! { div(class=cls) { (msg) } }
+                let auth_for_cancel = auth;
+                view! {
+                    div(class="row gap-10 mt-8 wrap") {
+                        div(class=cls) { (msg) }
+                        (if waiting {
+                            view! {
+                                button(class="btn btn-sm", on:click=move |_| {
+                                    spawn_local(async move {
+                                        // Free the callback port instead of leaving the
+                                        // flow pending for five minutes.
+                                        let _ = post_json("/api/auth/cancel", &serde_json::json!({})).await;
+                                        if auth_for_cancel.is_alive() {
+                                            auth_for_cancel.set(None);
+                                        }
+                                    });
+                                }) { "Cancel sign-in" }
+                            }
+                        } else {
+                            view! {}
+                        })
+                    }
+                }
             }
             None => view! {},
         })

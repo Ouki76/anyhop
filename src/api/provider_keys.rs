@@ -34,6 +34,25 @@ pub async fn provider_add(
                 .into_response();
         }
     };
+    if let Some(n) = body.name.as_deref().map(str::trim).filter(|n| !n.is_empty())
+        && let Err((code, msg)) = super::validate_name("provider", n)
+    {
+        return (code, msg).into_response();
+    }
+    if let Some(u) = body.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        && (!u.starts_with("http://") && !u.starts_with("https://") || u.len() > 2048)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "base_url must be an http(s) URL of at most 2048 characters",
+        )
+            .into_response();
+    }
+    if let Some(k) = body.key.as_deref()
+        && let Err((code, msg)) = super::validate_secret_len("key", k)
+    {
+        return (code, msg).into_response();
+    }
     let base_url = body.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let base_url = match base_url.or(default_base) {
         Some(b) => b.to_string(),
@@ -526,6 +545,9 @@ pub async fn key_add(State(state): State<Arc<AppState>>, Json(a): Json<AddKey>) 
     let secret = a.secret.trim();
     if secret.len() < 4 {
         return (StatusCode::BAD_REQUEST, "key too short").into_response();
+    }
+    if let Err((code, msg)) = super::validate_secret_len("key", secret) {
+        return (code, msg).into_response();
     }
     let router = state.router.load();
     let Some(p) = router.providers.iter().find(|p| p.name == a.provider) else {

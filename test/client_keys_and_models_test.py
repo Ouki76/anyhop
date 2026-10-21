@@ -497,6 +497,23 @@ def run_tests(original_toml):
     request("POST", "/api/client-keys/delete", {"key": "sk-hop-attrib"})
     print("  ok requests carry the client key name")
 
+    # 27. Input bounds: a 70 KB "name" must not reach the config file.
+    big = "x" * 70_000
+    with open("test/anyhop.test.toml") as f:
+        before_size = len(f.read())
+    assert request("POST", "/api/client-keys/add",
+                   {"name": big, "key": "sk-hop-big", "models": []})[0] == 400
+    assert request("POST", "/api/client-keys/add",
+                   {"name": "bad name/with slash", "key": "sk-hop-bad", "models": []})[0] == 400
+    assert request("POST", "/api/providers/add",
+                   {"name": big, "kind": "openai_compat", "base_url": "http://x/v1", "key": "k"})[0] == 400
+    assert request("POST", "/api/providers/add",
+                   {"name": "no-scheme", "kind": "openai_compat", "base_url": "example.com/v1", "key": "k"})[0] == 400
+    assert request("POST", "/api/keys/add", {"provider": "mock", "secret": "k" * 9000})[0] == 400
+    with open("test/anyhop.test.toml") as f:
+        assert len(f.read()) <= before_size + 2048, "config grew from a rejected request"
+    print("  ok input bounds (names, urls, secrets)")
+
     print("\nALL CLIENT KEYS AND MODELS TESTS PASSED!")
 
 

@@ -161,6 +161,19 @@ pub async fn fetch_text(url: &str) -> Option<String> {
     resp.text().await.ok()
 }
 
+/// Extract `error.message` from an API error envelope; fall back to the raw body.
+pub fn error_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.to_string())
+}
+
 pub async fn put_json<B: serde::Serialize>(url: &str, body: &B) -> Option<String> {
     let req = Request::put(url).json(body).ok()?;
     if let Some(k) = stored_key() {
@@ -169,7 +182,12 @@ pub async fn put_json<B: serde::Serialize>(url: &str, body: &B) -> Option<String
     let resp = req.send().await.ok()?;
     let ok = resp.status() == 200;
     let text = resp.text().await.ok()?;
-    Some(if ok { "saved + reloaded".into() } else { text })
+    Some(if ok {
+        "saved + reloaded".into()
+    } else {
+        // Show the human message, not the raw JSON envelope.
+        error_message(&text)
+    })
 }
 
 /// Re-fetch the models list into the signal (after enable/disable/refresh actions).
