@@ -200,6 +200,18 @@ intermediates; PKCS#8/PKCS#1/SEC1 keys). A certificate/key mismatch fails at sta
 at the first handshake. When TLS is on, HSTS is sent; behind a proxy it is sent when
 `X-Forwarded-Proto: https` arrives.
 
+## Logging
+
+Human-readable by default; `[server] log_format = "json"` switches to one JSON object per
+line (`ts`, `level`, `target`, `message` plus every structured field), which is what filebeat /
+Loki / CloudWatch expect:
+
+```json
+{"level":"INFO","message":"provider 'mock' (4 keys, strategy RoundRobin)","target":"anyhop","ts":1792609921}
+```
+
+`RUST_LOG` still controls verbosity (`RUST_LOG=info,anyhop::proxy=debug`).
+
 ## Tuning
 
 Every timing and limit that used to be a `const` is now a config value (`[tuning]`), editable

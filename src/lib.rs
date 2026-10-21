@@ -18,6 +18,7 @@ pub mod dashboard;
 pub mod events;
 pub mod fim;
 pub mod gemini;
+pub mod logging;
 pub mod middleware;
 pub mod pool;
 pub mod providers;
@@ -58,14 +59,26 @@ async fn async_main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
+    // The log format comes from the config, which means peeking at it before the
+    // subscriber exists. A broken config falls back to text: the real error is
+    // reported right after by Config::load.
     let config_path = std::env::var("ANYHOP_CONFIG").unwrap_or_else(|_| "anyhop.toml".into());
+    let json_logs = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|raw| toml::from_str::<config::Config>(&raw).ok())
+        .is_some_and(|c| c.server.log_format == "json");
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    if json_logs {
+        tracing_subscriber::fmt()
+            .event_format(logging::JsonFormat)
+            .with_env_filter(filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
+
     let cfg = config::Config::load(&config_path)?;
+
     info!("loaded config from {config_path}");
     #[cfg(unix)]
     {
@@ -110,7 +123,7 @@ async fn async_main() -> anyhow::Result<()> {
         });
         if oauth {
             tracing::warn!(
-                "state_file is empty: refreshed OAuth tokens will not survive a restart                  (rotated refresh tokens may then be lost) — set [server] state_file"
+                "state_file is empty: refreshed OAuth tokens will not survive a restart (rotated refresh tokens may then be lost) — set [server] state_file"
             );
         }
     }
