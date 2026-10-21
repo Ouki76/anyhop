@@ -15,6 +15,7 @@ This version:
   * fails on any console error / uncaught exception.
 """
 import json
+import os
 import subprocess
 import sys
 import time
@@ -23,7 +24,8 @@ import urllib.request
 
 import websocket
 
-BASE = "http://127.0.0.1:18080"
+PORT = os.environ.get("ANYHOP_TEST_PORT", "18080")
+BASE = f"http://127.0.0.1:{PORT}"
 ADMIN_KEY = "test-gw-key"
 
 CHROME = ["chromium-browser", "--headless=new", "--no-sandbox", "--disable-gpu",

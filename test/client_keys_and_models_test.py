@@ -10,7 +10,8 @@ import time
 import urllib.request
 import urllib.error
 
-BASE = "http://127.0.0.1:18080"
+PORT = os.environ.get("ANYHOP_TEST_PORT", "18080")
+BASE = f"http://127.0.0.1:{PORT}"
 ADMIN_KEY = "test-gw-key"
 
 
@@ -439,7 +440,11 @@ def run_tests(original_toml):
     assert request("POST", "/api/server/update", {"max_retries": 4})[0] == 200
     # Re-submitting the same values (what the form does) must report no changes,
     # otherwise the dashboard would demand a restart after every save.
-    status, again = request("POST", "/api/server/update", {"max_retries": 4, "listen": "127.0.0.1:18080"})
+    # Use whatever listen the gateway actually runs with (the suite port is
+    # configurable), otherwise this "no-op" save is a real change.
+    status, cur = request("GET", "/api/server")
+    status, again = request("POST", "/api/server/update",
+                            {"max_retries": 4, "listen": cur["listen"]})
     assert status == 200 and again["changed"] == [], again
     assert again["restart_required"] == [], again
     print("  ok [server] settings API (read/validate/restart_required, no-op save)")

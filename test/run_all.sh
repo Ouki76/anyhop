@@ -5,7 +5,11 @@ set -u
 cd "$(dirname "$0")/.."
 
 BIN="${1:-./target/release/anyhop}"
-BASE="http://127.0.0.1:18080"
+# Port is configurable so a run cannot be hijacked by whatever already owns 18080
+# (CI runners and other local projects collide surprisingly often).
+PORT="${ANYHOP_TEST_PORT:-18080}"
+export ANYHOP_TEST_PORT="$PORT"
+BASE="http://127.0.0.1:$PORT"
 AUTH="Authorization: Bearer test-gw-key"
 CT="Content-Type: application/json"
 
@@ -27,6 +31,8 @@ for m in mock_upstream mock_gemini mock_antigravity mock_codex mock_anthropic; d
     python3 "test/$m.py" >/dev/null 2>&1 &
     MOCKS="$MOCKS $!"
 done
+# Point the config at the chosen port (restored by the trap on exit).
+sed -i "s|^listen = .*|listen = \"127.0.0.1:$PORT\"|" test/anyhop.test.toml
 ANYHOP_CONFIG=test/anyhop.test.toml "$BIN" > /tmp/anyhop-regress.log 2>&1 &
 AH_PID=$!
 sleep 2

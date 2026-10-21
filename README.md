@@ -397,7 +397,8 @@ Tuning notes:
 ```bash
 cargo test               # unit tests: rotation, cooldowns, error classification,
                          #   scanner, SSE, CSP, metrics, token comparison
-./test/run_all.sh        # full suite: mocks + gateway; 37 checks / 72 assertions
+./test/run_all.sh        # full suite: mocks + gateway; 37 checks / 77 assertions
+ANYHOP_TEST_PORT=18091 ./test/run_all.sh   # if 18080 is taken by something else
                          #   (routing, rotation, streaming, embeddings, rate limits,
                          #    combos, provider & key lifecycle, tuning, SSE, dashboard)
 ```
