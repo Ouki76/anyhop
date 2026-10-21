@@ -51,6 +51,7 @@ pub fn SettingsTab() -> View {
     let t_ui_refresh = create_signal(String::new());
     let t_sse_keepalive = create_signal(String::new());
     let t_quota_ttl = create_signal(String::new());
+    let t_resp_store = create_signal(String::new());
     let api_key_set = create_signal(false);
     let admin_key_set = create_signal(false);
     let status = create_signal(String::new());
@@ -95,6 +96,7 @@ pub fn SettingsTab() -> View {
             t_ui_refresh.set(t.ui_refresh_secs.to_string());
             t_sse_keepalive.set(t.sse_keepalive_secs.to_string());
             t_quota_ttl.set(t.quota_cache_ttl_secs.to_string());
+            t_resp_store.set(t.response_store_max.to_string());
             api_key_set.set(s.api_key_set);
             admin_key_set.set(s.admin_key_set);
             loaded.set(true);
@@ -258,6 +260,7 @@ pub fn SettingsTab() -> View {
                             "ui_refresh_secs": int_of(&t_ui_refresh.get_clone()),
                             "sse_keepalive_secs": int_of(&t_sse_keepalive.get_clone()),
                             "quota_cache_ttl_secs": int_of(&t_quota_ttl.get_clone()),
+                            "response_store_max": int_of(&t_resp_store.get_clone()) as usize,
                         },
                     });
                     // Secrets: only send what the admin actually typed.
@@ -334,6 +337,8 @@ pub fn SettingsTab() -> View {
                             t_ui_refresh.set(t.ui_refresh_secs.to_string());
                             t_sse_keepalive.set(t.sse_keepalive_secs.to_string());
                             t_quota_ttl.set(t.quota_cache_ttl_secs.to_string());
+                            t_resp_store.set(t.response_store_max.to_string());
+            t_resp_store.set(t.response_store_max.to_string());
                             api_key.set(String::new());
                             admin_key.set(String::new());
                             if status.is_alive() {
@@ -447,6 +452,11 @@ pub fn SettingsTab() -> View {
                     label(class="form-label") { "Quota cache, s" }
                     input(class="input", r#type="number", min="1", bind:value=t_quota_ttl)
                     div(class="form-hint") { "How long a per-account quota snapshot is reused." }
+                }
+                div(class="form-group") {
+                    label(class="form-label") { "Response store" }
+                    input(class="input", r#type="number", min="0", bind:value=t_resp_store)
+                    div(class="form-hint") { "Replies kept for previous_response_id (0 = off)." }
                 }
             }
             div(class="card-foot") {

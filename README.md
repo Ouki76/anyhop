@@ -179,6 +179,33 @@ See `anyhop.example.toml`. Path: `ANYHOP_CONFIG` (default `anyhop.toml`).
 | `ANYHOP_WORKERS` | `min(4, cores)` | Tokio worker threads — raise it on many-core boxes (see benchmarks) |
 | `RUST_LOG` | `info` | Log filter (`RUST_LOG=debug anyhop`) |
 
+## Running more than one instance
+
+Every instance can run the same config (only `listen` differs) behind a load balancer:
+
+```toml
+[ratelimit]
+backend = "redis"                 # "local" (default) keeps buckets in-process
+redis_url = "redis://127.0.0.1:6379/0"
+key_prefix = "anyhop"
+fail_open = false                 # deny when Redis is down instead of allowing
+
+[tuning]
+sticky_mode = "hash"              # rendezvous hashing: no shared state at all
+```
+
+- **Rate limits** — with `backend = "redis"` every instance runs the same atomic Lua
+  token bucket (`<prefix>:rl:<key>:<rpm>:<burst>`), so two gateways behind an LB still
+  enforce one budget. `fail_open = true` (default) degrades to allowing traffic when
+  Redis is unreachable; `false` denies with `Retry-After: 1`.
+- **Sticky sessions** — `sticky_mode = "hash"` makes the choice a pure function of
+  (session, key id), so all instances agree without coordination. `sticky_mode = "map"`
+  restores the historical per-process map (single instance only, TTL-bounded).
+- **What stays per-instance** — key health/cooldowns and the event/request logs are
+  local. Each instance therefore learns about a dead key on its own; that is a
+  correctness-preserving trade-off (an extra failed attempt, not a wrong answer),
+  and `[server] state_file` can point at a per-instance file.
+
 ## TLS
 
 Two supported shapes — pick one:
@@ -264,7 +291,13 @@ Errors are always the same envelope, including for malformed bodies:
 | `/v1/embeddings` | POST | embeddings (openai_compat, gemini) |
 | `/v1/models` | GET | everything enabled, combos included (cached per catalogue epoch) |
 | `/v1/models/{id}` | GET | one model, `provider/model` or a combo name |
-| `/v1/responses` | POST | OpenAI Responses API (`input`, `instructions`, `max_output_tokens`; streaming events) |
+| `/v1/responses` | POST | OpenAI Responses API (`input`, `instructions`, `max_output_tokens`; streaming events; `previous_response_id` replays a stored conversation) |
+| `/v1/images/generations` | POST | pass-through, needs `capabilities = ["images"]` on an openai_compat provider |
+| `/v1/images/edits` | POST | multipart pass-through (body forwarded byte-identical) |
+| `/v1/audio/speech` | POST | TTS pass-through, binary relayed as-is (`capabilities = ["audio"]`) |
+| `/v1/audio/transcriptions` | POST | multipart pass-through |
+| `/v1/audio/translations` | POST | multipart pass-through |
+| `/v1/realtime` | GET·WS | WebSocket proxy to a provider with `capabilities = ["realtime"]` |
 
 | Admin (`/api`) | Method | Purpose |
 | --- | --- | --- |

@@ -50,6 +50,8 @@ pub struct KeyDto {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ProviderDto {
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub name: String,
     #[serde(default)]
     pub timeout_secs: u64,
@@ -167,6 +169,8 @@ pub struct RequestDto {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TuningDto {
+    #[serde(default)]
+    pub response_store_max: usize,
     pub max_cooldown_secs: u64,
     pub base_backoff_secs: u64,
     pub rate_limit_cooldown_secs: u64,

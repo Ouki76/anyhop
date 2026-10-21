@@ -96,6 +96,7 @@ pub struct TuningUpdate {
     ui_refresh_secs: Option<u64>,
     sse_keepalive_secs: Option<u64>,
     quota_cache_ttl_secs: Option<u64>,
+    response_store_max: Option<usize>,
 }
 
 /// Fields that only take effect after a restart, because they are baked into the
@@ -451,6 +452,7 @@ pub async fn update_server(
         sync_num!(ui_refresh_secs, "ui_refresh_secs");
         sync_num!(sse_keepalive_secs, "sse_keepalive_secs");
         sync_num!(quota_cache_ttl_secs, "quota_cache_ttl_secs");
+        sync_num!(response_store_max, "response_store_max");
         if !table.is_empty() {
             // Merge into the existing table so comments and untouched keys survive.
             let existing = doc.get_mut("tuning");
