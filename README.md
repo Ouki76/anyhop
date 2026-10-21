@@ -195,9 +195,17 @@ sticky_mode = "hash"              # rendezvous hashing: no shared state at all
 ```
 
 - **Rate limits** — with `backend = "redis"` every instance runs the same atomic Lua
-  token bucket (`<prefix>:rl:<key>:<rpm>:<burst>`), so two gateways behind an LB still
-  enforce one budget. `fail_open = true` (default) degrades to allowing traffic when
-  Redis is unreachable; `false` denies with `Retry-After: 1`.
+  token bucket, so two gateways behind an LB still enforce one budget.
+  `fail_open = true` (default) degrades to allowing traffic when Redis is unreachable;
+  `false` denies with `Retry-After: 1`.
+  Bucket names are `<prefix>:rl:<sha256(key)[..16]>:<rpm>:<burst>` — the client's
+  bearer token never reaches Redis (it would otherwise sit in `MONITOR`, `KEYS`,
+  RDB/AOF and every backup). The digest is unsalted, so it is a *name*, not a
+  password hash: anyone holding both Redis and a candidate token can confirm a
+  match. To map a bucket back while debugging:
+  `printf '%s' "$KEY" | sha256sum | cut -c1-32`. Redis bucket names are not
+  carried over from the pre-digest format, so an upgrade starts every client with
+  one fresh bucket.
 - **Sticky sessions** — `sticky_mode = "hash"` makes the choice a pure function of
   (session, key id), so all instances agree without coordination. `sticky_mode = "map"`
   restores the historical per-process map (single instance only, TTL-bounded).
@@ -239,6 +247,16 @@ tls_key  = "/etc/anyhop/privkey.pem"
 intermediates; PKCS#8/PKCS#1/SEC1 keys). A certificate/key mismatch fails at startup rather than
 at the first handshake. When TLS is on, HSTS is sent; behind a proxy it is sent when
 `X-Forwarded-Proto: https` arrives.
+
+### Limits inside the Redis client
+
+The RESP client parses untrusted bytes with hard caps: 64 KiB per line, 8 MiB per
+bulk, 1024 elements per array, depth 8, and **32 MiB per reply in total**.
+Exceeding any of them is a protocol error and drops the connection. Adding a
+command with a wide reply (MGET/KEYS-style) means raising `MAX_ARRAY` /
+`MAX_REPLY_BYTES`, not just the per-field caps. Unexpected replies are logged as
+`array(2)` / `bulk(8388608)` and `-ERR` text is truncated to 200 bytes, so the
+gateway log is not a substitute for Redis' own log.
 
 ## Logging
 
