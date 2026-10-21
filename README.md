@@ -256,6 +256,23 @@ shows "connection refused". That is fine: copy the **whole address** from the ad
 paste it into the panel ("Browser could not reach this gateway?" → *Complete sign-in*). The code
 is exchanged server-side either way, and the OAuth `state` is verified before use.
 
+### Token refresh
+
+Access tokens are renewed automatically, before every upstream call that needs one
+(chat, FIM, model listing, quota probes):
+
+- the cached token is used until `token_refresh_window_secs` before expiry (default 300 s), so a
+  request never pays the refresh round-trip;
+- the exchange uses the refresh token, and **if the issuer rotates it the replacement is kept** —
+  it is written to the state file immediately (not in the 2 s batch) and wins over the stale value
+  in `anyhop.toml` on the next start;
+- `invalid_grant` / 401 marks the account dead and emits an event; transient failures back off and
+  retry, so a network blip does not burn the account;
+- refreshes are serialized per account by its mutex, so a burst of requests triggers one exchange.
+
+Caveat: with `state_file = ""` the rotated refresh token cannot be persisted — the gateway warns
+about this at startup when an OAuth provider is configured.
+
 ```bash
 # what the panel does under the hood
 curl -X POST localhost:8080/api/auth/complete -H "Authorization: Bearer $ADMIN" \

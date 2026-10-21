@@ -132,10 +132,19 @@ impl Storage {
                         Some(m) => {
                             // Extras are rare (admin actions) and carry their whole
                             // list, so write them immediately instead of batching.
-                            if let StorageMsg::ExtraKeys { .. } = m {
-                                flush_extras(&writer_db, &m);
-                            } else {
-                                pending.insert(m.key(), m);
+                            // OAuth records too: a rotated refresh token that is
+                            // still in the batch when the process dies is gone, and
+                            // the config's stale token may already be revoked.
+                            match m {
+                                StorageMsg::ExtraKeys { .. } => flush_extras(&writer_db, &m),
+                                StorageMsg::OAuth { .. } => {
+                                    let mut one = HashMap::new();
+                                    one.insert(m.key(), m);
+                                    flush(&writer_db, &mut one);
+                                }
+                                other => {
+                                    pending.insert(other.key(), other);
+                                }
                             }
                             while let Ok(m) = rx.try_recv() {
                                 match m {

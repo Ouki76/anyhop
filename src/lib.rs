@@ -89,6 +89,23 @@ async fn async_main() -> anyhow::Result<()> {
     };
 
     let tuning = std::sync::Arc::new(cfg.tuning.clone());
+    // OAuth access tokens (and rotated refresh tokens) are cached in the state
+    // file; without it every restart falls back to the tokens in the config,
+    // which may already be revoked after a rotation.
+    if cfg.server.state_file.is_empty() {
+        let oauth = cfg.providers.iter().any(|p| {
+            matches!(
+                p.kind,
+                config::ProviderKind::Antigravity | config::ProviderKind::Codex
+            )
+        });
+        if oauth {
+            tracing::warn!(
+                "state_file is empty: refreshed OAuth tokens will not survive a restart                  (rotated refresh tokens may then be lost) — set [server] state_file"
+            );
+        }
+    }
+
     let events_tx = events::EventBus::with_capacity(
         cfg.server.events_history,
         cfg.tuning.event_channel_capacity,

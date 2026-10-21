@@ -191,10 +191,8 @@ impl Account {
     pub async fn ensure_access_token(&self) -> Result<String, AuthError> {
         let mut st = self.state.lock().await;
         if let Some(t) = &st.access_token {
-            let valid_until = st
-                .expires_at_ms
-                .saturating_sub(self.tuning.token_refresh_window().as_millis() as u64);
-            if now_ms() < valid_until {
+            let window = self.tuning.token_refresh_window().as_millis() as u64;
+            if !needs_refresh(st.expires_at_ms, now_ms(), window) {
                 return Ok(t.clone());
             }
         }
@@ -603,6 +601,14 @@ pub async fn fetch_email(http: &reqwest::Client, access_token: &str) -> Option<S
     v.get("email").and_then(|e| e.as_str()).map(str::to_string)
 }
 
+/// Should a cached access token be renewed?
+///
+/// Refreshing *before* expiry (window, default 5 min) keeps a request from
+/// paying the refresh latency; `window = 0` means "refresh only when expired".
+fn needs_refresh(expires_at_ms: u64, now_ms: u64, window_ms: u64) -> bool {
+    now_ms >= expires_at_ms.saturating_sub(window_ms)
+}
+
 /// A started OAuth flow: URL for the user + listener waiting for the callback.
 pub struct PendingAuth {
     pub url: String,
@@ -826,4 +832,118 @@ pub fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod token_rotation_tests {
+    use super::*;
+
+    fn temp_storage(tag: &str) -> crate::storage::Storage {
+        let path = std::env::temp_dir().join(format!(
+            "anyhop-oauth-{tag}-{}-{:?}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        crate::storage::Storage::open(path.to_str().unwrap()).unwrap()
+    }
+
+    fn account_with(storage: &crate::storage::Storage, cfg: crate::config::OAuthAccountConfig) -> Account {
+        Account::new(
+            &cfg,
+            "antigravity",
+            Some(storage),
+            reqwest::Client::new(),
+            std::sync::Arc::new(crate::config::Tuning::default()),
+        )
+    }
+
+    /// A refresh token rotated by the issuer and cached earlier must win over the
+    /// (stale) one in the config file, otherwise the next restart loses the account.
+    #[tokio::test]
+    async fn a_rotated_refresh_token_beats_the_configured_one() {
+        let storage = temp_storage("rotated");
+        storage.save_oauth(
+            "antigravity",
+            "1//old",
+            crate::storage::OAuthRecord {
+                access_token: "ya29.fresh".into(),
+                expires_at_ms: now_ms() + 3_600_000,
+                project_id: Some("proj".into()),
+                refresh_token: Some("1//rotated".into()),
+            },
+        );
+        // The write is handed to the storage task; a Flush ack orders it before
+        // the read below (and doubles as a check that it is not lost).
+        storage.flush_async().await;
+        let acc = account_with(
+            &storage,
+            crate::config::OAuthAccountConfig {
+                refresh_token: "1//old".into(),
+                email: Some("a@b.c".into()),
+                project_id: None,
+                account_id: None,
+                access_token: None,
+                proxy: None,
+            },
+        );
+        // Cached rotation is adopted at construction time.
+        assert_eq!(
+            acc.state.lock().await.refresh_token.as_deref(),
+            Some("1//rotated")
+        );
+    }
+
+    /// With no cache (fresh install) the configured token is used as-is.
+    #[tokio::test]
+    async fn without_a_cache_the_configured_token_is_kept() {
+        let storage = temp_storage("nocache");
+        let acc = account_with(
+            &storage,
+            crate::config::OAuthAccountConfig {
+                refresh_token: "1//config".into(),
+                email: None,
+                project_id: None,
+                account_id: None,
+                access_token: None,
+                proxy: None,
+            },
+        );
+        assert_eq!(
+            acc.state.lock().await.refresh_token.as_deref(),
+            Some("1//config")
+        );
+    }
+}
+
+#[cfg(test)]
+mod refresh_window_tests {
+    use super::needs_refresh;
+
+    const MIN: u64 = 60_000;
+
+    #[test]
+    fn a_fresh_token_is_used_as_is() {
+        // 1h left, 5 min window: no refresh.
+        assert!(!needs_refresh(60 * MIN, 0, 5 * MIN));
+    }
+
+    #[test]
+    fn a_token_inside_the_window_is_refreshed_early() {
+        // 4 min left with a 5 min window: refresh now, not after expiry.
+        assert!(needs_refresh(4 * MIN, 0, 5 * MIN));
+    }
+
+    #[test]
+    fn an_expired_token_is_refreshed() {
+        assert!(needs_refresh(0, 1, 5 * MIN));
+    }
+
+    #[test]
+    fn a_zero_window_refreshes_only_on_expiry() {
+        assert!(!needs_refresh(1, 0, 0));
+        assert!(needs_refresh(0, 1, 0));
+    }
 }
