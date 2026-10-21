@@ -190,10 +190,16 @@ pub fn AddProviderModal(
     let error = create_signal(String::new());
     let busy = create_signal(false);
     let auth = create_signal(Option::<AuthStateDto>::None);
+    // The name the OAuth flow should create/populate (a second antigravity
+    // provider gets its own account pool this way).
+    let name_for_auth = name;
 
     let start_oauth = move |_| {
         spawn_local(async move {
-            let body = serde_json::json!({"kind": kind});
+            let body = serde_json::json!({
+                "kind": kind,
+                "provider": name_for_auth.get_clone(),
+            });
             let Ok(req) = Request::post("/api/auth/start").json(&body) else { return };
             if let Some(k) = stored_key() {
                 req.headers().set("Authorization", &format!("Bearer {k}"));
@@ -337,8 +343,15 @@ pub fn AddProviderModal(
                     (if oauth {
                         view! {
                             div {
+                                div(class="form-group") {
+                                    label(class="form-label") { "Provider name" }
+                                    input(class="input", r#type="text", bind:value=name)
+                                    div(class="form-hint") {
+                                        "Several providers of the same type can coexist with separate account pools."
+                                    }
+                                }
                                 div(class="modal-note") {
-                                    "Opens a browser window for account sign-in. The provider is created automatically once the account is authorized."
+                                    "Opens a browser window for account sign-in. The provider is created once the account is authorized."
                                 }
                                 (match auth.get_clone() {
                                     Some(a) => {
@@ -481,7 +494,7 @@ pub fn ProviderCard(p: ProviderDto) -> View {
     };
 
     let footer = if oauth {
-        view! { OAuthAddButton(kind=pkind_footer) }
+        view! { OAuthAddButton(kind=pkind_footer, provider=pname_footer) }
     } else {
         view! { AddKeyForm(provider=pname_footer) }
     };
@@ -815,18 +828,24 @@ pub fn AddKeyForm(provider: String) -> View {
 }
 
 #[component(inline_props)]
-pub fn OAuthAddButton(kind: String) -> View {
+pub fn OAuthAddButton(kind: String, provider: String) -> View {
     let auth = create_signal(Option::<AuthStateDto>::None);
-    let label = format!("Add {} account", kind);
+    let provider_name = provider.clone();
+    let label = format!("Add {kind} account");
     view! {
         div(class="addkey") {
             button(class="btn btn-primary", on:click=move |_| {
                 let kind = kind.clone();
                 let kind_for_kind = kind.clone();
+                let provider_name_for_auth = provider_name.clone();
                 let kind_in_defer = kind.clone();
                 let kind_for_poll = kind.clone();
                 spawn_local(async move {
-                    let body = serde_json::json!({"kind": kind_for_kind});
+                    let body = serde_json::json!({
+                        "kind": kind_for_kind,
+                        // append to this provider, not to the first one of that type
+                        "provider": provider_name_for_auth.clone(),
+                    });
                     let Ok(req) = Request::post("/api/auth/start").json(&body) else { return };
                     if let Some(k) = stored_key() {
                         req.headers().set("Authorization", &format!("Bearer {k}"));

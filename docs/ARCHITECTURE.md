@@ -42,6 +42,11 @@ client ──HTTP──▶ axum router ──▶ auth ──▶ routing ──�
 | `src/api/combos.rs` | Combo (fallback chain) CRUD, written into `[[combos]]` |
 | `src/api/provider_keys.rs` | Provider add/update/delete, key add/enable/delete |
 | `src/api/server.rs` | `[server]` + `[tuning]` read/write; reports which fields need a restart |
+
+OAuth accounts are appended to the provider named in the request (`provider`, defaulting to the
+kind). The provider is created in the same write as its first account, so the file never contains
+a provider without credentials. A pending flow is keyed by kind **and** provider: asking for a
+different one cancels the stale flow and frees the local callback port.
 | `ui/` | Sycamore (Rust→WASM) dashboard, a pure client of `/api/*` |
 
 ## Request path (chat completions)

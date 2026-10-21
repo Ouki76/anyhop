@@ -236,7 +236,7 @@ Errors are always the same envelope, including for malformed bodies:
 | `/api/server`, `/api/server/update` | GET/POST | `[server]` + `[tuning]`, secrets write-only |
 | `/api/config` | GET/PUT | raw TOML (validated before it is written) |
 | `/api/reload` | POST | re-read the config from disk |
-| `/api/auth/start`, `/api/auth/status` | POST/GET | OAuth flow for an OAuth provider |
+| `/api/auth/start`, `/api/auth/status`, `/api/auth/cancel` | POST/GET/POST | OAuth flow; `{"kind":"antigravity","provider":"ag-work"}` targets (or creates) a named provider, `/cancel` frees the callback port |
 | `/metrics` | GET | Prometheus exposition |
 | `/healthz` | GET | liveness, no auth |
 
@@ -247,7 +247,7 @@ Errors are always the same envelope, including for malformed bodies:
 | Tab | What you can do |
 | --- | --- |
 | Overview | health rollup, per-account quota cards, recent events |
-| Providers | add a provider (key-based or OAuth), edit base URL / strategy / `max_concurrent` / drain threshold / proxy, add a key, disable or **delete** a key, delete the provider |
+| Providers | add a provider (key-based or OAuth, **several of the same type** with separate account pools), edit base URL / strategy / `max_concurrent` / drain threshold / attempt budget / proxy, add a key, disable or **delete** a key, delete the provider |
 | Models | enable/disable models (individually or all), refresh the catalogue, create/edit/delete **combos** with an ordered fallback chain |
 | API Keys | create client keys (name, model allowlist, `rpm`/`burst`), edit the allowlist and the rate limit, delete with confirmation |
 | Settings | `[server]` — listen, attempts/timeouts, body limit, history depth, refresh interval, proxy, state file, dashboard toggle, gateway/admin API keys (secrets are write-only) |

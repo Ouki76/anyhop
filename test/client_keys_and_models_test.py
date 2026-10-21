@@ -514,6 +514,24 @@ def run_tests(original_toml):
         assert len(f.read()) <= before_size + 2048, "config grew from a rejected request"
     print("  ok input bounds (names, urls, secrets)")
 
+    # 28. OAuth flows target a *named* provider, so a second provider of the same
+    #     type can have its own account pool.
+    status, st = request("POST", "/api/auth/start",
+                         {"kind": "antigravity", "provider": "ag-second"})
+    assert status == 200 and "url" in st, st
+    status, cur = request("GET", "/api/auth/status")
+    assert cur["kind"] == "antigravity" and cur.get("provider") == "ag-second", cur
+    request("POST", "/api/auth/cancel")
+    # a name that belongs to another type must be refused, not silently reused
+    status, err = request("POST", "/api/auth/start",
+                          {"kind": "antigravity", "provider": "mock"})
+    assert status == 409, err
+    status, err = request("POST", "/api/auth/start",
+                          {"kind": "codex", "provider": "bad name/x"})
+    assert status == 400, err
+    request("POST", "/api/auth/cancel")
+    print("  ok OAuth targets a named provider (collision/validation guarded)")
+
     print("\nALL CLIENT KEYS AND MODELS TESTS PASSED!")
 
 

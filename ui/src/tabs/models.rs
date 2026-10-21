@@ -215,6 +215,19 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                         n => format!("{n} combos"),
                     })
                 }
+                // The action belongs with the heading, not at the bottom of the list.
+                (if combo_editing.get_clone().is_none() {
+                    view! {
+                        button(class="btn btn-sm ml-auto", on:click=move |_| {
+                            combo_name.set(String::new());
+                            combo_chain.set(Vec::new());
+                            combo_error.set(String::new());
+                            combo_editing.set(Some(String::new()));
+                        }) { "+ New combo" }
+                    }
+                } else {
+                    view! {}
+                })
             }
             div(class="card") {
                 (if combos.get_clone().is_empty() && combo_editing.get_clone().is_none() {
@@ -261,14 +274,7 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                 })
 
                 (match combo_editing.get_clone() {
-                    None => view! {
-                        button(class="btn btn-sm mt-12", on:click=move |_| {
-                            combo_name.set(String::new());
-                            combo_chain.set(Vec::new());
-                            combo_error.set(String::new());
-                            combo_editing.set(Some(String::new()));
-                        }) { "+ New combo" }
-                    },
+                    None => view! {},
                     Some(name) => {
                         let is_new = name.is_empty();
                         let save_name = name.clone();
