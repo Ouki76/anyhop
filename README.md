@@ -167,6 +167,27 @@ See `anyhop.example.toml`. Path: `ANYHOP_CONFIG` (default `anyhop.toml`).
 | `ANYHOP_WORKERS` | `min(4, cores)` | Tokio worker threads — raise it on many-core boxes (see benchmarks) |
 | `RUST_LOG` | `info` | Log filter (`RUST_LOG=debug anyhop`) |
 
+## TLS
+
+Two supported shapes — pick one:
+
+```toml
+# A. TLS in this process (no reverse proxy needed)
+[server]
+tls_cert = "/etc/anyhop/fullchain.pem"
+tls_key  = "/etc/anyhop/privkey.pem"
+```
+
+```nginx
+# B. Terminate TLS at a proxy (nginx config in packaging/nginx.conf.example)
+#    Remember to forward X-Forwarded-Proto so HSTS is emitted.
+```
+
+`rustls` with TLS 1.3 + 1.2, ALPN `http/1.1`, certificate chain read from PEM (leaf first, then
+intermediates; PKCS#8/PKCS#1/SEC1 keys). A certificate/key mismatch fails at startup rather than
+at the first handshake. When TLS is on, HSTS is sent; behind a proxy it is sent when
+`X-Forwarded-Proto: https` arrives.
+
 ## Tuning
 
 Every timing and limit that used to be a `const` is now a config value (`[tuning]`), editable
@@ -217,7 +238,9 @@ Errors are always the same envelope, including for malformed bodies:
 | `/v1/completions` | POST | legacy completion / FIM |
 | `/v1/fim/completions` | POST | fill-in-the-middle |
 | `/v1/embeddings` | POST | embeddings (openai_compat, gemini) |
-| `/v1/models` | GET | everything enabled, combos included |
+| `/v1/models` | GET | everything enabled, combos included (cached per catalogue epoch) |
+| `/v1/models/{id}` | GET | one model, `provider/model` or a combo name |
+| `/v1/responses` | POST | OpenAI Responses API (`input`, `instructions`, `max_output_tokens`; streaming events) |
 
 | Admin (`/api`) | Method | Purpose |
 | --- | --- | --- |
@@ -237,7 +260,7 @@ Errors are always the same envelope, including for malformed bodies:
 | `/api/config` | GET/PUT | raw TOML (validated before it is written) |
 | `/api/reload` | POST | re-read the config from disk |
 | `/api/auth/start`, `/api/auth/status`, `/api/auth/cancel` | POST/GET/POST | OAuth flow; `{"kind":"antigravity","provider":"ag-work"}` targets (or creates) a named provider, `/cancel` frees the callback port |
-| `/metrics` | GET | Prometheus exposition |
+| `/metrics` | GET | Prometheus exposition, including `anyhop_http_request_duration_seconds` histograms |
 | `/healthz` | GET | liveness, no auth |
 
 ## OAuth sign-in (account providers)

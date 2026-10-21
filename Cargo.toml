@@ -2,8 +2,13 @@
 name = "anyhop"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 
 [dependencies]
+# In-process TLS ([server] tls_cert / tls_key). Both are already in Cargo.lock
+# transitively via reqwest's rustls backend, so this adds no new crates.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = [
@@ -55,3 +60,13 @@ harness = false
 [[bench]]
 name = "load"
 harness = false
+
+[lints.rust]
+# deny, not forbid: main.rs needs one `unsafe(export_name)` for jemalloc config
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"

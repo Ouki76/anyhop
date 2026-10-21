@@ -372,6 +372,9 @@ pub struct ClientKeyConfig {
     /// Spike allowance; defaults to `rpm` when unset or 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub burst: Option<u32>,
+    /// In-flight requests allowed for this key (None = `[server] client_key_max_concurrent`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -411,6 +414,23 @@ pub struct ServerConfig {
     #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
     #[serde(default = "default_true")]
     pub dashboard: bool,
+    /// Serve HTTPS directly from this process (PEM files). Both must be set.
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    #[serde(default)]
+    pub tls_key: Option<String>,
+    /// Log format: "text" (default) or "json" for log shippers.
+    #[serde(default = "default_log_format")]
+    pub log_format: String,
+    /// Per-client-key concurrency cap (0 = unlimited) unless the key overrides it.
+    #[serde(default)]
+    pub client_key_max_concurrent: u32,
+    /// Failed-auth attempts from one IP before it is throttled.
+    #[serde(default = "default_auth_fail_burst")]
+    pub auth_fail_burst: u32,
+    /// How long the failure counter is remembered.
+    #[serde(default = "default_auth_fail_window_secs")]
+    pub auth_fail_window_secs: u64,
     /// Max events kept (and persisted). 0 = in-memory 100, no persistence.
     #[serde(default = "default_events_history")]
     pub events_history: usize,
@@ -430,6 +450,15 @@ fn default_max_body() -> usize {
     32 * 1024 * 1024 // 32 MiB
 }
 
+fn default_log_format() -> String {
+    "text".to_string()
+}
+fn default_auth_fail_burst() -> u32 {
+    10
+}
+fn default_auth_fail_window_secs() -> u64 {
+    60
+}
 fn default_events_history() -> usize {
     100
 }
@@ -459,6 +488,12 @@ impl Default for ServerConfig {
             requests_history: default_requests_history(),
             admin_key: None,
             public_url: None,
+            tls_cert: None,
+            tls_key: None,
+            log_format: default_log_format(),
+            client_key_max_concurrent: 0,
+            auth_fail_burst: default_auth_fail_burst(),
+            auth_fail_window_secs: default_auth_fail_window_secs(),
             max_body_bytes: default_max_body(),
             models_refresh_secs: default_models_refresh_secs(),
         }

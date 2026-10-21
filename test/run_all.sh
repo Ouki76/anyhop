@@ -130,6 +130,13 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/embeddings" -H "$CT" -d 
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/embeddings" -H "$AUTH" -H "$CT" -d '{"input":"hi"}')
 [ "$CODE" = 400 ] && ok "embeddings without model -> 400" || fail "embeddings no model: $CODE"
 
+echo "== hardening (tls, lockout, concurrency, histograms) =="
+if ANYHOP_BIN="$BIN" timeout 300 python3 test/hardening_test.py; then
+    ok "hardening checks (tls, lockout, concurrency, histograms, responses)"
+else
+    fail "hardening checks"
+fi
+
 echo "== client keys & models =="
 if python3 test/client_keys_and_models_test.py; then
     ok "client keys and models access control"

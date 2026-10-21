@@ -16,6 +16,7 @@ pub fn ApiKeysTab(
     let key_input = create_signal(String::new());
     let rpm_input = create_signal(String::new());
     let burst_input = create_signal(String::new());
+    let max_concurrent_input = create_signal(String::new());
     let restrict_models = create_signal(false);
     let selected_models = create_signal(std::collections::HashSet::<String>::new());
     let model_search = create_signal(String::new());
@@ -123,9 +124,14 @@ pub fn ApiKeysTab(
                                 placeholder="burst (default = rpm)",
                                 bind:value=burst_input,
                             )
+                            input(
+                                class="input input-w200", r#type="number", min="0",
+                                placeholder="max concurrent (empty = server default)",
+                                bind:value=max_concurrent_input,
+                            )
                         }
                         div(class="dim-text mb-12") {
-                            "Token bucket: rpm is the sustained rate for this key, burst caps the spike. 429 + Retry-After when exceeded."
+                            "Token bucket: rpm is the sustained rate, burst caps the spike. max concurrent limits in-flight requests (429 when exceeded)."
                         }
                     }
 
@@ -203,6 +209,7 @@ pub fn ApiKeysTab(
                             let key = key_input.get_clone();
                             let rpm = rpm_input.get_clone().trim().parse::<u32>().unwrap_or(0);
                             let burst = burst_input.get_clone().trim().parse::<u32>().unwrap_or(0);
+                            let max_concurrent = max_concurrent_input.get_clone().trim().parse::<u32>().unwrap_or(0);
                             let models_vec = if restrict_models.get() {
                                 selected_models.get_clone().into_iter().collect::<Vec<_>>()
                             } else {
@@ -215,6 +222,7 @@ pub fn ApiKeysTab(
                                     "models": models_vec,
                                     "rpm": if rpm > 0 { Some(rpm) } else { None },
                                     "burst": if burst > 0 { Some(burst) } else { None },
+                                    "max_concurrent": if max_concurrent > 0 { serde_json::Value::from(max_concurrent) } else { serde_json::Value::Null },
                                 });
                                 let req = match Request::post("/api/client-keys/add").json(&body) {
                                     Ok(r) => r,

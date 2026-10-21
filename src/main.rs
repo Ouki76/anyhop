@@ -13,6 +13,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // jemalloc: background thread returns unused pages to the OS (5s decay).
 #[allow(non_upper_case_globals)]
+// The only `unsafe` in the crate: jemalloc reads its config from this exported
+// symbol. `unsafe_code` is denied crate-wide (Cargo.toml [lints.rust]).
+#[allow(unsafe_code)]
 #[unsafe(export_name = "malloc_conf")]
 static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
 

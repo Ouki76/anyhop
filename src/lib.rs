@@ -5,6 +5,9 @@
 //! `cargo bench` / integration tests. The binary in `src/main.rs` only sets the
 //! global allocator and calls [`run`].
 
+// Production code must not panic on bad input; tests may unwrap freely.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod anthropic;
 pub mod antigravity;
 pub mod api;
@@ -23,6 +26,7 @@ pub mod ratelimit;
 pub mod scan;
 pub mod sse;
 pub mod storage;
+pub mod tls;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -190,6 +194,10 @@ async fn async_main() -> anyhow::Result<()> {
             admin_key: cfg.server.admin_key.clone().or(cfg.server.api_key.clone()),
             events_history: cfg.server.events_history,
             requests_history: cfg.server.requests_history,
+            auth_fail_burst: cfg.server.auth_fail_burst,
+            auth_fail_window: Duration::from_secs(cfg.server.auth_fail_window_secs),
+            client_key_max_concurrent: cfg.server.client_key_max_concurrent,
+            tls_enabled: cfg.server.tls_cert.is_some(),
         }),
         storage: storage.clone(),
         config_path: config_path.clone(),
@@ -198,6 +206,9 @@ async fn async_main() -> anyhow::Result<()> {
         auth_task: std::sync::Mutex::new(None),
         auth_code_tx: std::sync::Mutex::new(None),
         auth_state_token: std::sync::Mutex::new(None),
+        auth_fails: std::sync::Mutex::new(crate::middleware::AuthFailures::default()),
+        catalog_epoch: std::sync::atomic::AtomicU64::new(1),
+        models_cache: std::sync::Mutex::new(None),
         request_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
         client_keys: std::sync::RwLock::new(client_keys_map),
         disabled_models: std::sync::RwLock::new(disabled_models_set),
@@ -216,41 +227,42 @@ async fn async_main() -> anyhow::Result<()> {
 
     spawn_background_tasks(state.clone(), &cfg);
 
-    let listener = tokio::net::TcpListener::bind(&cfg.server.listen).await?;
+    let raw_listener = tokio::net::TcpListener::bind(&cfg.server.listen).await?;
+    let make = || app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+
     // TCP_NODELAY on accepted sockets. Without it Nagle + delayed ACK adds ~40 ms
     // to a fraction of keep-alive requests — measured with test/soak.py: p95 went
     // from 42 ms to ~1 ms. axum::serve does not set it for us.
-    let listener = listener.tap_io(|stream| {
-        if let Err(e) = stream.set_nodelay(true) {
-            tracing::debug!("cannot set TCP_NODELAY: {e}");
-        }
-    });
-    info!("anyhop listening on http://{}", cfg.server.listen);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            #[cfg(unix)]
-            {
-                // Missing SIGTERM support must not block Ctrl+C shutdown:
-                // fall back to a never-resolving future for the term branch.
-                let mut term =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = async {
-                        match term.as_mut() {
-                            Some(t) => { t.recv().await; }
-                            None => std::future::pending::<()>().await,
-                        }
-                    } => {}
+    //
+    // The tap has to sit *outside* the TLS wrapper: axum implements
+    // `Connected<IncomingStream<TapIo<L, F>>>` for `L::Addr`, which is what makes
+    // `ConnectInfo<SocketAddr>` available (the brute-force guard needs the peer IP).
+    match (&cfg.server.tls_cert, &cfg.server.tls_key) {
+        (Some(cert), Some(key)) => {
+            let tls = tls::TlsConfig::from_pem_files(cert, key)
+                .map_err(|e| anyhow::anyhow!("cannot start TLS: {e}"))?;
+            info!("anyhop listening on https://{} (TLS)", cfg.server.listen);
+            let listener = tls::TlsListener::new(raw_listener, tls).tap_io(|stream| {
+                if let Err(e) = stream.get_ref().0.set_nodelay(true) {
+                    tracing::debug!("cannot set TCP_NODELAY: {e}");
                 }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-            info!("shutting down gracefully");
-        })
-        .await?;
+            });
+            axum::serve(listener, make())
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+        _ => {
+            info!("anyhop listening on http://{}", cfg.server.listen);
+            let listener = raw_listener.tap_io(|stream| {
+                if let Err(e) = stream.set_nodelay(true) {
+                    tracing::debug!("cannot set TCP_NODELAY: {e}");
+                }
+            });
+            axum::serve(listener, make())
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+    }
 
     // Final state flush — the periodic persist task dies with the runtime.
     persist_feeds(&state);
@@ -263,6 +275,8 @@ async fn async_main() -> anyhow::Result<()> {
 /// Rebuild providers/router from the config file (state restored from storage).
 pub fn reload_config(state: &Arc<proxy::AppState>) -> anyhow::Result<usize> {
     let cfg = config::Config::load(&state.config_path)?;
+    // Providers, combos and model lists may all have changed.
+    state.invalidate_catalog();
     let mut providers = Vec::new();
     for p in &cfg.providers {
         providers.push(providers::Provider::from_config(
@@ -299,6 +313,10 @@ pub fn reload_config(state: &Arc<proxy::AppState>) -> anyhow::Result<usize> {
         admin_key: cfg.server.admin_key.clone().or(cfg.server.api_key.clone()),
         events_history: cfg.server.events_history,
         requests_history: cfg.server.requests_history,
+        auth_fail_burst: cfg.server.auth_fail_burst,
+        auth_fail_window: Duration::from_secs(cfg.server.auth_fail_window_secs),
+        client_key_max_concurrent: cfg.server.client_key_max_concurrent,
+        tls_enabled: cfg.server.tls_cert.is_some(),
     };
     state.events.set_cap(cfg.server.events_history);
     // Full replacement, not a merge: keys/models removed from the config must disappear.
@@ -400,7 +418,9 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
         .route("/v1/fim/completions", post(fim::fim_completions))
         .route("/v1/completions", post(fim::fim_completions))
         .route("/v1/models", get(proxy::list_models))
+        .route("/v1/models/{*id}", get(proxy::get_model))
         .route("/v1/embeddings", post(proxy::embeddings))
+        .route("/v1/responses", post(proxy::responses::responses))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::require_api_key,
@@ -466,7 +486,9 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
         // No admin key here: the browser carries the OAuth state instead.
         .route("/api/auth/callback", get(api::auth_callback))
         .route("/healthz", get(|| async { "ok" }))
-        .layer(axum::middleware::from_fn(middleware::json_errors));
+        .layer(axum::middleware::from_fn(middleware::json_errors))
+        // Outermost: measures the whole request, including auth and error paths.
+        .layer(axum::middleware::from_fn(middleware::record_metrics));
 
     #[cfg(feature = "dashboard")]
     let app = if cfg.server.dashboard {
@@ -486,7 +508,10 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
     app.with_state(state.clone())
         // Outermost layer: hardening headers on every response, including 401s
         // and errors produced by the auth middlewares inside.
-        .layer(axum::middleware::from_fn(middleware::security_headers))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::security_headers,
+        ))
 }
 
 /// Long-running maintenance tasks: SIGHUP hot reload, periodic stats/feed
@@ -568,4 +593,29 @@ fn persist_feeds(state: &Arc<proxy::AppState>) {
             .collect();
         s.save_feed("requests", &v);
     }
+}
+
+/// Resolves on Ctrl+C or SIGTERM (the process is expected to exit afterwards).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        // Missing SIGTERM support must not block Ctrl+C shutdown:
+        // fall back to a never-resolving future for the term branch.
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                match term.as_mut() {
+                    Some(t) => { t.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    info!("shutting down gracefully");
 }

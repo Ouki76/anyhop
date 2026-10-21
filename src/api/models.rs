@@ -43,6 +43,7 @@ fn dm_write(state: &AppState) -> RwLockWriteGuard<'_, HashSet<String>> {
 /// Persist the disabled set: storage feed first (fast, survives restarts even if
 /// the TOML rewrite fails), then the TOML file. Every mutating handler did this.
 async fn save_disabled(state: &Arc<AppState>) {
+    state.invalidate_catalog();
     let all: Vec<_> = dm_read(state).iter().cloned().collect();
     if let Some(s) = &state.storage {
         s.save_feed("disabled_models", &all);
@@ -125,6 +126,7 @@ pub async fn models_list(State(state): State<Arc<AppState>>) -> Response {
 
 pub async fn models_refresh(State(state): State<Arc<AppState>>) -> Response {
     refresh_all_providers(&state).await;
+    state.invalidate_catalog();
     state.events.emit_simple(
         "models",
         "",
@@ -138,6 +140,8 @@ pub async fn models_refresh(State(state): State<Arc<AppState>>) -> Response {
 pub async fn refresh_all_providers(state: &Arc<AppState>) {
     let router = state.router.load();
     futures::future::join_all(router.providers.iter().map(|p| p.refresh_models())).await;
+    // Covers the background refresh task as well as the manual endpoint.
+    state.invalidate_catalog();
 }
 
 pub async fn model_enable(

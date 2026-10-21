@@ -25,6 +25,12 @@ pub fn SettingsTab() -> View {
     let proxy = create_signal(String::new());
     let state_file = create_signal(String::new());
     let public_url = create_signal(String::new());
+    let tls_cert = create_signal(String::new());
+    let tls_key = create_signal(String::new());
+    let log_format = create_signal("text".to_string());
+    let ck_max_concurrent = create_signal(String::new());
+    let auth_fail_burst = create_signal(String::new());
+    let auth_fail_window = create_signal(String::new());
     let dashboard = create_signal(true);
     let api_key = create_signal(String::new());
     let admin_key = create_signal(String::new());
@@ -64,6 +70,12 @@ pub fn SettingsTab() -> View {
             proxy.set(s.proxy.unwrap_or_default());
             state_file.set(s.state_file);
             public_url.set(s.public_url.unwrap_or_default());
+            tls_cert.set(s.tls_cert.unwrap_or_default());
+            tls_key.set(s.tls_key.unwrap_or_default());
+            log_format.set(s.log_format);
+            ck_max_concurrent.set(s.client_key_max_concurrent.to_string());
+            auth_fail_burst.set(s.auth_fail_burst.to_string());
+            auth_fail_window.set(s.auth_fail_window_secs.to_string());
             dashboard.set(s.dashboard);
             let t = s.tuning;
             t_max_cooldown.set(t.max_cooldown_secs.to_string());
@@ -152,6 +164,38 @@ pub fn SettingsTab() -> View {
                                 "Used for OAuth redirects when the panel is not opened on this machine. Empty = localhost callback only."
                             }
                         }
+                        div(class="form-group") {
+                            label(class="form-label") { "TLS certificate (PEM)" }
+                            input(class="input", r#type="text", placeholder="/etc/anyhop/cert.pem", bind:value=tls_cert)
+                            div(class="form-hint") { "Serves HTTPS directly. Empty = plain HTTP (terminate TLS at a proxy). Restart required." }
+                        }
+                        div(class="form-group") {
+                            label(class="form-label") { "TLS private key (PEM)" }
+                            input(class="input", r#type="password", placeholder="/etc/anyhop/key.pem", bind:value=tls_key)
+                            div(class="form-hint") { "Must match the certificate. Restart required." }
+                        }
+                        div(class="form-group") {
+                            label(class="form-label") { "Log format" }
+                            select(class="select", bind:value=log_format) {
+                                option(value="text") { "text" }
+                                option(value="json") { "json" }
+                            }
+                            div(class="form-hint") { "json for log shippers. Restart required." }
+                        }
+                        div(class="form-group") {
+                            label(class="form-label") { "Client key concurrency" }
+                            input(class="input", r#type="number", min="0", bind:value=ck_max_concurrent)
+                            div(class="form-hint") { "Default in-flight cap per client key (0 = unlimited)." }
+                        }
+                        div(class="form-group") {
+                            label(class="form-label") { "Auth failures before lockout" }
+                            input(class="input", r#type="number", min="1", bind:value=auth_fail_burst)
+                            div(class="form-hint") { "Per IP, on /v1 and /api." }
+                        }
+                        div(class="form-group") {
+                            label(class="form-label") { "Lockout window, s" }
+                            input(class="input", r#type="number", min="1", bind:value=auth_fail_window)
+                        }
                         div(class="form-group span-2") {
                             label(class="form-label") { "Upstream proxy for all providers" }
                             input(class="input", r#type="text", placeholder="empty = direct connection", bind:value=proxy)
@@ -190,6 +234,12 @@ pub fn SettingsTab() -> View {
                         "proxy": proxy.get_clone(),
                         "state_file": state_file.get_clone(),
                         "public_url": public_url.get_clone(),
+                        "tls_cert": tls_cert.get_clone(),
+                        "tls_key": tls_key.get_clone(),
+                        "log_format": log_format.get_clone(),
+                        "client_key_max_concurrent": int_of(&ck_max_concurrent.get_clone()) as usize,
+                        "auth_fail_burst": int_of(&auth_fail_burst.get_clone()) as usize,
+                        "auth_fail_window_secs": int_of(&auth_fail_window.get_clone()),
                         "tuning": {
                             "max_cooldown_secs": int_of(&t_max_cooldown.get_clone()),
                             "base_backoff_secs": int_of(&t_base_backoff.get_clone()),
@@ -259,6 +309,12 @@ pub fn SettingsTab() -> View {
                             proxy.set(s.proxy.unwrap_or_default());
                             state_file.set(s.state_file);
                             public_url.set(s.public_url.clone().unwrap_or_default());
+                            tls_cert.set(s.tls_cert.clone().unwrap_or_default());
+                            tls_key.set(s.tls_key.clone().unwrap_or_default());
+                            log_format.set(s.log_format.clone());
+                            ck_max_concurrent.set(s.client_key_max_concurrent.to_string());
+                            auth_fail_burst.set(s.auth_fail_burst.to_string());
+                            auth_fail_window.set(s.auth_fail_window_secs.to_string());
                             dashboard.set(s.dashboard);
                             let t = s.tuning;
                             t_max_cooldown.set(t.max_cooldown_secs.to_string());

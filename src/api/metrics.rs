@@ -172,6 +172,9 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         );
     }
 
+    // Latency histograms (recorded by middleware::record_metrics). Empty when
+    // nothing has been served yet, so this is safe to append unconditionally.
+    out.push_str(&crate::api::histograms::render());
     (
         StatusCode::OK,
         [(

@@ -3,6 +3,14 @@
 # opened from another machine or a domain: OAuth sign-in then redirects to
 # <public_url>/api/auth/callback instead of a loopback port.
 # public_url = "https://gateway.example.com"
+# In-process TLS: set BOTH to serve HTTPS without a reverse proxy. Restart
+# required; the pair must match.
+# tls_cert = "/etc/anyhop/fullchain.pem"
+# tls_key = "/etc/anyhop/privkey.pem"
+# log_format = "text"              # "json" for log shippers
+# client_key_max_concurrent = 0    # default in-flight cap per client key
+# auth_fail_burst = 10             # failed auth per IP before lockout
+# auth_fail_window_secs = 60
 listen = "127.0.0.1:8080"
 max_retries = 4
 attempt_timeout_secs = 120

@@ -36,6 +36,13 @@ pub struct ServerDto {
     admin_key_set: bool,
     /// Public base URL for OAuth redirects (empty = loopback only).
     public_url: Option<String>,
+    /// In-process TLS (both set, or neither).
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    log_format: String,
+    client_key_max_concurrent: u32,
+    auth_fail_burst: u32,
+    auth_fail_window_secs: u64,
     /// Every configurable timing/limit (see `config::Tuning`).
     tuning: crate::config::Tuning,
 }
@@ -58,6 +65,13 @@ pub struct ServerUpdate {
     state_file: Option<String>,
     /// Empty string clears it (back to the loopback OAuth flow).
     public_url: Option<String>,
+    /// Empty strings clear TLS (back to plain HTTP). Needs a restart.
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    log_format: Option<String>,
+    client_key_max_concurrent: Option<u32>,
+    auth_fail_burst: Option<u32>,
+    auth_fail_window_secs: Option<u64>,
     /// Partial update of `[tuning]`; omitted fields keep their value.
     tuning: Option<TuningUpdate>,
 }
@@ -87,7 +101,15 @@ pub struct TuningUpdate {
 
 /// Fields that only take effect after a restart, because they are baked into the
 /// router/listener/allocator path at startup.
-const RESTART_ONLY: &[&str] = &["listen", "max_body_bytes", "dashboard", "state_file"];
+const RESTART_ONLY: &[&str] = &[
+    "listen",
+    "max_body_bytes",
+    "dashboard",
+    "state_file",
+    "tls_cert",
+    "tls_key",
+    "log_format",
+];
 
 pub async fn get_server(State(state): State<Arc<AppState>>) -> Response {
     let raw = match std::fs::read_to_string(&state.config_path) {
@@ -117,6 +139,12 @@ pub async fn get_server(State(state): State<Arc<AppState>>) -> Response {
         api_key_set: s.api_key.is_some(),
         admin_key_set: s.admin_key.is_some(),
         public_url: s.public_url.clone(),
+        tls_cert: s.tls_cert.clone(),
+        tls_key: s.tls_key.clone(),
+        log_format: s.log_format.clone(),
+        client_key_max_concurrent: s.client_key_max_concurrent,
+        auth_fail_burst: s.auth_fail_burst,
+        auth_fail_window_secs: s.auth_fail_window_secs,
         tuning: cfg.tuning.clone(),
     })
     .into_response()
@@ -281,6 +309,76 @@ pub async fn update_server(
     {
         server["state_file"] = toml_edit::value(v.trim());
         changed.push("state_file");
+    }
+    if let Some(v) = &body.log_format {
+        let v = v.trim();
+        if v != cur.log_format {
+            if !matches!(v, "text" | "json") {
+                return (StatusCode::BAD_REQUEST, "log_format must be text or json")
+                    .into_response();
+            }
+            server["log_format"] = toml_edit::value(v);
+            changed.push("log_format");
+        }
+    }
+    if let Some(v) = body.client_key_max_concurrent
+        && v != cur.client_key_max_concurrent
+    {
+        if v > 10_000 {
+            return (
+                StatusCode::BAD_REQUEST,
+                "client_key_max_concurrent must be <= 10000",
+            )
+                .into_response();
+        }
+        server["client_key_max_concurrent"] = toml_edit::value(v as i64);
+        changed.push("client_key_max_concurrent");
+    }
+    if let Some(v) = body.auth_fail_burst
+        && v != cur.auth_fail_burst
+    {
+        if !(1..=10_000).contains(&v) {
+            return (StatusCode::BAD_REQUEST, "auth_fail_burst must be 1..10000").into_response();
+        }
+        server["auth_fail_burst"] = toml_edit::value(v as i64);
+        changed.push("auth_fail_burst");
+    }
+    if let Some(v) = body.auth_fail_window_secs
+        && v != cur.auth_fail_window_secs
+    {
+        if !(1..=3600).contains(&v) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "auth_fail_window_secs must be 1..3600",
+            )
+                .into_response();
+        }
+        server["auth_fail_window_secs"] = toml_edit::value(v as i64);
+        changed.push("auth_fail_window_secs");
+    }
+    for (key, value, current) in [
+        (
+            "tls_cert",
+            body.tls_cert.as_deref(),
+            cur.tls_cert.as_deref(),
+        ),
+        ("tls_key", body.tls_key.as_deref(), cur.tls_key.as_deref()),
+    ] {
+        let Some(v) = value else { continue };
+        let v = v.trim();
+        if v == current.unwrap_or("") {
+            continue;
+        }
+        if v.is_empty() {
+            server.remove(key);
+        } else {
+            server[key] = toml_edit::value(v);
+        }
+        changed.push(if key == "tls_cert" {
+            "tls_cert"
+        } else {
+            "tls_key"
+        });
     }
     if let Some(v) = &body.public_url {
         let v = v.trim().trim_end_matches('/');

@@ -4,18 +4,21 @@
 //! - `models` — GET /v1/models
 //! - `chat`   — POST /v1/chat/completions (+ retry/fallback core shared with FIM)
 //! - `embeddings` — POST /v1/embeddings (pass-through or Gemini translation)
+//! - `responses` — POST /v1/responses (OpenAI Responses API over the same pipeline)
 
 mod access;
 mod chat;
 mod embeddings;
 mod models;
+pub mod responses;
 
 pub use access::{combo_allowed, model_allowed, model_disabled};
 pub use chat::{chat_completions, run_target_pub};
 // Exposed for `cargo bench` only (hot-path measurement), not part of the HTTP surface.
 pub use chat::session_key;
 pub use embeddings::embeddings;
-pub use models::list_models;
+pub use models::{get_model, list_models};
+pub use responses::responses;
 
 use std::time::Duration;
 
@@ -35,6 +38,13 @@ pub struct RtConfig {
     pub admin_key: Option<String>,
     pub events_history: usize,
     pub requests_history: usize,
+    /// Failed-auth attempts per IP before lockout, and the window.
+    pub auth_fail_burst: u32,
+    pub auth_fail_window: std::time::Duration,
+    /// Default in-flight cap for client keys that do not set their own (0 = off).
+    pub client_key_max_concurrent: u32,
+    /// True when this process serves TLS itself (drives HSTS).
+    pub tls_enabled: bool,
 }
 
 pub struct AppState {
@@ -54,6 +64,15 @@ pub struct AppState {
     /// OAuth `state` of the pending flow, so the public callback can reject
     /// foreign/expired redirects itself instead of failing later.
     pub auth_state_token: std::sync::Mutex<Option<String>>,
+    /// Failed authentication attempts per client IP (window + count), so a
+    /// credential-stuffing loop cannot hammer the key comparison for free.
+    pub auth_fails: std::sync::Mutex<crate::middleware::AuthFailures>,
+    /// Bumped whenever the model catalogue can change (reload, enable/disable,
+    /// refresh). `/v1/models` caches its serialized body per epoch.
+    pub catalog_epoch: std::sync::atomic::AtomicU64,
+    /// (epoch, full body) of the unfiltered catalogue. Client-key allowlists
+    /// bypass it — that is the only per-request variable.
+    pub models_cache: std::sync::Mutex<Option<(u64, String)>>,
     /// Ring buffer of recent upstream attempts for the Requests tab.
     pub request_log: std::sync::Mutex<std::collections::VecDeque<crate::events::RequestRecord>>,
     /// Client API keys: key -> ClientKeyConfig.
@@ -78,6 +97,11 @@ pub struct ClientKeyRuntime {
     pub limiter: Option<std::sync::Arc<crate::ratelimit::KeyRateLimit>>,
     /// Requests rejected by the rate limiter (exposed via /metrics).
     pub limited: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// In-flight requests for this key, and the cap (0 = unlimited).
+    pub in_flight: std::sync::atomic::AtomicU32,
+    pub max_concurrent: u32,
+    /// Requests rejected because the key was already at its concurrency cap.
+    pub saturated: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ClientKeyRuntime {
@@ -86,10 +110,14 @@ impl ClientKeyRuntime {
             .rpm
             .and_then(|rpm| crate::ratelimit::KeyRateLimit::new(rpm, cfg.burst.unwrap_or(0)))
             .map(std::sync::Arc::new);
+        let max_concurrent = cfg.max_concurrent.unwrap_or(0);
         Self {
             cfg,
             limiter,
             limited: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            in_flight: std::sync::atomic::AtomicU32::new(0),
+            max_concurrent,
+            saturated: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -97,10 +125,18 @@ impl ClientKeyRuntime {
     /// counter when the limits themselves did not change.
     pub fn rebind(&self, cfg: crate::config::ClientKeyConfig) -> Self {
         if self.cfg.rpm == cfg.rpm && self.cfg.burst == cfg.burst {
+            let max_concurrent = cfg.max_concurrent.unwrap_or(0);
             Self {
                 cfg,
                 limiter: self.limiter.clone(),
                 limited: self.limited.clone(),
+                // Keep the live in-flight counter across a config reload, otherwise
+                // requests already in progress would be counted twice.
+                in_flight: std::sync::atomic::AtomicU32::new(
+                    self.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+                ),
+                max_concurrent,
+                saturated: self.saturated.clone(),
             }
         } else {
             Self::new(cfg)
@@ -118,6 +154,12 @@ pub struct KeyPermissions {
 }
 
 impl AppState {
+    /// The model catalogue may have changed: drop the cached `/v1/models` body.
+    pub fn invalidate_catalog(&self) {
+        self.catalog_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn log_request(&self, rec: crate::events::RequestRecord) {
         // Short read guard for one integer instead of cloning the whole RtConfig.
         // Config: 0 means "in-memory default (200), no persistence".

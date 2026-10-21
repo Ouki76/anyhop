@@ -33,6 +33,9 @@ pub struct AddClientKey {
     pub rpm: Option<u32>,
     #[serde(default)]
     pub burst: Option<u32>,
+    /// In-flight cap for this key (None = server default).
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -173,6 +176,7 @@ pub async fn client_key_add(
         created_at: Some(now),
         rpm,
         burst,
+        max_concurrent: body.max_concurrent,
     };
 
     let runtime = Arc::new(crate::proxy::ClientKeyRuntime::new(client_key.clone()));

@@ -92,6 +92,25 @@ pub async fn require_api_key(
 ) -> Response {
     let rt = state.rt();
     let token = extract_bearer(&req);
+    let ip = client_ip(&req);
+
+    // Locked out after repeated failures? Refuse before touching the keys.
+    {
+        let burst = rt.auth_fail_burst;
+        let window = rt.auth_fail_window;
+        let mut fails = state.auth_fails.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(retry) = fails.blocked(&ip, burst, window) {
+            let mut resp = proxy::error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed authentication attempts from this address",
+                "rate_limit_exceeded",
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str(&retry.to_string()) {
+                resp.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+            return resp;
+        }
+    }
 
     let (auth_needed, client_key_info) = {
         // Poisoning-recoverable read: a panicking writer must not wedge all /v1 traffic.
@@ -120,6 +139,11 @@ pub async fn require_api_key(
     if let Some(expected) = &rt.api_key
         && token_eq(&t, expected)
     {
+        state
+            .auth_fails
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear(&ip);
         req.extensions_mut().insert(proxy::KeyPermissions {
             allowed_models: None,
             key_name: Some("master".into()),
@@ -150,6 +174,33 @@ pub async fn require_api_key(
             }
             return resp;
         }
+        state
+            .auth_fails
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear(&ip);
+        // Concurrency cap: the key's own limit, else the server-wide default.
+        let limit = if ck.max_concurrent > 0 {
+            ck.max_concurrent
+        } else {
+            rt.client_key_max_concurrent
+        };
+        if limit > 0 {
+            let cur = ck
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if cur >= limit {
+                ck.in_flight
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                ck.saturated
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return proxy::error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!("too many concurrent requests for this API key (limit {limit})"),
+                    "rate_limit_exceeded",
+                );
+            }
+        }
         let allowed = if ck.cfg.models.is_empty() {
             None
         } else {
@@ -159,9 +210,23 @@ pub async fn require_api_key(
             allowed_models: allowed,
             key_name: ck.cfg.name.clone().or_else(|| Some(ck.cfg.key.clone())),
         });
-        return next.run(req).await;
+        let mut resp = next.run(req).await;
+        if limit > 0 {
+            // Dropped with the response — i.e. after a streamed body completes.
+            resp.extensions_mut().insert(ClientKeyGuard(ck));
+        }
+        return resp;
     }
 
+    {
+        let burst = rt.auth_fail_burst;
+        let window = rt.auth_fail_window;
+        state
+            .auth_fails
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note(&ip, burst, window);
+    }
     proxy::error_response(
         StatusCode::UNAUTHORIZED,
         "invalid gateway API key",
@@ -180,14 +245,42 @@ pub async fn require_admin_key(
     next: Next,
 ) -> Response {
     let rt = state.rt();
-    if let Some(expected) = rt.admin_key.or(rt.api_key)
-        && !bearer_ok(&req, &expected)
+    let ip = client_ip(&req);
+    let burst = rt.auth_fail_burst;
+    let window = rt.auth_fail_window;
+    // Same lockout as /v1: the admin surface is the more valuable target.
     {
-        return proxy::error_response(
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing admin key",
-            "authentication_error",
-        );
+        let mut fails = state.auth_fails.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(retry) = fails.blocked(&ip, burst, window) {
+            let mut resp = proxy::error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed authentication attempts from this address",
+                "rate_limit_exceeded",
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str(&retry.to_string()) {
+                resp.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+            return resp;
+        }
+    }
+    if let Some(expected) = rt.admin_key.or(rt.api_key) {
+        if !bearer_ok(&req, &expected) {
+            state
+                .auth_fails
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .note(&ip, burst, window);
+            return proxy::error_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid or missing admin key",
+                "authentication_error",
+            );
+        }
+        state
+            .auth_fails
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear(&ip);
     }
     next.run(req).await
 }
@@ -195,6 +288,100 @@ pub async fn require_admin_key(
 /// Response hardening applied to every route.
 ///
 /// The admin UI keeps its key in `localStorage`, so an injected script would own
+/// Failed-auth counter per client IP.
+///
+/// A wrong key costs one comparison; without a limit an attacker can try
+/// millions per minute. After `burst` failures inside `window`, further attempts
+/// from that IP get 429 before the key is even compared.
+#[derive(Default)]
+pub struct AuthFailures {
+    seen: std::collections::HashMap<String, (u32, std::time::Instant)>,
+}
+
+impl AuthFailures {
+    /// Count one failure; returns true when this IP is now locked out.
+    pub fn note(&mut self, ip: &str, burst: u32, window: std::time::Duration) -> bool {
+        let now = std::time::Instant::now();
+        // Keep the map from growing without bound when someone sprays spoofed IPs.
+        if self.seen.len() > 10_000 {
+            self.seen
+                .retain(|_, (_, t)| now.duration_since(*t) < window);
+        }
+        let e = self.seen.entry(ip.to_string()).or_insert((0, now));
+        if now.duration_since(e.1) > window {
+            *e = (0, now);
+        }
+        e.0 = e.0.saturating_add(1);
+        e.0 >= burst
+    }
+
+    /// Whether this IP is currently locked out (without counting an attempt).
+    pub fn blocked(&mut self, ip: &str, burst: u32, window: std::time::Duration) -> Option<u64> {
+        let now = std::time::Instant::now();
+        let (count, first) = self.seen.get(ip).copied()?;
+        let elapsed = now.duration_since(first);
+        if elapsed > window {
+            self.seen.remove(ip);
+            return None;
+        }
+        if count >= burst {
+            return Some((window - elapsed).as_secs().max(1));
+        }
+        None
+    }
+
+    /// Clear the counter for an IP after a successful authentication.
+    pub fn clear(&mut self, ip: &str) {
+        self.seen.remove(ip);
+    }
+}
+
+/// Decrements the key's in-flight counter when the response (including a streamed
+/// body) is dropped, so the cap tracks real concurrency rather than handler time.
+#[derive(Clone)]
+pub struct ClientKeyGuard(pub std::sync::Arc<proxy::ClientKeyRuntime>);
+
+impl Drop for ClientKeyGuard {
+    fn drop(&mut self) {
+        self.0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Where the request came from: the socket peer, else the first X-Forwarded-For
+/// hop (reverse proxies), else "unknown" so the guard still has a bucket.
+fn client_ip(req: &Request) -> String {
+    if let Some(axum::extract::ConnectInfo(addr)) = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+    {
+        return addr.ip().to_string();
+    }
+    req.headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Record request latency for `/metrics` (histograms, not just counters).
+pub async fn record_metrics(req: Request, next: Next) -> Response {
+    let started = std::time::Instant::now();
+    let path = req.uri().path().to_string();
+    let method = req.method().as_str().to_string();
+    let resp = next.run(req).await;
+    crate::api::histograms::record(
+        &crate::api::histograms::route_label(&path),
+        &method,
+        resp.status().as_u16(),
+        started.elapsed().as_secs_f64(),
+    );
+    resp
+}
+
 /// Every API error should look the same to a client. Axum's built-in rejections
 /// (bad JSON, missing field, wrong method) answer with `text/plain`, which breaks
 /// clients that parse the `{"error": {...}}` envelope everywhere else.
@@ -274,7 +461,20 @@ pub fn error_type(status: StatusCode) -> &'static str {
 /// MIME sniffing (`nosniff`), clickjacking/framing (`DENY`), and leaking the
 /// `?key=` query to third parties via the `Referer` header (`no-referrer`).
 /// The dashboard document additionally gets a strict CSP (see `dashboard::csp`).
-pub async fn security_headers(req: Request, next: Next) -> Response {
+pub async fn security_headers(
+    State(state): State<Arc<proxy::AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // Our own listener serving TLS counts too — nobody sets X-Forwarded-Proto then.
+    let served_over_tls = state.rt().tls_enabled;
+    let req_is_https = served_over_tls || {
+        // A TLS-terminating proxy tells us via X-Forwarded-Proto.
+        req.headers()
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("https"))
+    };
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
     h.insert(
@@ -289,12 +489,15 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
         header::REFERRER_POLICY,
         header::HeaderValue::from_static("no-referrer"),
     );
-    // Only honoured over HTTPS (i.e. behind a TLS-terminating proxy), ignored
-    // elsewhere — safe to send unconditionally.
-    h.insert(
-        header::STRICT_TRANSPORT_SECURITY,
-        header::HeaderValue::from_static("max-age=31536000"),
-    );
+    // HSTS only where it means something: over our own TLS, or when a proxy says
+    // the browser is already on HTTPS. Sending it on plain HTTP is ignored by
+    // browsers but confuses operators reading curl output.
+    if req_is_https {
+        h.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            header::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
     resp
 }
 

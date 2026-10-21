@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ClientKeyDto {
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
     pub key: String,
     pub masked: String,
     pub name: String,
@@ -200,6 +202,18 @@ pub struct ServerDto {
     /// Public base URL used for OAuth redirects (empty = loopback only).
     #[serde(default)]
     pub public_url: Option<String>,
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    #[serde(default)]
+    pub tls_key: Option<String>,
+    #[serde(default)]
+    pub log_format: String,
+    #[serde(default)]
+    pub client_key_max_concurrent: u32,
+    #[serde(default)]
+    pub auth_fail_burst: u32,
+    #[serde(default)]
+    pub auth_fail_window_secs: u64,
     /// Secrets are never returned — only whether they are configured.
     pub api_key_set: bool,
     pub admin_key_set: bool,
