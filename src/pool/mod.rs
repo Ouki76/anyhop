@@ -177,10 +177,19 @@ impl KeyPool {
     /// Pick the next key available for this model according to the strategy.
     /// `session` enables sticky routing: the same session hash sticks to one key.
     pub fn pick(&self, model: &str, session: Option<u64>) -> Option<Arc<KeyState>> {
-        // Sticky lookup first (round_robin/least_used; fill_first is sticky by design).
+        // Sticky routing (round_robin/least_used; fill_first is sticky by design).
         if let Some(s) = session
             && !matches!(self.strategy, Strategy::FillFirst)
         {
+            if self.sticky.is_hashed() {
+                // Rendezvous hashing: the same conversation lands on the same key
+                // in every instance, with no shared state to keep in sync.
+                let keys = lock(&self.keys);
+                return self
+                    .sticky
+                    .rendezvous(s, &keys, |k| k.is_available(model))
+                    .map(|i| keys[i].clone());
+            }
             let now = now_ms();
             if let Some(kid) = self.sticky.lookup(s, now) {
                 let keys = lock(&self.keys);

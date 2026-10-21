@@ -51,6 +51,11 @@ pub struct Provider {
     pub pool: KeyPool,
     pub models: Arc<Vec<String>>,
     pub extra_headers: Vec<(String, String)>,
+    /// Pass-through capabilities declared in the config ("images", "audio",
+    /// "realtime"). Empty = chat/completions/embeddings only. Kept on the
+    /// runtime provider so `proxy::media` can route without re-reading the
+    /// config file on every request.
+    pub capabilities: Vec<String>,
     /// Antigravity OAuth accounts, index-aligned with pool keys
     /// (pool secret == account refresh token).
     ag_accounts: Vec<Arc<Account>>,
@@ -185,11 +190,25 @@ impl Provider {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            capabilities: cfg.capabilities.clone(),
             ag_accounts,
             codex_accounts,
             models_cache: Mutex::new(None),
             quota_cache: Mutex::new(None),
         })
+    }
+
+    /// True when this provider explicitly declares `cap` ("images", "audio",
+    /// "realtime").
+    ///
+    /// The `openai_compat` check is not redundant with config validation: only
+    /// that kind may declare capabilities (`Config::validate` rejects the rest),
+    /// and repeating it here keeps a hand-built router — tests, a future
+    /// reload path — from routing an image request to an API that cannot serve
+    /// it. Silence ("no declaration") must never be read as "capable".
+    pub fn has_capability(&self, cap: &str) -> bool {
+        matches!(self.kind, ProviderKind::OpenaiCompat)
+            && self.capabilities.iter().any(|c| c == cap)
     }
 
     /// Find the OAuth account behind a pool key (antigravity only).

@@ -10,6 +10,11 @@ rust-version = "1.88"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 axum = "0.8"
+# WebSocket upgrade for GET /v1/realtime: axum is built without its `ws` feature
+# and no WS crate is available offline, so the endpoint uses hyper's raw
+# upgrade hook (already in the tree through axum's server) plus a local RFC 6455
+# codec in `src/ws.rs`.
+hyper = { version = "1", features = ["server", "http1"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",

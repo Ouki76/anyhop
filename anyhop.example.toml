@@ -87,6 +87,23 @@ models = ["openai/gpt-4o-mini", "deepseek/deepseek-chat"]
 # burst = 20               # optional spike allowance (default: same as rpm)
 
 # ---------------------------------------------------------------------------
+# Client-key rate limiting.
+#   backend = "local"  one token bucket per process (default, unchanged)
+#   backend = "redis"  the bucket lives in Redis (atomic Lua bucket), so every
+#                      gateway instance behind the same server shares one budget.
+# `redis_url` is `redis://[user:pass@]host:port/db` (percent-encoded password);
+# TLS is terminated by stunnel/a sidecar — only redis:// is spoken.
+# `fail_open` decides what happens while Redis is unreachable: true = allow
+# (limit degraded to fail-open), false = deny with Retry-After: 1.
+# ---------------------------------------------------------------------------
+# [ratelimit]
+# backend = "redis"
+# redis_url = "redis://:s3cr3t@127.0.0.1:6379/0"
+# key_prefix = "anyhop"
+# fail_open = true
+# timeout_ms = 50
+
+# ---------------------------------------------------------------------------
 # Tuning: every timing/limit that used to be a hardcoded constant.
 # All fields are optional; the values below are the defaults.
 # ---------------------------------------------------------------------------
@@ -108,3 +125,4 @@ token_refresh_window_secs = 300   # refresh this early (0 = on expiry)
 ui_refresh_secs = 3               # dashboard live-view poll
 sse_keepalive_secs = 15           # SSE ping interval
 quota_cache_ttl_secs = 60         # per-account quota snapshot reuse
+response_store_max = 1000         # /v1/responses store size (0 = no previous_response_id)

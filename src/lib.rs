@@ -15,6 +15,7 @@ pub mod codex;
 pub mod config;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
+pub mod distributed;
 pub mod events;
 pub mod fim;
 pub mod gemini;
@@ -28,6 +29,7 @@ pub mod scan;
 pub mod sse;
 pub mod storage;
 pub mod tls;
+pub mod ws;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -187,7 +189,8 @@ async fn async_main() -> anyhow::Result<()> {
     // reload_config already does full replacement — startup now matches.
     let mut client_keys_map = std::collections::HashMap::new();
     for k in cfg.client_keys.clone() {
-        client_keys_map.insert(k.key.clone(), Arc::new(proxy::ClientKeyRuntime::new(k)));
+        let runtime = proxy::ClientKeyRuntime::new_with(k.clone(), &cfg.ratelimit);
+        client_keys_map.insert(k.key.clone(), Arc::new(runtime));
     }
 
     let mut disabled_models_set = std::collections::HashSet::new();
@@ -211,6 +214,7 @@ async fn async_main() -> anyhow::Result<()> {
             auth_fail_window: Duration::from_secs(cfg.server.auth_fail_window_secs),
             client_key_max_concurrent: cfg.server.client_key_max_concurrent,
             tls_enabled: cfg.server.tls_cert.is_some(),
+            ratelimit: cfg.ratelimit.clone(),
         }),
         storage: storage.clone(),
         config_path: config_path.clone(),
@@ -330,6 +334,7 @@ pub fn reload_config(state: &Arc<proxy::AppState>) -> anyhow::Result<usize> {
         auth_fail_window: Duration::from_secs(cfg.server.auth_fail_window_secs),
         client_key_max_concurrent: cfg.server.client_key_max_concurrent,
         tls_enabled: cfg.server.tls_cert.is_some(),
+        ratelimit: cfg.ratelimit.clone(),
     };
     state.events.set_cap(cfg.server.events_history);
     // Full replacement, not a merge: keys/models removed from the config must disappear.
@@ -342,8 +347,8 @@ pub fn reload_config(state: &Arc<proxy::AppState>) -> anyhow::Result<usize> {
         ck.clear();
         for k in &cfg.client_keys {
             let runtime = match prev.get(&k.key) {
-                Some(old) => Arc::new(old.rebind(k.clone())),
-                None => Arc::new(proxy::ClientKeyRuntime::new(k.clone())),
+                Some(old) => Arc::new(old.rebind(k.clone(), &cfg.ratelimit)),
+                None => Arc::new(proxy::ClientKeyRuntime::new_with(k.clone(), &cfg.ratelimit)),
             };
             ck.insert(k.key.clone(), runtime);
         }
@@ -434,6 +439,23 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
         .route("/v1/models/{*id}", get(proxy::get_model))
         .route("/v1/embeddings", post(proxy::embeddings))
         .route("/v1/responses", post(proxy::responses::responses))
+        // Pass-through media: the provider must declare the capability.
+        .route(
+            "/v1/images/generations",
+            post(proxy::media::images_generations),
+        )
+        .route("/v1/images/edits", post(proxy::media::images_edits))
+        .route("/v1/audio/speech", post(proxy::media::audio_speech))
+        .route(
+            "/v1/audio/transcriptions",
+            post(proxy::media::audio_transcriptions),
+        )
+        .route(
+            "/v1/audio/translations",
+            post(proxy::media::audio_translations),
+        )
+        // WebSocket upgrade; the handler hijacks the connection itself.
+        .route("/v1/realtime", get(proxy::realtime::realtime))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::require_api_key,

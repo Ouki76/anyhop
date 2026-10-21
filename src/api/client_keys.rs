@@ -179,7 +179,12 @@ pub async fn client_key_add(
         max_concurrent: body.max_concurrent,
     };
 
-    let runtime = Arc::new(crate::proxy::ClientKeyRuntime::new(client_key.clone()));
+    // New keys follow the live [ratelimit] backend like the ones loaded from TOML.
+    let ratelimit = state.rt().ratelimit;
+    let runtime = Arc::new(crate::proxy::ClientKeyRuntime::new_with(
+        client_key.clone(),
+        &ratelimit,
+    ));
     {
         let mut map = ck_write(&state);
         if map.contains_key(&key_str) {
@@ -228,6 +233,8 @@ pub async fn client_key_update(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateClientKey>,
 ) -> ApiResult {
+    // Snapshot before taking the map lock (no lock nesting with `cfg`).
+    let ratelimit = state.rt().ratelimit;
     let updated = {
         let mut map = ck_write(&state);
         let Some(prev) = map.get(&body.key).cloned() else {
@@ -247,7 +254,7 @@ pub async fn client_key_update(
             cfg.burst = burst;
         }
         // rebind keeps the live bucket when the limits did not change.
-        let rt = Arc::new(prev.rebind(cfg));
+        let rt = Arc::new(prev.rebind(cfg, &ratelimit));
         map.insert(body.key.clone(), rt.clone());
         rt
     };

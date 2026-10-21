@@ -1,15 +1,17 @@
 //! POST /v1/responses — the OpenAI Responses API, served by the chat pipeline.
 //!
-//! Scope is text in / text out. There is no response store, so
-//! `previous_response_id` cannot work, and tool calling / reasoning knobs /
-//! structured-output formats are not wired through the translating providers.
-//! Those are refused by name instead of dropped: a silently ignored `tools`
-//! array looks to the user like a model that decided not to call a function,
-//! which is far harder to debug than a 400.
+//! Scope is text in / text out. A small response store (kept in the state file,
+//! bounded by `[tuning] response_store_max`) makes `previous_response_id` work:
+//! the stored turn's input messages and its assistant reply are prepended to the
+//! new conversation. Tool calling / reasoning knobs / structured-output formats
+//! are not wired through the translating providers, and are refused by name
+//! instead of dropped: a silently ignored `tools` array looks to the user like a
+//! model that decided not to call a function, which is far harder to debug than
+//! a 400.
 //!
 //! The mapping itself is kept in pure functions (`to_chat_request`,
-//! `response_object`, `StreamMapper`) so the translation rules and the SSE event
-//! sequence are unit-testable without a provider.
+//! `replay_history`, `response_object`, `StreamMapper`) so the translation rules
+//! and the SSE event sequence are unit-testable without a provider.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -26,6 +28,7 @@ use tracing::{debug, info};
 
 use crate::providers::{Provider, ProviderRouter, Resolved};
 use crate::sse::SseParser;
+use crate::storage::{Storage, StoredResponse};
 
 use super::{
     AppState, KeyPermissions, combo_allowed, error_response, model_allowed, model_disabled,
@@ -52,10 +55,26 @@ pub async fn responses(
             );
         }
     };
-    let chat = match to_chat_request(&req) {
+    // No state file or a zero cap both mean "off", and `previous_response_id` is
+    // then refused rather than ignored (see `resolve_previous`).
+    let store_max = state.tuning.response_store_max;
+    let storage = state.storage.as_ref().filter(|_| store_max > 0);
+    if let Some(s) = storage {
+        // The writer task owns eviction but cannot see `Tuning`: hand it the cap
+        // (one relaxed store) and let it do the work on its own thread.
+        s.set_response_max(store_max);
+    }
+    let previous = match resolve_previous(&req, storage, store_max) {
+        Ok(p) => p,
+        Err((status, message)) => return error_response(status, message, "invalid_request_error"),
+    };
+    let mut chat = match to_chat_request(&req) {
         Ok(v) => v,
         Err((status, message)) => return error_response(status, message, "invalid_request_error"),
     };
+    if let Some(prev) = &previous {
+        replay_history(&mut chat, prev);
+    }
     // `to_chat_request` always sets both fields.
     let model = chat
         .get("model")
@@ -75,16 +94,120 @@ pub async fn responses(
         Err((status, message, ty)) => return error_response(status, message, ty),
     };
 
-    let resp = serve_targets(&state, &targets, &model, &chat, is_stream).await;
+    let (resp, provider) = serve_targets(&state, &targets, &model, &chat, is_stream).await;
     if !resp.status().is_success() {
         // `run_target`/`error_response` already produced an OpenAI-shaped error.
         return resp;
     }
+    let ctx = ResponseContext {
+        input: chat
+            .get("messages")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+        model,
+        provider,
+        previous_response_id: previous.as_ref().map(|p| p.id.clone()),
+        storage: storage.cloned(),
+    };
     if is_stream {
-        sse_response(resp, &model)
+        sse_response(resp, ctx)
     } else {
-        non_stream_response(resp, &model).await
+        non_stream_response(resp, &ctx).await
     }
+}
+
+/// What a finished response must remember: the request that produced it, so a
+/// follow-up can replay the conversation, plus the store it belongs in.
+struct ResponseContext {
+    /// The translated chat messages that were sent upstream.
+    input: Value,
+    model: String,
+    /// Provider that answered (combo fallback aware).
+    provider: String,
+    /// The id this response continues, echoed back to the client.
+    previous_response_id: Option<String>,
+    /// `None` when the feature is off (no state file, or a zero cap).
+    storage: Option<Storage>,
+}
+
+impl ResponseContext {
+    /// Keep a completed response so the next turn can chain to it. Silent no-op
+    /// when the store is off — the client just sees `previous_response_id: null`.
+    fn persist(&self, id: &str, created_at: u64, text: &str, usage: (u64, u64)) {
+        let Some(storage) = &self.storage else {
+            return;
+        };
+        let (input_tokens, output_tokens) = usage;
+        storage.save_response(
+            id,
+            StoredResponse {
+                id: id.to_string(),
+                created_at,
+                model: self.model.clone(),
+                provider: self.provider.clone(),
+                input: self.input.clone(),
+                output_text: text.to_string(),
+                usage: Some(json!({
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
+                })),
+            },
+        );
+    }
+}
+
+/// Resolve `previous_response_id` into the record a follow-up replays.
+///
+/// `Ok(None)` means "this request starts a conversation". `Err` carries the
+/// exact 400 the client gets, so both the "store is off" and the "unknown id"
+/// rules are assertable without building an `AppState`.
+fn resolve_previous(
+    v: &Value,
+    storage: Option<&Storage>,
+    store_max: usize,
+) -> Result<Option<StoredResponse>, (StatusCode, String)> {
+    let id = match v.get("previous_response_id") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+        Some(_) => return Err(bad_request("'previous_response_id' must be a string")),
+    };
+    // Answering statelessly instead would hand the client a fresh conversation
+    // while it believes it is continuing one.
+    let Some(storage) = storage.filter(|_| store_max > 0) else {
+        return Err(bad_request(
+            "'previous_response_id' is not supported: response storage is disabled \
+             (set [server] state_file and a non-zero [tuning] response_store_max)",
+        ));
+    };
+    match storage.load_response(&id) {
+        Some(rec) => Ok(Some(rec)),
+        None => Err(bad_request(format!(
+            "'previous_response_id' '{id}' is unknown or expired"
+        ))),
+    }
+}
+
+/// Prepend a stored turn to a freshly translated chat request: its original
+/// input messages, then the assistant reply it ended with, then the new turn.
+///
+/// The stored input already contains whatever `instructions` the original call
+/// carried (they were translated into a system message), so a changed
+/// `instructions` on the follow-up arrives as a later system turn — which every
+/// translating provider hoists back to a system prompt anyway.
+fn replay_history(chat: &mut Value, prev: &StoredResponse) {
+    let mut messages: Vec<Value> = Vec::new();
+    match &prev.input {
+        Value::Array(items) => messages.extend(items.iter().cloned()),
+        // Defensive: keeps a record with an unexpected shape replayable.
+        Value::String(s) => messages.push(user_message(s)),
+        _ => {}
+    }
+    messages.push(json!({"role": "assistant", "content": prev.output_text}));
+    if let Some(new) = chat.get("messages").and_then(Value::as_array) {
+        messages.extend(new.iter().cloned());
+    }
+    chat["messages"] = Value::Array(messages);
 }
 
 // ---------------------------------------------------------------------------
@@ -183,14 +306,15 @@ fn resolve_targets<'a>(
 }
 
 /// Walk the resolved targets until one answers, with the same combo fallback and
-/// 503 semantics as the chat endpoint.
+/// 503 semantics as the chat endpoint. Also reports which provider answered, so
+/// the response store can record it.
 async fn serve_targets(
     state: &AppState,
     targets: &[(&Provider, String)],
     model: &str,
     chat: &Value,
     is_stream: bool,
-) -> Response {
+) -> (Response, String) {
     let total = targets.len();
     for (i, (provider, upstream_model)) in targets.iter().enumerate() {
         let result = run_target_pub(state, provider, upstream_model, chat, is_stream).await;
@@ -198,7 +322,7 @@ async fn serve_targets(
             if total > 1 && i > 0 {
                 info!(combo = %model, fallback = i + 1, of = total, "combo fallback succeeded");
             }
-            return resp;
+            return (resp, provider.name.clone());
         }
         if total > 1 {
             state.events.emit(crate::events::DashEvent::new(
@@ -211,13 +335,17 @@ async fn serve_targets(
                 ),
             ));
         } else {
-            return exhausted_response(provider, model, state.rt().max_retries);
+            let resp = exhausted_response(provider, model, state.rt().max_retries);
+            return (resp, provider.name.clone());
         }
     }
-    error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        format!("combo '{model}': all {total} targets exhausted"),
-        "provider_unavailable",
+    (
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("combo '{model}': all {total} targets exhausted"),
+            "provider_unavailable",
+        ),
+        String::new(),
     )
 }
 
@@ -265,14 +393,9 @@ fn to_chat_request(v: &Value) -> Result<Value, (StatusCode, String)> {
         .ok_or_else(|| bad_request("missing or invalid 'model' field"))?
         .to_string();
 
-    // Reject what we cannot honour, by name. Dropping `tools` (or accepting
-    // `previous_response_id` and answering statelessly) would silently change the
-    // meaning of the request.
-    if v.get("previous_response_id").is_some_and(|x| !x.is_null()) {
-        return Err(bad_request(
-            "'previous_response_id' is not supported: this gateway keeps no response store",
-        ));
-    }
+    // Reject what we cannot honour, by name. Dropping `tools` would silently
+    // change the meaning of the request; `previous_response_id` is resolved (and
+    // replayed) by the handler, so it is not this function's business.
     if let Some(tools) = v.get("tools")
         && !is_inert_array(tools)
     {
@@ -527,6 +650,7 @@ fn response_object(
     item_id: &str,
     text: &str,
     usage: (u64, u64),
+    previous_response_id: Option<&str>,
 ) -> Value {
     let (input_tokens, output_tokens) = usage;
     json!({
@@ -535,6 +659,9 @@ fn response_object(
         "created_at": created_at,
         "status": "completed",
         "model": model,
+        // The turn this one continues, exactly as the client sent it (null for a
+        // fresh conversation), so a client can chain without bookkeeping.
+        "previous_response_id": previous_response_id,
         "output": [{
             "type": "message",
             "id": item_id,
@@ -552,7 +679,7 @@ fn response_object(
     })
 }
 
-async fn non_stream_response(resp: Response, model: &str) -> Response {
+async fn non_stream_response(resp: Response, ctx: &ResponseContext) -> Response {
     let bytes = match axum::body::to_bytes(resp.into_body(), MAX_UPSTREAM_BODY).await {
         Ok(b) => b,
         Err(e) => {
@@ -574,13 +701,19 @@ async fn non_stream_response(resp: Response, model: &str) -> Response {
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let id = random_id("resp_");
+    let created_at = unix_now();
+    let usage = usage_pair(&chat);
+    // Batched write: the client is not made to wait for the state file.
+    ctx.persist(&id, created_at, text, usage);
     Json(response_object(
-        &random_id("resp_"),
-        unix_now(),
-        model,
+        &id,
+        created_at,
+        &ctx.model,
         &random_id("msg_"),
         text,
-        usage_pair(&chat),
+        usage,
+        ctx.previous_response_id.as_deref(),
     ))
     .into_response()
 }
@@ -611,6 +744,8 @@ struct StreamMapper {
     item_id: String,
     model: String,
     created_at: u64,
+    /// Echoed in every snapshot of the response object.
+    previous_response_id: Option<String>,
     text: String,
     usage: (u64, u64),
     /// `output_item.added` is emitted lazily, right before the first delta.
@@ -618,20 +753,25 @@ struct StreamMapper {
     /// Set once the terminal event was sent, so `[DONE]` followed by EOF (the
     /// normal case) cannot complete the response twice.
     completed: bool,
+    /// True when the terminal event was `response.completed` (not `failed`):
+    /// only then is there a response worth storing.
+    ok: bool,
     sequence: u64,
 }
 
 impl StreamMapper {
-    fn new(model: String) -> Self {
+    fn new(model: String, previous_response_id: Option<String>) -> Self {
         Self {
             resp_id: random_id("resp_"),
             item_id: random_id("msg_"),
             model,
             created_at: unix_now(),
+            previous_response_id,
             text: String::new(),
             usage: (0, 0),
             item_added: false,
             completed: false,
+            ok: false,
             sequence: 0,
         }
     }
@@ -655,6 +795,7 @@ impl StreamMapper {
             "created_at": self.created_at,
             "status": status,
             "model": self.model,
+            "previous_response_id": self.previous_response_id.as_deref(),
             "output": output,
             "usage": {
                 "input_tokens": input_tokens,
@@ -741,6 +882,8 @@ impl StreamMapper {
             return Vec::new();
         }
         self.completed = true;
+        // From here on the reply is real: the relay stores it.
+        self.ok = true;
         let mut out = Vec::new();
         if !self.item_added {
             // An empty completion still owes one output item, otherwise the
@@ -766,6 +909,7 @@ impl StreamMapper {
             &item_id,
             &text,
             self.usage,
+            self.previous_response_id.as_deref(),
         );
         out.push(self.emit("response.completed", json!({"response": resp})));
         out
@@ -796,14 +940,17 @@ struct StreamState {
     mapper: StreamMapper,
     queue: VecDeque<Bytes>,
     ended: bool,
+    /// Where the finished response is stored, and whether that already happened.
+    ctx: ResponseContext,
+    saved: bool,
 }
 
 /// Relay the upstream chat SSE as Responses SSE.
 ///
 /// The key guard lives inside the upstream body, so it keeps the in-flight slot
 /// until this stream is dropped — no extra bookkeeping needed here.
-fn sse_response(resp: Response, model: &str) -> Response {
-    let mut mapper = StreamMapper::new(model.to_string());
+fn sse_response(resp: Response, ctx: ResponseContext) -> Response {
+    let mut mapper = StreamMapper::new(ctx.model.clone(), ctx.previous_response_id.clone());
     let queue: VecDeque<Bytes> = mapper.start().into();
     let state = StreamState {
         upstream: Box::pin(resp.into_body().into_data_stream()),
@@ -811,6 +958,8 @@ fn sse_response(resp: Response, model: &str) -> Response {
         mapper,
         queue,
         ended: false,
+        ctx,
+        saved: false,
     };
 
     // `unfold` with an explicit queue: a single upstream chunk usually yields
@@ -818,6 +967,17 @@ fn sse_response(resp: Response, model: &str) -> Response {
     let stream = futures::stream::unfold(Some(state), |prev| async move {
         let mut st = prev?;
         loop {
+            // Store the reply before its terminal frame leaves: a follow-up may
+            // arrive as soon as the client sees `response.completed`.
+            if st.mapper.ok && !st.saved {
+                st.saved = true;
+                st.ctx.persist(
+                    &st.mapper.resp_id,
+                    st.mapper.created_at,
+                    &st.mapper.text,
+                    st.mapper.usage,
+                );
+            }
             if let Some(frame) = st.queue.pop_front() {
                 return Some((Ok::<Bytes, std::io::Error>(frame), Some(st)));
             }
@@ -864,6 +1024,44 @@ fn sse_response(resp: Response, model: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Context with the store off — what a gateway without a state file builds.
+    fn test_ctx(model: &str, previous: Option<&str>) -> ResponseContext {
+        ResponseContext {
+            input: json!([{"role": "user", "content": "hi"}]),
+            model: model.to_string(),
+            provider: "test".to_string(),
+            previous_response_id: previous.map(str::to_string),
+            storage: None,
+        }
+    }
+
+    /// Unique scratch state file: redb locks the path, so tests must not share one.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "anyhop-responses-{tag}-{}-{nanos}.redb",
+            std::process::id()
+        ))
+    }
+
+    fn stored(id: &str, created_at: u64) -> StoredResponse {
+        StoredResponse {
+            id: id.to_string(),
+            created_at,
+            model: "m".to_string(),
+            provider: "mock".to_string(),
+            input: json!([
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hi"}
+            ]),
+            output_text: "hello".to_string(),
+            usage: None,
+        }
+    }
 
     fn event_names(frames: &[Bytes]) -> Vec<String> {
         frames
@@ -984,10 +1182,6 @@ mod tests {
                 json!({"model": "m", "input": "hi", "text": {"format": {"type": "json_schema"}}}),
                 "text.format",
             ),
-            (
-                json!({"model": "m", "input": "hi", "previous_response_id": "resp_1"}),
-                "previous_response_id",
-            ),
         ];
         for (req, field) in cases {
             let (status, message) = to_chat_request(&req).expect_err("must be rejected");
@@ -1026,6 +1220,227 @@ mod tests {
         assert!(message.contains("input"));
     }
 
+    // ----- previous_response_id (the response store) -----
+
+    #[test]
+    fn replay_prepends_the_original_input_and_the_assistant_output() {
+        let prev = stored("resp_1", 1);
+        let mut chat = to_chat_request(&json!({"model": "m", "input": "again"}))
+            .expect("a plain follow-up translates");
+        replay_history(&mut chat, &prev);
+        assert_eq!(
+            chat["messages"],
+            json!([
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "again"},
+            ])
+        );
+        // Only the messages are touched.
+        assert_eq!(chat["model"], "m");
+    }
+
+    #[test]
+    fn a_follow_up_keeps_its_own_knobs_after_the_replayed_history() {
+        let mut chat = to_chat_request(&json!({
+            "model": "m",
+            "input": "again",
+            "max_output_tokens": 32,
+            "stream": true
+        }))
+        .expect("supported knobs");
+        replay_history(&mut chat, &stored("resp_1", 1));
+        assert_eq!(chat["max_tokens"], 32);
+        assert_eq!(chat["stream"], true);
+        assert_eq!(
+            chat["messages"].as_array().map(Vec::len),
+            Some(4),
+            "history is prepended, not merged"
+        );
+    }
+
+    #[test]
+    fn previous_response_id_without_a_store_is_a_400() {
+        let (status, message) =
+            resolve_previous(&json!({"previous_response_id": "resp_1"}), None, 1000)
+                .expect_err("no store: the id must be refused, not ignored");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("previous_response_id"), "{message}");
+        assert!(
+            message.contains("response storage is disabled"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_null_previous_response_id_starts_a_conversation() {
+        let prev = resolve_previous(&json!({"previous_response_id": null}), None, 1000)
+            .expect("null means 'no previous response'");
+        assert!(prev.is_none());
+    }
+
+    #[test]
+    fn a_non_string_previous_response_id_is_a_400() {
+        let (status, message) = resolve_previous(&json!({"previous_response_id": 7}), None, 1000)
+            .expect_err("an id must be a string");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("previous_response_id"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_stored_response_resolves_and_an_unknown_id_is_a_400() {
+        let path = scratch("resolve");
+        let store = Storage::open(path.to_str().expect("temp path is UTF-8"))
+            .expect("the state file opens");
+        store.set_response_max(10);
+        store.save_response("resp_1", stored("resp_1", 1));
+        store.flush_async().await;
+
+        let prev = resolve_previous(&json!({"previous_response_id": "resp_1"}), Some(&store), 10)
+            .expect("a stored id resolves")
+            .expect("the record comes back");
+        assert_eq!(prev.output_text, "hello");
+
+        let (status, message) = resolve_previous(
+            &json!({"previous_response_id": "resp_gone"}),
+            Some(&store),
+            10,
+        )
+        .expect_err("nothing was stored under that id");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("unknown or expired"), "{message}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_zero_store_cap_refuses_previous_response_id() {
+        let path = scratch("disabled");
+        let store = Storage::open(path.to_str().expect("temp path is UTF-8"))
+            .expect("the state file opens");
+        store.save_response("resp_1", stored("resp_1", 1));
+        store.flush_async().await;
+
+        // The record is still on disk, but the feature is off: refusing is the
+        // only honest answer (a fresh conversation would look like a replay).
+        let (status, message) =
+            resolve_previous(&json!({"previous_response_id": "resp_1"}), Some(&store), 0)
+                .expect_err("a zero cap disables the store");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            message.contains("response storage is disabled"),
+            "{message}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The non-stream handler path end to end: store the reply, get the id back,
+    /// replay it into a follow-up.
+    #[tokio::test]
+    async fn a_non_stream_completion_is_stored_and_replays() {
+        let path = scratch("nonstream");
+        let store = Storage::open(path.to_str().expect("temp path is UTF-8"))
+            .expect("the state file opens");
+        store.set_response_max(10);
+        let ctx = ResponseContext {
+            input: json!([{"role": "user", "content": "hi"}]),
+            model: "m".to_string(),
+            provider: "mock".to_string(),
+            previous_response_id: Some("resp_prev".to_string()),
+            storage: Some(store.clone()),
+        };
+        let upstream = json!({
+            "choices": [{"message": {"role": "assistant", "content": "hello"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        });
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(upstream.to_string()))
+            .expect("an in-memory response is well formed");
+
+        let out = non_stream_response(resp, &ctx).await;
+        let body = axum::body::to_bytes(out.into_body(), 1 << 20)
+            .await
+            .expect("the body collects");
+        let body: Value = serde_json::from_slice(&body).expect("the body is JSON");
+        let id = body["id"]
+            .as_str()
+            .expect("the response has an id")
+            .to_string();
+        assert_eq!(body["previous_response_id"], "resp_prev");
+
+        store.flush_async().await;
+        let rec = store.load_response(&id).expect("the reply was stored");
+        assert_eq!(rec.output_text, "hello");
+        assert_eq!(rec.model, "m");
+        assert_eq!(rec.provider, "mock");
+        assert_eq!(rec.input, json!([{"role": "user", "content": "hi"}]));
+        assert_eq!(
+            rec.usage,
+            Some(json!({"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}))
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same for the streaming path: the reply is stored by the relay, before the
+    /// `response.completed` frame is handed to the client.
+    #[tokio::test]
+    async fn a_streaming_completion_is_stored() {
+        let path = scratch("stream");
+        let store = Storage::open(path.to_str().expect("temp path is UTF-8"))
+            .expect("the state file opens");
+        store.set_response_max(10);
+        let ctx = ResponseContext {
+            input: json!([{"role": "user", "content": "hi"}]),
+            model: "m".to_string(),
+            provider: "mock".to_string(),
+            previous_response_id: None,
+            storage: Some(store.clone()),
+        };
+        let upstream = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            )),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
+        ]);
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(upstream))
+            .expect("an in-memory response is well formed");
+
+        let relayed = sse_response(resp, ctx);
+        let body = axum::body::to_bytes(relayed.into_body(), 1 << 20)
+            .await
+            .expect("the relayed body collects");
+        let text = std::str::from_utf8(&body).expect("frames are UTF-8");
+        let completed = text
+            .split("\n\n")
+            .find(|frame| frame.starts_with("event: response.completed"))
+            .expect("the stream completed");
+        let data = completed
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .expect("the frame carries data");
+        let done: Value = serde_json::from_str(data).expect("the payload is JSON");
+        let id = done["response"]["id"]
+            .as_str()
+            .expect("the response has an id")
+            .to_string();
+        assert_eq!(done["response"]["previous_response_id"], Value::Null);
+
+        store.flush_async().await;
+        let rec = store
+            .load_response(&id)
+            .expect("the streamed reply was stored");
+        assert_eq!(rec.output_text, "Hi");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ----- response shaping -----
 
     #[test]
@@ -1045,12 +1460,15 @@ mod tests {
             "msg_abc",
             text,
             usage_pair(&chat),
+            None,
         );
 
         assert_eq!(out["object"], "response");
         assert_eq!(out["status"], "completed");
         assert_eq!(out["id"], "resp_abc");
         assert_eq!(out["model"], "m");
+        // A fresh conversation says so explicitly rather than omitting the field.
+        assert_eq!(out["previous_response_id"], Value::Null);
         assert_eq!(out["output_text"], "Hi there");
         assert_eq!(out["output"][0]["type"], "message");
         assert_eq!(out["output"][0]["role"], "assistant");
@@ -1069,7 +1487,7 @@ mod tests {
 
     #[test]
     fn chat_deltas_map_to_responses_sse_events() {
-        let mut mapper = StreamMapper::new("m".to_string());
+        let mut mapper = StreamMapper::new("m".to_string(), None);
         let mut frames = mapper.start();
         // Role-only and empty deltas must not produce text events.
         frames.extend(mapper.feed(br#"{"choices":[{"delta":{"role":"assistant"}}]}"#));
@@ -1123,7 +1541,7 @@ mod tests {
 
     #[test]
     fn eof_without_done_still_completes_once() {
-        let mut mapper = StreamMapper::new("m".to_string());
+        let mut mapper = StreamMapper::new("m".to_string(), None);
         let mut frames = mapper.start();
         frames.extend(mapper.feed(br#"{"choices":[{"delta":{"content":"x"}}]}"#));
         frames.extend(mapper.finish());
@@ -1142,7 +1560,7 @@ mod tests {
 
     #[test]
     fn empty_completion_still_reports_one_item() {
-        let mut mapper = StreamMapper::new("m".to_string());
+        let mut mapper = StreamMapper::new("m".to_string(), None);
         let mut frames = mapper.start();
         frames.extend(mapper.feed(b"[DONE]"));
         assert_eq!(
@@ -1155,6 +1573,32 @@ mod tests {
             ]
         );
         assert_eq!(data_of(&frames[1])["item"]["role"], "assistant");
+    }
+
+    #[test]
+    fn streaming_echoes_previous_response_id_in_every_response_object() {
+        let mut mapper = StreamMapper::new("m".to_string(), Some("resp_prev".to_string()));
+        let mut frames = mapper.start();
+        frames.extend(mapper.feed(br#"{"choices":[{"delta":{"content":"x"}}]}"#));
+        frames.extend(mapper.finish());
+        assert_eq!(
+            data_of(&frames[0])["response"]["previous_response_id"],
+            "resp_prev"
+        );
+        let completed = data_of(frames.last().expect("there is a terminal frame"));
+        assert_eq!(completed["response"]["previous_response_id"], "resp_prev");
+        assert!(mapper.ok, "a completed stream is worth storing");
+    }
+
+    #[test]
+    fn a_failed_stream_is_not_stored() {
+        let mut mapper = StreamMapper::new("m".to_string(), None);
+        let _ = mapper.start();
+        let _ = mapper.feed(br#"{"error":{"message":"boom"}}"#);
+        assert!(mapper.completed);
+        // `response.failed` is terminal but carries no reply: storing it would let
+        // the next turn "continue" a conversation with an empty assistant turn.
+        assert!(!mapper.ok);
     }
 
     /// The async relay (parser + queue + `Body::from_stream`), end to end on an
@@ -1175,7 +1619,7 @@ mod tests {
             .body(Body::from_stream(upstream))
             .expect("in-memory response is well formed");
 
-        let relayed = sse_response(resp, "m");
+        let relayed = sse_response(resp, test_ctx("m", None));
         let body = axum::body::to_bytes(relayed.into_body(), 1 << 20)
             .await
             .expect("relayed body collects");
@@ -1203,7 +1647,7 @@ mod tests {
 
     #[test]
     fn upstream_error_frame_ends_the_stream_as_failed() {
-        let mut mapper = StreamMapper::new("m".to_string());
+        let mut mapper = StreamMapper::new("m".to_string(), None);
         let mut frames = mapper.start();
         frames.extend(mapper.feed(br#"{"error":{"message":"boom","type":"server_error"}}"#));
         assert_eq!(

@@ -42,7 +42,9 @@ def request(method, path, data=None, token=ADMIN_KEY):
 def main():
     print("=== Testing Client Keys and Models Functionality ===")
 
-    test_toml = "test/anyhop.test.toml"
+    # The suite runs against a private copy (see run_all.sh) so parallel runs
+    # cannot corrupt each other; fall back to the checked-in file when run alone.
+    test_toml = os.environ.get("ANYHOP_TEST_CONFIG", "test/anyhop.test.toml")
     with open(test_toml, "r") as f:
         original_toml = f.read()
 
@@ -389,7 +391,7 @@ def run_tests(original_toml):
     tmp = next(p for p in providers if p["name"] == "tmp-prov")
     assert len(tmp["keys"]) == 2, tmp
     # Deleting a key removes it from the live pool and from the config file.
-    toml_before = open("test/anyhop.test.toml").read()
+    toml_before = open(os.environ.get("ANYHOP_TEST_CONFIG", "test/anyhop.test.toml")).read()
     victim = tmp["keys"][0]["id"]
     status, body = request("POST", "/api/keys/delete", {"provider": "tmp-prov", "id": victim})
     assert status == 200, f"key_delete failed: {status} {body}"
@@ -398,7 +400,7 @@ def run_tests(original_toml):
     assert len(tmp["keys"]) == 1 and all(k["id"] != victim for k in tmp["keys"]), tmp
     # Whichever secret went away must be gone from the file too (a reload would
     # otherwise bring it back).
-    toml_after = open("test/anyhop.test.toml").read()
+    toml_after = open(os.environ.get("ANYHOP_TEST_CONFIG", "test/anyhop.test.toml")).read()
     assert toml_after != toml_before, "the config file was not rewritten"
     assert not (("tmp-key-1" in toml_after) and ("tmp-key-2" in toml_after)), "deleted key still in the TOML"
     # The last credential of a provider cannot be deleted (the provider would be
@@ -504,7 +506,7 @@ def run_tests(original_toml):
 
     # 27. Input bounds: a 70 KB "name" must not reach the config file.
     big = "x" * 70_000
-    with open("test/anyhop.test.toml") as f:
+    with open(os.environ.get("ANYHOP_TEST_CONFIG", "test/anyhop.test.toml")) as f:
         before_size = len(f.read())
     assert request("POST", "/api/client-keys/add",
                    {"name": big, "key": "sk-hop-big", "models": []})[0] == 400
@@ -515,7 +517,7 @@ def run_tests(original_toml):
     assert request("POST", "/api/providers/add",
                    {"name": "no-scheme", "kind": "openai_compat", "base_url": "example.com/v1", "key": "k"})[0] == 400
     assert request("POST", "/api/keys/add", {"provider": "mock", "secret": "k" * 9000})[0] == 400
-    with open("test/anyhop.test.toml") as f:
+    with open(os.environ.get("ANYHOP_TEST_CONFIG", "test/anyhop.test.toml")) as f:
         assert len(f.read()) <= before_size + 2048, "config grew from a rejected request"
     print("  ok input bounds (names, urls, secrets)")
 

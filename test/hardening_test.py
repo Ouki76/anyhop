@@ -9,8 +9,10 @@ so they must not poison the shared state.
 Each check starts a throwaway gateway with a temp config, exercises the feature
 and tears it down. Mocks from run_all.sh are already listening on their ports.
 """
+import base64
 import json
 import os
+import struct
 import socket
 import ssl
 import subprocess
@@ -39,6 +41,15 @@ def fail(msg):
     global FAIL
     FAIL += 1
     print(f"  FAIL {msg}")
+
+
+def redis_available():
+    try:
+        with socket.create_connection(("127.0.0.1", REDIS_PORT), timeout=1) as s:
+            s.sendall(b"PING\r\n")
+            return b"PONG" in s.recv(64)
+    except OSError:
+        return False
 
 
 def free_port():
@@ -94,7 +105,7 @@ class Gateway:
             self.proc.kill()
 
 
-def request(port, path, data=None, token=KEY, method=None, timeout=10):
+def request(port, path, data=None, token=KEY, method=None, timeout=10, binary=False):
     url = f"http://127.0.0.1:{port}{path}"
     headers = {"Content-Type": "application/json"}
     if token:
@@ -103,9 +114,11 @@ def request(port, path, data=None, token=KEY, method=None, timeout=10):
     req = urllib.request.Request(url, data=body, headers=headers, method=method or ("GET" if data is None else "POST"))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, r.read().decode()
+            raw = r.read()
+            return r.status, (raw if binary else raw.decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode()
+        raw = e.read()
+        return e.code, (raw if binary else raw.decode("utf-8", "replace"))
 
 
 def check_auth_lockout():
@@ -222,10 +235,15 @@ def check_tls():
 
 
 def check_observability():
-    """Histograms and the new endpoints on a plain instance."""
+    """Histograms, the new endpoints and the response store on one instance."""
     port = free_port()
     cfg = tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False)
+    # The response store lives in the redb state file, so this instance needs one.
+    state_dir = tempfile.mkdtemp()
+    state = os.path.join(state_dir, "state.redb")
     write_config(cfg.name, port, "")
+    raw = open(cfg.name).read().replace('state_file = ""', f'state_file = "{state}"')
+    open(cfg.name, "w").write(raw)
     gw = Gateway(cfg.name, port)
     try:
         if not gw.wait():
@@ -246,6 +264,31 @@ def check_observability():
         else:
             ok("/v1/models/{id} resolves a single model")
 
+        # Response store: a second turn must replay through previous_response_id.
+        status, first = request(port, "/v1/responses", {"model": "mock/test-model", "input": "first turn"})
+        rid = json.loads(first).get("id") if status == 200 else None
+        if not rid:
+            fail(f"response store: first turn failed ({status})")
+        else:
+            status, second = request(
+                port, "/v1/responses",
+                {"model": "mock/test-model", "input": "second turn", "previous_response_id": rid},
+            )
+            if status != 200:
+                fail(f"previous_response_id rejected: {status} {second[:120]}")
+            elif json.loads(second).get("previous_response_id") != rid:
+                fail("previous_response_id was not echoed back")
+            else:
+                ok("previous_response_id replays a stored conversation")
+            status, _ = request(
+                port, "/v1/responses",
+                {"model": "mock/test-model", "input": "x", "previous_response_id": "resp_doesnotexist"},
+            )
+            if status != 400:
+                fail(f"unknown previous_response_id should be 400, got {status}")
+            else:
+                ok("unknown previous_response_id is a 400")
+
         status, body = request(port, "/metrics")
         if status != 200:
             fail(f"/metrics returned {status}")
@@ -258,12 +301,205 @@ def check_observability():
         os.unlink(cfg.name)
 
 
+def check_media_and_realtime():
+    """Images/audio pass-through and the WebSocket realtime proxy, end to end."""
+    port = free_port()
+    cfg = tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False)
+    with open(cfg.name, "w") as f:
+        f.write(
+            f"""[server]
+listen = "127.0.0.1:{port}"
+api_key = "{KEY}"
+state_file = ""
+
+[[providers]]
+name = "media"
+type = "openai_compat"
+base_url = "http://127.0.0.1:9105/v1"
+strategy = "round_robin"
+keys = ["media-key-1"]
+models = ["test-model", "tts-1", "whisper-1", "gpt-image-1"]
+capabilities = ["images", "audio", "realtime"]
+"""
+        )
+    gw = Gateway(cfg.name, port)
+    try:
+        if not gw.wait():
+            fail("media: gateway did not start")
+            return
+
+        status, body = request(port, "/v1/images/generations",
+                               {"model": "media/gpt-image-1", "prompt": "a cat"})
+        data = json.loads(body) if status == 200 else {}
+        if status != 200 or not data.get("data", [{}])[0].get("b64_json"):
+            fail(f"/v1/images/generations returned {status}: {body[:100]}")
+        else:
+            ok("/v1/images/generations relays an image payload")
+
+        # Multipart must be forwarded byte-for-byte (boundary intact).
+        boundary = "----anyhopTestBoundary"
+        mp = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n"
+            f"media/gpt-image-1\r\n--{boundary}\r\nContent-Disposition: form-data; "
+            f"name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n"
+            f"BINARYDATA\r\n--{boundary}--\r\n"
+        ).encode()
+        url = f"http://127.0.0.1:{port}/v1/images/edits"
+        req = urllib.request.Request(
+            url, data=mp,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                     "Authorization": f"Bearer {KEY}"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                echo = json.loads(r.read().decode())
+            if boundary not in echo.get("echo_content_type", ""):
+                fail(f"multipart boundary lost: {echo.get('echo_content_type')}")
+            else:
+                ok("/v1/images/edits forwards multipart untouched")
+        except urllib.error.HTTPError as e:
+            fail(f"/v1/images/edits returned {e.code}")
+
+        status, audio = request(
+            port, "/v1/audio/speech",
+            {"model": "media/tts-1", "input": "hi", "voice": "alloy"}, binary=True,
+        )
+        if status != 200:
+            fail(f"/v1/audio/speech returned {status}")
+        elif not isinstance(audio, bytes) or len(audio) < 10:
+            fail("/v1/audio/speech returned no audio")
+        else:
+            ok(f"/v1/audio/speech relays {len(audio)} bytes of audio")
+
+        # Capability gating: a provider without the capability must refuse, not mis-route.
+        status, body = request(port, "/v1/images/generations",
+                               {"model": "media/test-model", "prompt": "x"})
+        # media declares images, so this succeeds; the refusal case is exercised in unit tests.
+
+        # WebSocket realtime through the gateway.
+        try:
+            reply = ws_roundtrip(port, "/v1/realtime?model=media/test-model")
+            if reply.get("type") == "session.created" and reply.get("key") == "media-key-1":
+                ok("/v1/realtime upgrades, forwards to the provider and streams back")
+            else:
+                fail(f"realtime: unexpected first frame {reply}")
+        except Exception as e:  # noqa: BLE001
+            fail(f"realtime: {e}")
+    finally:
+        gw.stop()
+        os.unlink(cfg.name)
+
+
+def ws_roundtrip(port, path):
+    """Minimal WS client: handshake, send one text frame, read one back."""
+    key = base64.b64encode(os.urandom(16)).decode()
+    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    req = (
+        f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
+        f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+        f"Authorization: Bearer {KEY}\r\n\r\n"
+    )
+    sock.sendall(req.encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("connection closed during handshake")
+        head += chunk
+    if b"101" not in head.split(b"\r\n")[0]:
+        raise RuntimeError(f"no upgrade: {head.split(chr(13).encode())[0]}")
+    frame = read_ws_frame(sock)
+    sock.close()
+    return json.loads(frame.decode())
+
+
+def read_ws_frame(sock):
+    header = sock.recv(2)
+    if len(header) < 2:
+        raise RuntimeError("no frame")
+    opcode = header[0] & 0x0F
+    length = header[1] & 0x7F
+    if length == 126:
+        length = struct.unpack(">H", sock.recv(2))[0]
+    elif length == 127:
+        length = struct.unpack(">Q", sock.recv(8))[0]
+    data = b""
+    while len(data) < length:
+        chunk = sock.recv(length - len(data))
+        if not chunk:
+            break
+        data += chunk
+    if opcode == 8:
+        raise RuntimeError("server closed the connection")
+    return data
+
+
+REDIS_PORT = 6399
+
+
+def check_multi_instance():
+    """Two gateway processes must share one rate-limit budget through Redis."""
+    # Fresh key per run: the Redis bucket outlives this process.
+    key = f"sk-hop-shared-{os.urandom(4).hex()}"
+    port_a, port_b = free_port(), free_port()
+    cfgs = []
+    gws = []
+    try:
+        for port in (port_a, port_b):
+            cfg = tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False)
+            write_config(cfg.name, port, "")
+            raw = open(cfg.name).read()
+            # Client keys live in the config file, so instances that must share
+            # one key declare it there (the deployment model: same file content,
+            # per-instance listen). The limit itself is shared through Redis.
+            raw += (
+                f'\n[ratelimit]\nbackend = "redis"\n'
+                f'redis_url = "redis://127.0.0.1:{REDIS_PORT}/0"\nfail_open = false\n'
+                f'\n[[client_keys]]\nkey = "{key}"\nname = "shared"\n'
+                'rpm = 3\nburst = 3\n'
+            )
+            open(cfg.name, "w").write(raw)
+            cfgs.append(cfg.name)
+            gw = Gateway(cfg.name, port)
+            gws.append(gw)
+            if not gw.wait():
+                fail("multi-instance: a gateway did not start")
+                return
+        # The key is declared in both configs with rpm=3; requests alternate
+        # between the two processes and must share that budget.
+        codes = []
+        for i in range(6):
+            port = port_a if i % 2 == 0 else port_b
+            status, _ = request(
+                port, "/v1/chat/completions",
+                {"model": "mock/test-model", "messages": [{"role": "user", "content": "hi"}]},
+                token=key,
+            )
+            codes.append(status)
+        allowed = codes.count(200)
+        if allowed != 3 or 429 not in codes:
+            fail(f"multi-instance: budget not shared, codes={codes}")
+        else:
+            ok(f"two instances share one Redis budget (codes={codes})")
+    finally:
+        for gw in gws:
+            gw.stop()
+        for c in cfgs:
+            os.unlink(c)
+
+
 def main():
     print("== hardening (own gateway instances) ==")
     check_tls()
     check_auth_lockout()
     check_per_key_concurrency()
     check_observability()
+    check_media_and_realtime()
+    if redis_available():
+        check_multi_instance()
+    else:
+        print("  skip multi-instance (fake redis not running on 6399)")
     print(f"HARDENING PASS={PASS} FAIL={FAIL}")
     return 0 if FAIL == 0 else 1
 

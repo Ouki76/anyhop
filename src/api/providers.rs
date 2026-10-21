@@ -30,6 +30,10 @@ pub struct ProviderDto {
     /// Per-provider overrides of the global attempt budget.
     timeout_secs: u64,
     max_retries: usize,
+    /// Pass-through endpoints this provider declared (`images`, `audio`,
+    /// `realtime`). Read-only here: they are edited in the TOML or through
+    /// `POST /api/providers/update`, and the dashboard only displays them.
+    capabilities: Vec<String>,
 }
 
 pub async fn providers(State(state): State<Arc<AppState>>) -> Response {
@@ -64,6 +68,7 @@ pub async fn providers(State(state): State<Arc<AppState>>) -> Response {
             oauth: matches!(p.kind, ProviderKind::Antigravity | ProviderKind::Codex),
             timeout_secs: p.timeout.as_secs(),
             max_retries: p.max_retries,
+            capabilities: p.capabilities.clone(),
         })
         .collect();
     Json(data).into_response()

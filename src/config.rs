@@ -18,6 +18,39 @@ pub struct Config {
     /// Runtime knobs that used to be hardcoded constants.
     #[serde(default)]
     pub tuning: Tuning,
+    /// Where client-key limits are enforced.
+    #[serde(default)]
+    pub ratelimit: RateLimitConfig,
+}
+
+/// Client-key rate limiting backend.
+///
+/// `local` keeps token buckets in this process (single instance). `redis` shares
+/// them through Redis over RESP, so N instances enforce one budget.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RateLimitConfig {
+    pub backend: String,
+    /// `redis://[user:pass@]host:port/db` (redis:// only; TLS via stunnel).
+    pub redis_url: String,
+    /// Prefix for every key written to Redis.
+    pub key_prefix: String,
+    /// Fail open (allow) or closed (deny) when Redis is unreachable.
+    pub fail_open: bool,
+    /// Per-command timeout.
+    pub timeout_ms: u64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            backend: "local".to_string(),
+            redis_url: "redis://127.0.0.1:6379/0".to_string(),
+            key_prefix: "anyhop".to_string(),
+            fail_open: true,
+            timeout_ms: 50,
+        }
+    }
 }
 
 /// Operationally interesting timings and limits.
@@ -41,7 +74,13 @@ pub struct Tuning {
     pub connect_timeout_secs: u64,
     /// Timeout for side calls (model listing, quota probes).
     pub meta_timeout_secs: u64,
-    /// Sticky sessions: how long a conversation stays on one key.
+    /// Sticky routing mode:
+    /// * `hash` (default) — rendezvous hashing over the live key set. No shared
+    ///   state, so N instances route the same conversation to the same key.
+    /// * `map` — per-process session→key map with the TTL below; only correct
+    ///   with a single instance.
+    pub sticky_mode: String,
+    /// Sticky sessions: how long a conversation stays on one key (`map` mode).
     pub sticky_ttl_secs: u64,
     /// Sticky session map size before eviction.
     pub sticky_max_entries: usize,
@@ -61,6 +100,10 @@ pub struct Tuning {
     pub sse_keepalive_secs: u64,
     /// How long the per-account quota snapshot is reused.
     pub quota_cache_ttl_secs: u64,
+    /// Responses API store size: how many `resp_*` records are kept so a
+    /// follow-up can chain with `previous_response_id`. The oldest are evicted
+    /// first; 0 disables the store (and `previous_response_id` is refused).
+    pub response_store_max: usize,
 }
 
 impl Default for Tuning {
@@ -73,6 +116,7 @@ impl Default for Tuning {
             models_cache_ttl_secs: 600,
             connect_timeout_secs: 10,
             meta_timeout_secs: 10,
+            sticky_mode: "hash".to_string(),
             sticky_ttl_secs: 1800,
             sticky_max_entries: 10_000,
             session_prefix_bytes: 4096,
@@ -83,6 +127,7 @@ impl Default for Tuning {
             ui_refresh_secs: 3,
             sse_keepalive_secs: 15,
             quota_cache_ttl_secs: 60,
+            response_store_max: 1000,
         }
     }
 }
@@ -160,6 +205,10 @@ impl Tuning {
             "tuning.meta_timeout_secs must be between 1 and 300"
         );
         anyhow::ensure!(
+            matches!(self.sticky_mode.as_str(), "hash" | "map"),
+            "tuning.sticky_mode must be \"hash\" or \"map\""
+        );
+        anyhow::ensure!(
             (1..=86_400).contains(&self.sticky_ttl_secs),
             "tuning.sticky_ttl_secs must be between 1 and 86400"
         );
@@ -198,6 +247,10 @@ impl Tuning {
         anyhow::ensure!(
             (1..=86_400).contains(&self.quota_cache_ttl_secs),
             "tuning.quota_cache_ttl_secs must be between 1 and 86400"
+        );
+        anyhow::ensure!(
+            self.response_store_max <= 100_000,
+            "tuning.response_store_max must be between 0 and 100000"
         );
         Ok(())
     }
@@ -248,6 +301,34 @@ impl Config {
             );
         }
         self.tuning.validate()?;
+        anyhow::ensure!(
+            matches!(self.ratelimit.backend.as_str(), "local" | "redis"),
+            "ratelimit.backend must be \"local\" or \"redis\""
+        );
+        if self.ratelimit.backend == "redis" {
+            anyhow::ensure!(
+                self.ratelimit.redis_url.starts_with("redis://"),
+                "ratelimit.redis_url must start with redis://"
+            );
+            anyhow::ensure!(
+                (1..=5_000).contains(&self.ratelimit.timeout_ms),
+                "ratelimit.timeout_ms must be between 1 and 5000"
+            );
+        }
+        for p in &self.providers {
+            for cap in &p.capabilities {
+                anyhow::ensure!(
+                    matches!(cap.as_str(), "images" | "audio" | "realtime"),
+                    "provider '{}': unknown capability '{cap}' (images|audio|realtime)",
+                    p.name
+                );
+            }
+            anyhow::ensure!(
+                p.capabilities.is_empty() || matches!(p.kind, ProviderKind::OpenaiCompat),
+                "provider '{}': capabilities are only supported for openai_compat providers",
+                p.name
+            );
+        }
         anyhow::ensure!(
             !self.server.listen.trim().is_empty(),
             "server.listen is empty"
@@ -555,6 +636,10 @@ pub struct ProviderConfig {
     /// Per-provider attempt budget; falls back to `[server] max_retries`.
     #[serde(default)]
     pub max_retries: Option<usize>,
+    /// Optional pass-through endpoints this provider serves: "images", "audio",
+    /// "realtime". Empty = chat/completions/embeddings only.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

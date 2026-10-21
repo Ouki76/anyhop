@@ -17,6 +17,9 @@ pub struct AddProvider {
     name: Option<String>,
     base_url: Option<String>,
     key: Option<String>,
+    /// Pass-through endpoints this provider serves (`images`, `audio`,
+    /// `realtime`). Only valid for `openai_compat`, same rule as the TOML.
+    capabilities: Option<Vec<String>>,
 }
 
 /// POST /api/providers/add — append a key-based provider to the config.
@@ -44,6 +47,24 @@ pub async fn provider_add(
         && let Err((_, msg)) = super::validate_name("provider", n)
     {
         return Err(ApiError::bad_request(msg));
+    }
+    // Same rules as the TOML (`config::Config::validate`): a known capability
+    // name, and only on openai_compat. Checking before the write keeps a bad
+    // request from leaving a config behind that the next reload would refuse.
+    if let Some(caps) = &body.capabilities {
+        if let Some(bad) = caps
+            .iter()
+            .find(|c| !matches!(c.as_str(), "images" | "audio" | "realtime"))
+        {
+            return Err(ApiError::bad_request(format!(
+                "unknown capability '{bad}' (images|audio|realtime)"
+            )));
+        }
+        if !caps.is_empty() && body.kind != "openai_compat" {
+            return Err(ApiError::bad_request(
+                "capabilities are only supported for openai_compat providers",
+            ));
+        }
     }
     if let Some(u) = body
         .base_url
@@ -128,6 +149,15 @@ pub async fn provider_add(
         keys.push(k);
         t["keys"] = toml_edit::value(keys);
     }
+    // An empty list is the default (no pass-through endpoints) — omit the key
+    // instead of writing `capabilities = []` noise into the operator's file.
+    if let Some(caps) = body.capabilities.as_ref().filter(|c| !c.is_empty()) {
+        let mut array = toml_edit::Array::new();
+        for cap in caps {
+            array.push(cap.as_str());
+        }
+        t["capabilities"] = toml_edit::value(array);
+    }
     arr.push(t);
 
     if let Err(e) = crate::config::write_atomic(&state.config_path, &doc.to_string()) {
@@ -160,6 +190,9 @@ pub struct UpdateProvider {
     /// Per-provider attempt budget (overrides `[server]`).
     timeout_secs: Option<u64>,
     max_retries: Option<usize>,
+    /// Pass-through endpoints (`images`, `audio`, `realtime`). An empty list
+    /// removes the key; `null`/absent leaves it untouched.
+    capabilities: Option<Vec<String>>,
 }
 
 /// POST /api/providers/update — edit the mutable settings of one provider.
@@ -260,6 +293,21 @@ pub async fn provider_update(
                 p["proxy"] = toml_edit::value(proxy);
             }
         }
+    }
+
+    if let Some(caps) = body.capabilities.as_ref() {
+        if caps.is_empty() {
+            p.remove("capabilities");
+        } else {
+            let mut array = toml_edit::Array::new();
+            for cap in caps {
+                array.push(cap.as_str());
+            }
+            p["capabilities"] = toml_edit::value(array);
+        }
+        // No name/kind check here: `write_validated` re-parses the whole file
+        // through `Config::validate`, which rejects an unknown capability or one
+        // on a non-openai_compat provider — and nothing is written in that case.
     }
 
     if let Err(resp) = write_validated(&state, &doc).await {

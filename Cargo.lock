@@ -23,6 +23,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "hex",
+ "hyper",
  "memchr",
  "mimalloc",
  "mime_guess",

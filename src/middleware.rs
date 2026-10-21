@@ -154,12 +154,17 @@ pub async fn require_api_key(
     if let Some(ck) = client_key_info {
         // Per-key rate limit. Enforced after authentication (so an unauthorised
         // caller cannot probe limits) and before the request touches an upstream.
-        if let Some(limiter) = &ck.limiter
-            && let Err(retry_after) = limiter.try_take()
-        {
+        // `shared` is the configured backend (`local` bucket or Redis, so N
+        // instances share one budget); the per-process bucket stays as the
+        // fallback when no shared limiter could be built.
+        let limited: Option<u64> = match (&ck.shared, &ck.limiter) {
+            (Some(shared), _) => shared.try_acquire().await.err(),
+            (None, Some(local)) => local.try_take().err().map(|d| d.as_secs().max(1)),
+            (None, None) => None,
+        };
+        if let Some(secs) = limited {
             ck.limited
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let secs = retry_after.as_secs().max(1);
             tracing::debug!(
                 key = %ck.cfg.name.as_deref().unwrap_or("client key"),
                 "rate limited, retry in {secs}s"

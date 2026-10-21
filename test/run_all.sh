@@ -14,16 +14,16 @@ AUTH="Authorization: Bearer test-gw-key"
 CT="Content-Type: application/json"
 
 MOCKS=""
-# The suite mutates the test config through the API (client keys, disabled models)
-# and normally restores it at the end. Snapshot it anyway: a failing or interrupted
-# run must not leave the repo dirty for the next one.
-CFG_SNAPSHOT=$(mktemp)
-cp test/anyhop.test.toml "$CFG_SNAPSHOT"
+# The suite mutates the test config through the API (client keys, disabled models).
+# It works on a private copy: two runs in parallel used to share the file and leak
+# each other's client keys into the "reload removes keys" check.
+CFG=$(mktemp --suffix=.toml)
+cp test/anyhop.test.toml "$CFG"
 
 cleanup() {
     [ -n "${AH_PID:-}" ] && kill "$AH_PID" 2>/dev/null
     for m in $MOCKS; do kill "$m" 2>/dev/null; done
-    [ -f "$CFG_SNAPSHOT" ] && cp "$CFG_SNAPSHOT" test/anyhop.test.toml && rm -f "$CFG_SNAPSHOT"
+    rm -f "$CFG"
 }
 trap cleanup EXIT
 
@@ -31,9 +31,16 @@ for m in mock_upstream mock_gemini mock_antigravity mock_codex mock_anthropic; d
     python3 "test/$m.py" >/dev/null 2>&1 &
     MOCKS="$MOCKS $!"
 done
-# Point the config at the chosen port (restored by the trap on exit).
-sed -i "s|^listen = .*|listen = \"127.0.0.1:$PORT\"|" test/anyhop.test.toml
-ANYHOP_CONFIG=test/anyhop.test.toml "$BIN" > /tmp/anyhop-regress.log 2>&1 &
+# Media/audio/WS provider used by the hardening stage.
+python3 test/mock_media.py 9105 >/dev/null 2>&1 &
+MOCKS="$MOCKS $!"
+# RESP double so the multi-instance rate-limit check needs no real Redis.
+python3 test/mock_redis.py 6399 >/dev/null 2>&1 &
+MOCKS="$MOCKS $!"
+# Point the private config copy at the chosen port.
+sed -i "s|^listen = .*|listen = \"127.0.0.1:$PORT\"|" "$CFG"
+export ANYHOP_TEST_CONFIG="$CFG"
+ANYHOP_CONFIG="$CFG" "$BIN" > /tmp/anyhop-regress.log 2>&1 &
 AH_PID=$!
 sleep 2
 
@@ -132,7 +139,7 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/embeddings" -H "$AUTH" -
 
 echo "== hardening (tls, lockout, concurrency, histograms) =="
 if ANYHOP_BIN="$BIN" timeout 300 python3 test/hardening_test.py; then
-    ok "hardening checks (tls, lockout, concurrency, histograms, responses)"
+    ok "hardening checks (tls, lockout, concurrency, histograms, media, realtime)"
 else
     fail "hardening checks"
 fi

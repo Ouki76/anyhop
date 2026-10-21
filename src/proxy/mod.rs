@@ -4,12 +4,16 @@
 //! - `models` — GET /v1/models
 //! - `chat`   — POST /v1/chat/completions (+ retry/fallback core shared with FIM)
 //! - `embeddings` — POST /v1/embeddings (pass-through or Gemini translation)
+//! - `media`  — POST /v1/images/* and /v1/audio/* (binary pass-through)
+//! - `realtime` — GET /v1/realtime (WebSocket pass-through, capability gated)
 //! - `responses` — POST /v1/responses (OpenAI Responses API over the same pipeline)
 
 mod access;
 mod chat;
 mod embeddings;
+pub mod media;
 mod models;
+pub mod realtime;
 pub mod responses;
 
 pub use access::{combo_allowed, model_allowed, model_disabled};
@@ -45,6 +49,9 @@ pub struct RtConfig {
     pub client_key_max_concurrent: u32,
     /// True when this process serves TLS itself (drives HSTS).
     pub tls_enabled: bool,
+    /// Client-key rate-limit backend (`local` or `redis`), see
+    /// [`crate::distributed`]. Cloned per key on construction/rebind.
+    pub ratelimit: crate::config::RateLimitConfig,
 }
 
 pub struct AppState {
@@ -95,6 +102,10 @@ pub struct AppState {
 pub struct ClientKeyRuntime {
     pub cfg: crate::config::ClientKeyConfig,
     pub limiter: Option<std::sync::Arc<crate::ratelimit::KeyRateLimit>>,
+    /// The configured enforcement path for this key: the local bucket, or a
+    /// bucket shared with every instance through Redis. `None` = unlimited
+    /// (or no bucket could be built, in which case `limiter` is used).
+    pub shared: Option<std::sync::Arc<crate::distributed::SharedLimiter>>,
     /// Requests rejected by the rate limiter (exposed via /metrics).
     pub limited: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// In-flight requests for this key, and the cap (0 = unlimited).
@@ -105,15 +116,24 @@ pub struct ClientKeyRuntime {
 }
 
 impl ClientKeyRuntime {
+    /// Local-backend constructor: the per-process bucket only.
     pub fn new(cfg: crate::config::ClientKeyConfig) -> Self {
-        let limiter = cfg
-            .rpm
-            .and_then(|rpm| crate::ratelimit::KeyRateLimit::new(rpm, cfg.burst.unwrap_or(0)))
-            .map(std::sync::Arc::new);
+        Self::new_with(cfg, &crate::config::RateLimitConfig::default())
+    }
+
+    /// Constructor that honours `[ratelimit]`: with `backend = "redis"` the
+    /// key's tokens live in Redis, so every gateway instance shares one budget.
+    pub fn new_with(
+        cfg: crate::config::ClientKeyConfig,
+        rl: &crate::config::RateLimitConfig,
+    ) -> Self {
+        let limiter = local_bucket(&cfg);
+        let shared = crate::distributed::SharedLimiter::for_key(&cfg, limiter.clone(), rl);
         let max_concurrent = cfg.max_concurrent.unwrap_or(0);
         Self {
             cfg,
             limiter,
+            shared,
             limited: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             in_flight: std::sync::atomic::AtomicU32::new(0),
             max_concurrent,
@@ -123,12 +143,25 @@ impl ClientKeyRuntime {
 
     /// Rebuild for a (possibly edited) config, keeping the live bucket and the
     /// counter when the limits themselves did not change.
-    pub fn rebind(&self, cfg: crate::config::ClientKeyConfig) -> Self {
+    pub fn rebind(
+        &self,
+        cfg: crate::config::ClientKeyConfig,
+        rl: &crate::config::RateLimitConfig,
+    ) -> Self {
         if self.cfg.rpm == cfg.rpm && self.cfg.burst == cfg.burst {
             let max_concurrent = cfg.max_concurrent.unwrap_or(0);
+            let limiter = self.limiter.clone();
+            // Reuse the live limiter when the backend is unchanged, so a reload
+            // keeps the (already connected) Redis pool.
+            let fresh = crate::distributed::SharedLimiter::for_key(&cfg, limiter.clone(), rl);
+            let shared = match (&self.shared, &fresh) {
+                (Some(old), Some(new)) if old.same_config(new) => Some(old.clone()),
+                _ => fresh,
+            };
             Self {
                 cfg,
-                limiter: self.limiter.clone(),
+                limiter,
+                shared,
                 limited: self.limited.clone(),
                 // Keep the live in-flight counter across a config reload, otherwise
                 // requests already in progress would be counted twice.
@@ -139,9 +172,18 @@ impl ClientKeyRuntime {
                 saturated: self.saturated.clone(),
             }
         } else {
-            Self::new(cfg)
+            Self::new_with(cfg, rl)
         }
     }
+}
+
+/// The per-process bucket for a key (`rpm` 0/None = unlimited).
+fn local_bucket(
+    cfg: &crate::config::ClientKeyConfig,
+) -> Option<std::sync::Arc<crate::ratelimit::KeyRateLimit>> {
+    cfg.rpm
+        .and_then(|rpm| crate::ratelimit::KeyRateLimit::new(rpm, cfg.burst.unwrap_or(0)))
+        .map(std::sync::Arc::new)
 }
 
 /// Client key permissions, populated by the auth middleware.
@@ -190,4 +232,83 @@ pub fn error_response(status: StatusCode, message: impl Into<String>, ty: &str) 
         }
     });
     (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(rpm: Option<u32>, burst: Option<u32>) -> crate::config::ClientKeyConfig {
+        crate::config::ClientKeyConfig {
+            key: "sk-wiring".to_string(),
+            name: Some("wiring".to_string()),
+            models: Vec::new(),
+            created_at: None,
+            rpm,
+            burst,
+            max_concurrent: None,
+        }
+    }
+
+    /// The `[ratelimit]` snapshot must reach every key's runtime, and the local
+    /// backend must keep using the very same per-process bucket.
+    #[test]
+    fn client_keys_follow_the_ratelimit_backend() {
+        let local_cfg = crate::config::RateLimitConfig::default();
+        assert_eq!(local_cfg.backend, "local");
+
+        let local = ClientKeyRuntime::new(key(Some(60), Some(2)));
+        assert!(
+            matches!(
+                local.shared.as_deref(),
+                Some(crate::distributed::SharedLimiter::Local(_))
+            ),
+            "the local backend must expose the local bucket"
+        );
+
+        let redis_cfg = crate::config::RateLimitConfig {
+            backend: "redis".to_string(),
+            redis_url: "redis://127.0.0.1:6379/0".to_string(),
+            ..crate::config::RateLimitConfig::default()
+        };
+        let shared = ClientKeyRuntime::new_with(key(Some(60), Some(2)), &redis_cfg);
+        match shared.shared.as_deref() {
+            Some(crate::distributed::SharedLimiter::Redis(l)) => {
+                assert_eq!(l.key(), "anyhop:rl:sk-wiring:60:2");
+            }
+            other => panic!("expected a redis limiter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unlimited_keys_carry_no_limiter() {
+        let rt =
+            ClientKeyRuntime::new_with(key(None, None), &crate::config::RateLimitConfig::default());
+        assert!(rt.limiter.is_none());
+        assert!(rt.shared.is_none());
+    }
+
+    #[test]
+    fn rebind_keeps_the_live_bucket_when_the_limits_do_not_change() {
+        let before = ClientKeyRuntime::new(key(Some(60), Some(2)));
+        let after = before.rebind(
+            key(Some(60), Some(2)),
+            &crate::config::RateLimitConfig::default(),
+        );
+        let (a, b) = (
+            before.limiter.clone().expect("bucket"),
+            after.limiter.clone().expect("bucket"),
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &b),
+            "a reload handed out a fresh quota"
+        );
+        // A changed limit does reset it.
+        let changed = before.rebind(
+            key(Some(30), Some(1)),
+            &crate::config::RateLimitConfig::default(),
+        );
+        let c = changed.limiter.clone().expect("bucket");
+        assert!(!std::sync::Arc::ptr_eq(&a, &c));
+    }
 }
