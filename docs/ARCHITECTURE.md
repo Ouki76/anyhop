@@ -26,6 +26,7 @@ client ──HTTP──▶ axum router ──▶ auth ──▶ routing ──�
 | `src/providers.rs` | `Provider` (HTTP client, pool, model list cache), routing (`resolve`), quota probing |
 | `src/pool.rs` | Key pool: strategies, health state machine, cooldowns, sticky sessions, admission control |
 | `src/proxy/chat.rs` | `POST /v1/chat/completions`: the retry/failover core of the gateway |
+| `src/proxy/responses.rs` | `POST /v1/responses`, translated onto the chat pipeline |
 | `src/proxy/embeddings.rs` | `POST /v1/embeddings`: pass-through (openai_compat) or translation (gemini) |
 | `src/ratelimit.rs` | Per-client-key token bucket |
 | `src/proxy/mod.rs` | `AppState`, `RtConfig`, request log |
@@ -34,6 +35,7 @@ client ──HTTP──▶ axum router ──▶ auth ──▶ routing ──�
 | `src/sse.rs` | SSE parser/serializer shared by the translation layers |
 | `src/{gemini,anthropic,antigravity,codex}.rs` | Per-provider request/response translation, incl. streaming and tool calls |
 | `src/api/*` | JSON management API (`/api/*`), `/metrics`, config persistence |
+| `src/tls.rs` | rustls PEM loading + an `axum::serve::Listener` that decrypts per connection |
 | `src/dashboard.rs` | Embedded dashboard assets + per-request CSP |
 | `ui/` | Sycamore (Rust→WASM) SPA: a thin client over `/api/*` (no logic of its own) |
 | `src/middleware.rs` | Auth middlewares, constant-time compare, security headers |
@@ -42,6 +44,8 @@ client ──HTTP──▶ axum router ──▶ auth ──▶ routing ──�
 | `src/api/combos.rs` | Combo (fallback chain) CRUD, written into `[[combos]]` |
 | `src/api/provider_keys.rs` | Provider add/update/delete, key add/enable/delete |
 | `src/api/server.rs` | `[server]` + `[tuning]` read/write; reports which fields need a restart |
+| `src/api/errors.rs` | `ApiError`/`ApiResult` — one typed error for the whole JSON API |
+| `src/api/histograms.rs` | Latency histograms behind `/metrics` (bounded cardinality) |
 
 OAuth accounts are appended to the provider named in the request (`provider`, defaulting to the
 kind). The provider is created in the same write as its first account, so the file never contains

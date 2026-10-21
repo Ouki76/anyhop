@@ -25,7 +25,10 @@ Single binary (~6MB), minimal resource footprint.
 - **Hot reload**: `kill -HUP` re-reads the config without a restart
 - **Persistence** (redb): key health, OAuth tokens, stats, runtime-added keys
 - **JSON API** `/api/*`: providers, quotas, SSE events, key management — always on
-- **Metrics**: `GET /metrics` in Prometheus text format (keys available, cooldowns, dead keys, error ratios)
+- **Metrics**: `GET /metrics` in Prometheus text format — counters per key, plus latency
+  histograms (`anyhop_http_request_duration_seconds`) per route/method/status
+- **TLS**: in-process via `rustls` (`[server] tls_cert`/`tls_key`) or terminated at a
+  reverse proxy — both documented, HSTS emitted only over HTTPS.
 - **Dashboard** `/dashboard` (optional): Sycamore (Rust→WASM) SPA on top of the JSON API.
   Configured entirely from the browser: providers (add/edit settings/delete, add/disable/delete
   keys, OAuth accounts), models (enable/disable/refresh), combos (create/edit chain/reorder/delete),
@@ -146,7 +149,16 @@ groups:
   UI and serve a stale `ui/dist`, the page will refuse to boot — always rebuild the
   bundle (`cd ui && trunk build --release`) and the binary.
 - Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
-  `Referrer-Policy: no-referrer`, `Strict-Transport-Security`.
+  `Referrer-Policy: no-referrer`; `Strict-Transport-Security` only when the request came in
+  over HTTPS (own TLS listener or `X-Forwarded-Proto: https`), so plain-HTTP curl output
+  does not claim otherwise.
+- **Auth lockout**: `auth_fail_burst` (default 10) failed attempts from one IP within
+  `auth_fail_window_secs` (default 60) turn every subsequent request from that address into
+  `429 + Retry-After`, on `/v1` and `/api` alike. Keys are compared in constant time
+  (`token_eq`), and the lockout triggers before the comparison.
+- **Concurrency caps**: `[server] client_key_max_concurrent` (or per-key `max_concurrent`)
+  bounds in-flight requests per client key; the counter is released when the response —
+  including a streamed body — is dropped.
 - Secrets live in plaintext TOML. Keep it `chmod 600`/`640`; the binary logs a warning
   when it is world-readable.
 
@@ -360,7 +372,7 @@ load generator caps out around 8k rps on its own and would hide the real capacit
 | Endpoint | Throughput | p50 | p99 |
 | --- | --- | --- | --- |
 | `GET /healthz` | **149,000 req/s** | 0.38 ms | 1.16 ms |
-| `GET /v1/models` (124 models) | **38,000 req/s** | 1.66 ms | 3.24 ms |
+| `GET /v1/models` (124 models, cached) | **63,000 req/s** | 0.85 ms | 2.23 ms |
 | `GET /metrics` | **88,000 req/s** | 0.70 ms | 1.65 ms |
 
 RSS 17 MB with the gateway and the load generator sharing the same 16 cores — the
@@ -423,9 +435,10 @@ Tuning notes:
 ## Tests
 
 ```bash
-cargo test               # unit tests: rotation, cooldowns, error classification,
-                         #   scanner, SSE, CSP, metrics, token comparison
-./test/run_all.sh        # full suite: mocks + gateway; 37 checks / 77 assertions
+cargo test               # 143 unit tests: rotation, cooldowns, error classification,
+                         #   scanner, SSE, CSP, metrics, TLS PEM parsing, Responses
+                         #   translation, histograms, typed errors
+./test/run_all.sh        # full suite: mocks + gateway; 38 checks / 80 assertions
 ANYHOP_TEST_PORT=18091 ./test/run_all.sh   # if 18080 is taken by something else
                          #   (routing, rotation, streaming, embeddings, rate limits,
                          #    combos, provider & key lifecycle, tuning, SSE, dashboard)
