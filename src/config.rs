@@ -227,6 +227,20 @@ impl Config {
     /// through the same path so a saved config can never fail the next startup.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.providers.is_empty(), "config has no [[providers]]");
+        if let Some(u) = self.server.public_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            anyhow::ensure!(
+                u.starts_with("http://") || u.starts_with("https://"),
+                "server.public_url must start with http:// or https://"
+            );
+            anyhow::ensure!(
+                !u.ends_with('/'),
+                "server.public_url must not end with '/' (got '{u}')"
+            );
+            anyhow::ensure!(
+                u.len() <= 512,
+                "server.public_url must be at most 512 characters"
+            );
+        }
         self.tuning.validate()?;
         anyhow::ensure!(
             !self.server.listen.trim().is_empty(),
@@ -384,6 +398,13 @@ pub struct ServerConfig {
     /// Admin key for /api/* and /dashboard. Defaults to api_key when unset.
     #[serde(default)]
     pub admin_key: Option<String>,
+    /// Public base URL of this gateway (e.g. `https://gateway.example.com`).
+    ///
+    /// When set, OAuth sign-in uses `<public_url>/api/auth/callback` as the
+    /// redirect URI, so a dashboard opened on another machine (or a phone) can
+    /// finish the flow. Unset = the classic loopback listener on 127.0.0.1.
+    #[serde(default)]
+    pub public_url: Option<String>,
     /// Max request body size (bytes).
     #[serde(default = "default_max_body")]
     pub max_body_bytes: usize,
@@ -438,6 +459,7 @@ impl Default for ServerConfig {
             events_history: default_events_history(),
             requests_history: default_requests_history(),
             admin_key: None,
+            public_url: None,
             max_body_bytes: default_max_body(),
             models_refresh_secs: default_models_refresh_secs(),
         }

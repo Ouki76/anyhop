@@ -48,6 +48,12 @@ pub struct AppState {
     /// Handle of the task serving that flow, so it can be aborted (frees the
     /// local callback port when the operator switches provider or cancels).
     pub auth_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Channel the authorization code is delivered through (loopback socket,
+    /// public callback route or a pasted URL).
+    pub auth_code_tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<(String, String)>>>,
+    /// OAuth `state` of the pending flow, so the public callback can reject
+    /// foreign/expired redirects itself instead of failing later.
+    pub auth_state_token: std::sync::Mutex<Option<String>>,
     /// Ring buffer of recent upstream attempts for the Requests tab.
     pub request_log: std::sync::Mutex<std::collections::VecDeque<crate::events::RequestRecord>>,
     /// Client API keys: key -> ClientKeyConfig.

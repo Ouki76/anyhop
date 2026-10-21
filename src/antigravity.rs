@@ -524,10 +524,13 @@ pub fn unwrap_response(v: Value) -> Value {
 // ---------- OAuth authorization-code flow (for `anyhop auth antigravity`) ----------
 
 pub fn build_auth_url(state: &str) -> String {
-    let redirect = format!("http://localhost:{CALLBACK_PORT}/oauth-callback");
+    build_auth_url_with(state, &loopback_redirect_uri())
+}
+
+pub fn build_auth_url_with(state: &str, redirect_uri: &str) -> String {
     format!(
         "{AUTH_ENDPOINT}?access_type=offline&client_id={CLIENT_ID}&prompt=consent&redirect_uri={}&response_type=code&scope={}&state={state}",
-        urlencoded(&redirect),
+        urlencoded(redirect_uri),
         urlencoded(&SCOPES.join(" ")),
     )
 }
@@ -550,15 +553,18 @@ pub struct AuthTokens {
     pub refresh_token: String,
 }
 
-pub async fn exchange_code(http: &reqwest::Client, code: &str) -> anyhow::Result<AuthTokens> {
-    let redirect = format!("http://localhost:{CALLBACK_PORT}/oauth-callback");
+pub async fn exchange_code(
+    http: &reqwest::Client,
+    code: &str,
+    redirect_uri: &str,
+) -> anyhow::Result<AuthTokens> {
     let resp = http
         .post(TOKEN_ENDPOINT)
         .form(&[
             ("code", code),
             ("client_id", CLIENT_ID),
             ("client_secret", CLIENT_SECRET),
-            ("redirect_uri", redirect.as_str()),
+            ("redirect_uri", redirect_uri),
             ("grant_type", "authorization_code"),
         ])
         .send()
@@ -600,8 +606,12 @@ pub async fn fetch_email(http: &reqwest::Client, access_token: &str) -> Option<S
 /// A started OAuth flow: URL for the user + listener waiting for the callback.
 pub struct PendingAuth {
     pub url: String,
-    state: String,
-    listener: tokio::net::TcpListener,
+    pub state: String,
+    /// Redirect URI sent to the provider; must match the one in the auth URL.
+    pub redirect_uri: String,
+    /// Present for the loopback flow only. `None` = headless, the code arrives
+    /// from a public callback route or a pasted URL.
+    pub listener: Option<tokio::net::TcpListener>,
     http: reqwest::Client,
 }
 
@@ -613,12 +623,16 @@ pub struct AuthOutcome {
 
 /// Start the OAuth flow (non-blocking): returns the URL to open.
 pub async fn start_auth(proxy: Option<&str>) -> anyhow::Result<PendingAuth> {
-    start_auth_with(proxy, &crate::config::Tuning::default()).await
+    start_auth_with(proxy, &crate::config::Tuning::default(), None).await
 }
 
+/// Start the flow. `redirect_uri = Some(public)` runs headless: the provider
+/// sends the browser to that URL (our own /api/auth/callback), so the panel can
+/// be used from another machine. `None` keeps the loopback listener.
 pub async fn start_auth_with(
     proxy: Option<&str>,
     tuning: &crate::config::Tuning,
+    redirect_uri: Option<&str>,
 ) -> anyhow::Result<PendingAuth> {
     let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -628,18 +642,58 @@ pub async fn start_auth_with(
     }
     let http = builder.build()?;
     let state = format!("{:x}", now_ms());
-    let url = build_auth_url(&state);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot bind localhost:{CALLBACK_PORT}: {e} (auth already running?)"))?;
-    Ok(PendingAuth { url, state, listener, http })
+    match redirect_uri {
+        Some(uri) => {
+            let url = build_auth_url_with(&state, uri);
+            Ok(PendingAuth {
+                url,
+                state,
+                redirect_uri: uri.to_string(),
+                listener: None,
+                http,
+            })
+        }
+        None => {
+            let uri = loopback_redirect_uri();
+            let url = build_auth_url_with(&state, &uri);
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
+                .await
+                .map_err(|e| anyhow::anyhow!(
+                    "cannot bind localhost:{CALLBACK_PORT}: {e} (auth already running?)"
+                ))?;
+            Ok(PendingAuth {
+                url,
+                state,
+                redirect_uri: uri,
+                listener: Some(listener),
+                http,
+            })
+        }
+    }
+}
+
+pub fn loopback_redirect_uri() -> String {
+    format!("http://localhost:{CALLBACK_PORT}/oauth-callback")
 }
 
 /// Wait for the browser callback and complete the exchange.
 pub async fn complete_auth(p: PendingAuth) -> anyhow::Result<AuthOutcome> {
+    let code = wait_for_callback(&p).await?;
+    finish(p, &code).await
+}
+
+/// Wait for the loopback browser callback and return the authorization code.
+///
+/// Split from the token exchange so the caller can race it against a pasted
+/// callback URL (`tokio::select!`) — the panel may be used from another machine,
+/// where the browser cannot reach this listener at all.
+pub async fn wait_for_callback(p: &PendingAuth) -> anyhow::Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (mut sock, _) = p.listener.accept().await?;
+    let Some(listener) = p.listener.as_ref() else {
+        anyhow::bail!("this flow is headless — supply the code with complete_with_code()");
+    };
+    let (mut sock, _) = listener.accept().await?;
     let mut buf = vec![0u8; 8192];
     let n = sock.read(&mut buf).await?;
     let req = String::from_utf8_lossy(&buf[..n]);
@@ -654,7 +708,7 @@ pub async fn complete_auth(p: PendingAuth) -> anyhow::Result<AuthOutcome> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             match k {
-                "code" => code = Some(percent_decode(v)),
+                "code" => code = Some(crate::antigravity::percent_decode(v)),
                 "state" => got_state = Some(v.to_string()),
                 _ => {}
             }
@@ -674,8 +728,16 @@ pub async fn complete_auth(p: PendingAuth) -> anyhow::Result<AuthOutcome> {
 
     let code = code.ok_or_else(|| anyhow::anyhow!("callback without code"))?;
     anyhow::ensure!(got_state.as_deref() == Some(p.state.as_str()), "state mismatch, retry");
+    Ok(code)
+}
 
-    let tokens = exchange_code(&p.http, &code).await?;
+/// Complete a flow with a code obtained elsewhere (public callback, pasted URL).
+pub async fn complete_with_code(p: PendingAuth, code: &str) -> anyhow::Result<AuthOutcome> {
+    finish(p, code).await
+}
+
+async fn finish(p: PendingAuth, code: &str) -> anyhow::Result<AuthOutcome> {
+    let tokens = exchange_code(&p.http, code, &p.redirect_uri).await?;
     let email = fetch_email(&p.http, &tokens.access_token).await;
 
     // Best-effort project discovery so the snippet is complete.

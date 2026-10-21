@@ -1,4 +1,8 @@
 [server]
+# Public URL of this gateway (no trailing slash). Set it when the dashboard is
+# opened from another machine or a domain: OAuth sign-in then redirects to
+# <public_url>/api/auth/callback instead of a loopback port.
+# public_url = "https://gateway.example.com"
 listen = "127.0.0.1:8080"
 max_retries = 4
 attempt_timeout_secs = 120

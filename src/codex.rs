@@ -700,9 +700,11 @@ use sha2::Digest;
 /// A started Codex OAuth flow.
 pub struct PendingAuth {
     pub url: String,
-    state: String,
+    pub state: String,
+    pub redirect_uri: String,
     verifier: String,
-    listener: tokio::net::TcpListener,
+    /// `None` = headless: the code arrives from a public callback or a pasted URL.
+    pub listener: Option<tokio::net::TcpListener>,
     http: reqwest::Client,
 }
 
@@ -714,12 +716,15 @@ pub struct AuthOutcome {
 
 /// Start the Codex OAuth flow (non-blocking): returns the URL to open.
 pub async fn start_auth(proxy: Option<&str>) -> anyhow::Result<PendingAuth> {
-    start_auth_with(proxy, &crate::config::Tuning::default()).await
+    start_auth_with(proxy, &crate::config::Tuning::default(), None).await
 }
 
+/// `redirect_uri = Some(public)` runs headless (the browser comes back to our own
+/// /api/auth/callback); `None` keeps the loopback listener on CALLBACK_PORT.
 pub async fn start_auth_with(
     proxy: Option<&str>,
     tuning: &crate::config::Tuning,
+    redirect_uri: Option<&str>,
 ) -> anyhow::Result<PendingAuth> {
     let mut builder = reqwest::Client::builder().timeout(tuning.oauth_http_timeout());
     if let Some(p) = proxy {
@@ -730,22 +735,43 @@ pub async fn start_auth_with(
     let verifier = random_verifier()?;
     let challenge = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
     let state = format!("{:x}", now_ms());
+    let redirect = redirect_uri.unwrap_or(REDIRECT_URI).to_string();
     let url = format!(
         "{AUTH_URL}?response_type=code&client_id={CLIENT_ID}&redirect_uri={}&scope={}&state={state}&code_challenge={challenge}&code_challenge_method=S256&codex_cli_simplified_flow=true&id_token_add_organizations=true",
-        crate::antigravity::urlencoded(REDIRECT_URI),
+        crate::antigravity::urlencoded(&redirect),
         crate::antigravity::urlencoded("openid email profile offline_access"),
     );
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot bind localhost:{CALLBACK_PORT}: {e} (auth already running?)"))?;
-    Ok(PendingAuth { url, state, verifier, listener, http })
+    let listener = match redirect_uri {
+        Some(_) => None,
+        None => Some(
+            tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
+                .await
+                .map_err(|e| anyhow::anyhow!(
+                    "cannot bind localhost:{CALLBACK_PORT}: {e} (auth already running?)"
+                ))?,
+        ),
+    };
+    Ok(PendingAuth { url, state, redirect_uri: redirect, verifier, listener, http })
 }
 
 /// Wait for the browser callback and complete the exchange.
 pub async fn complete_auth(p: PendingAuth) -> anyhow::Result<AuthOutcome> {
+    let code = wait_for_callback(&p).await?;
+    finish(p, &code).await
+}
+
+/// Wait for the loopback browser callback and return the authorization code.
+///
+/// Split from the token exchange so the caller can race it against a pasted
+/// callback URL — the panel may be used from another machine, where the browser
+/// cannot reach this listener at all.
+pub async fn wait_for_callback(p: &PendingAuth) -> anyhow::Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (mut sock, _) = p.listener.accept().await?;
+    let Some(listener) = p.listener.as_ref() else {
+        anyhow::bail!("this flow is headless — supply the code with complete_with_code()");
+    };
+    let (mut sock, _) = listener.accept().await?;
     let mut buf = vec![0u8; 8192];
     let n = sock.read(&mut buf).await?;
     let req = String::from_utf8_lossy(&buf[..n]);
@@ -780,15 +806,23 @@ pub async fn complete_auth(p: PendingAuth) -> anyhow::Result<AuthOutcome> {
 
     let code = code.ok_or_else(|| anyhow::anyhow!("callback without code"))?;
     anyhow::ensure!(got_state.as_deref() == Some(p.state.as_str()), "state mismatch, retry");
+    Ok(code)
+}
 
+/// Complete a headless flow with a code obtained elsewhere.
+pub async fn complete_with_code(p: PendingAuth, code: &str) -> anyhow::Result<AuthOutcome> {
+    finish(p, code).await
+}
+
+async fn finish(p: PendingAuth, code: &str) -> anyhow::Result<AuthOutcome> {
     let resp = p
         .http
         .post(TOKEN_URL)
         .form(&[
             ("grant_type", "authorization_code"),
             ("client_id", CLIENT_ID),
-            ("code", code.as_str()),
-            ("redirect_uri", REDIRECT_URI),
+            ("code", code),
+            ("redirect_uri", p.redirect_uri.as_str()),
             ("code_verifier", p.verifier.as_str()),
         ])
         .send()

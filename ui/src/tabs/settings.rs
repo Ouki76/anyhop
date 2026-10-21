@@ -24,6 +24,7 @@ pub fn SettingsTab() -> View {
     let refresh_secs = create_signal(String::new());
     let proxy = create_signal(String::new());
     let state_file = create_signal(String::new());
+    let public_url = create_signal(String::new());
     let dashboard = create_signal(true);
     let api_key = create_signal(String::new());
     let admin_key = create_signal(String::new());
@@ -62,6 +63,7 @@ pub fn SettingsTab() -> View {
             refresh_secs.set(s.models_refresh_secs.to_string());
             proxy.set(s.proxy.unwrap_or_default());
             state_file.set(s.state_file);
+            public_url.set(s.public_url.unwrap_or_default());
             dashboard.set(s.dashboard);
             let t = s.tuning;
             t_max_cooldown.set(t.max_cooldown_secs.to_string());
@@ -143,6 +145,13 @@ pub fn SettingsTab() -> View {
                             input(class="input", r#type="text", placeholder="empty = no persistence", bind:value=state_file)
                             div(class="form-hint") { "Applies after a restart" }
                         }
+                        div(class="form-group") {
+                            label(class="form-label") { "Public URL" }
+                            input(class="input", r#type="text", placeholder="https://gateway.example.com", bind:value=public_url)
+                            div(class="form-hint") {
+                                "Used for OAuth redirects when the panel is not opened on this machine. Empty = localhost callback only."
+                            }
+                        }
                         div(class="form-group span-2") {
                             label(class="form-label") { "Upstream proxy for all providers" }
                             input(class="input", r#type="text", placeholder="empty = direct connection", bind:value=proxy)
@@ -180,6 +189,7 @@ pub fn SettingsTab() -> View {
                         "dashboard": dashboard.get_clone(),
                         "proxy": proxy.get_clone(),
                         "state_file": state_file.get_clone(),
+                        "public_url": public_url.get_clone(),
                         "tuning": {
                             "max_cooldown_secs": int_of(&t_max_cooldown.get_clone()),
                             "base_backoff_secs": int_of(&t_base_backoff.get_clone()),
@@ -248,6 +258,7 @@ pub fn SettingsTab() -> View {
                             refresh_secs.set(s.models_refresh_secs.to_string());
                             proxy.set(s.proxy.unwrap_or_default());
                             state_file.set(s.state_file);
+                            public_url.set(s.public_url.clone().unwrap_or_default());
                             dashboard.set(s.dashboard);
                             let t = s.tuning;
                             t_max_cooldown.set(t.max_cooldown_secs.to_string());

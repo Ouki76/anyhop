@@ -174,6 +174,8 @@ async fn async_main() -> anyhow::Result<()> {
         events: events_tx,
         auth_state: std::sync::Mutex::new(None),
         auth_task: std::sync::Mutex::new(None),
+        auth_code_tx: std::sync::Mutex::new(None),
+        auth_state_token: std::sync::Mutex::new(None),
         request_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
         client_keys: std::sync::RwLock::new(client_keys_map),
         disabled_models: std::sync::RwLock::new(disabled_models_set),
@@ -410,6 +412,7 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
         .route("/api/auth/start", post(api::auth_start))
         .route("/api/auth/status", get(api::auth_status))
         .route("/api/auth/cancel", post(api::auth_cancel))
+        .route("/api/auth/complete", post(api::auth_complete))
         // Prometheus exposition: under the admin layer like the rest — a scraper
         // authenticates with `bearer_token` (or `?key=`, allowed for GET).
         .route("/metrics", get(api::metrics))
@@ -423,6 +426,9 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
     let app = axum::Router::new()
         .merge(api)
         .merge(admin_base)
+        // Provider redirect target for OAuth when [server] public_url is set.
+        // No admin key here: the browser carries the OAuth state instead.
+        .route("/api/auth/callback", get(api::auth_callback))
         .route("/healthz", get(|| async { "ok" }))
         .layer(axum::middleware::from_fn(middleware::json_errors));
 

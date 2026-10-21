@@ -190,6 +190,7 @@ pub fn AddProviderModal(
     let error = create_signal(String::new());
     let busy = create_signal(false);
     let auth = create_signal(Option::<AuthStateDto>::None);
+    let paste_url = create_signal(String::new());
     // The name the OAuth flow should create/populate (a second antigravity
     // provider gets its own account pool this way).
     let name_for_auth = name;
@@ -207,14 +208,21 @@ pub fn AddProviderModal(
             let Ok(resp) = req.send().await else { return };
             let Ok(v) = resp.json::<serde_json::Value>().await else { return };
             let Some(url) = v.get("url").and_then(|u| u.as_str()).map(str::to_string) else { return };
+            let mode = v
+                .get("mode")
+                .and_then(|m| m.as_str())
+                .unwrap_or("loopback")
+                .to_string();
             // The modal may have been closed while the request was in flight.
             if !auth.is_alive() {
                 return;
             }
             auth.set(Some(AuthStateDto {
                 kind: kind.into(),
+                provider: String::new(),
                 status: "waiting".into(),
                 url: url.clone(),
+                mode,
                 message: "waiting for browser callback".into(),
             }));
             if let Some(w) = web_sys::window() {
@@ -361,7 +369,37 @@ pub fn AddProviderModal(
                                         } else {
                                             a.message
                                         };
-                                        view! { div(class=cls) { (msg) } }
+                                        let waiting = a.status == "waiting";
+                                        view! {
+                                            div(class=cls) { (msg) }
+                                            (if waiting {
+                                                view! {
+                                                    div(class="form-group mt-12") {
+                                                        label(class="form-label") { "Browser could not reach this gateway?" }
+                                                        input(
+                                                            class="input", r#type="text",
+                                                            placeholder="paste the URL your browser ended up on",
+                                                            bind:value=paste_url,
+                                                        )
+                                                        div(class="form-hint") {
+                                                            "Copy the full address from the address bar (it contains code=…) and press Complete."
+                                                        }
+                                                    }
+                                                    div(class="row gap-10") {
+                                                        button(class="btn btn-sm", on:click=move |_| {
+                                                            let v = paste_url.get_clone();
+                                                            if v.trim().is_empty() { return; }
+                                                            spawn_local(async move {
+                                                                let _ = post_json("/api/auth/complete", &serde_json::json!({"url": v})).await;
+                                                                if paste_url.is_alive() { paste_url.set(String::new()); }
+                                                            });
+                                                        }) { "Complete sign-in" }
+                                                    }
+                                                }
+                                            } else {
+                                                view! {}
+                                            })
+                                        }
                                     }
                                     None => view! {},
                                 })
@@ -830,6 +868,7 @@ pub fn AddKeyForm(provider: String) -> View {
 #[component(inline_props)]
 pub fn OAuthAddButton(kind: String, provider: String) -> View {
     let auth = create_signal(Option::<AuthStateDto>::None);
+    let paste_url = create_signal(String::new());
     let provider_name = provider.clone();
     let label = format!("Add {kind} account");
     view! {
@@ -858,8 +897,10 @@ pub fn OAuthAddButton(kind: String, provider: String) -> View {
                         if auth.is_alive() {
                             auth.set(Some(AuthStateDto {
                                 kind: kind_in_defer,
+                                provider: String::new(),
                                 status: "waiting".into(),
                                 url: url2,
+                                mode: String::new(),
                                 message: "waiting for browser callback".into(),
                             }));
                         }
@@ -914,6 +955,25 @@ pub fn OAuthAddButton(kind: String, provider: String) -> View {
                 view! {
                     div(class="row gap-10 mt-8 wrap") {
                         div(class=cls) { (msg) }
+                        (if waiting {
+                            view! {
+                                input(
+                                    class="input input-w320", r#type="text",
+                                    placeholder="or paste the redirected URL here",
+                                    bind:value=paste_url,
+                                )
+                                button(class="btn btn-sm", on:click=move |_| {
+                                    let v = paste_url.get_clone();
+                                    if v.trim().is_empty() { return; }
+                                    spawn_local(async move {
+                                        let _ = post_json("/api/auth/complete", &serde_json::json!({"url": v})).await;
+                                        if paste_url.is_alive() { paste_url.set(String::new()); }
+                                    });
+                                }) { "Complete" }
+                            }
+                        } else {
+                            view! {}
+                        })
                         (if waiting {
                             view! {
                                 button(class="btn btn-sm", on:click=move |_| {

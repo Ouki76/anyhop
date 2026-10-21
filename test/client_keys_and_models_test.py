@@ -532,6 +532,36 @@ def run_tests(original_toml):
     request("POST", "/api/auth/cancel")
     print("  ok OAuth targets a named provider (collision/validation guarded)")
 
+    # 29. Public OAuth callback: with [server] public_url the flow redirects to
+    #     this gateway, and the unauthenticated callback validates the state.
+    status, upd = request("POST", "/api/server/update", {"public_url": "https://gw.example.com"})
+    assert status == 200 and "public_url" in upd["changed"], upd
+    status, started = request("POST", "/api/auth/start",
+                              {"kind": "antigravity", "provider": "ag-public"})
+    assert status == 200, started
+    assert started["mode"] == "public", started
+    import urllib.parse as up
+    q = up.parse_qs(up.urlparse(started["url"]).query)
+    assert q["redirect_uri"][0] == "https://gw.example.com/api/auth/callback", q
+    token = started["state"]
+    # The browser callback carries no admin key — it must still be accepted,
+    # and a wrong `state` must be rejected with 400.
+    bad = urllib.request.Request(
+        f"{BASE}/api/auth/callback?code=x&state=wrong-state", method="GET")
+    try:
+        urllib.request.urlopen(bad, timeout=10)
+        fail_state = None
+    except urllib.error.HTTPError as e:
+        fail_state = e.code
+    assert fail_state == 400, "callback accepted a foreign state"
+    # A pasted URL with the right state is delivered to the waiting flow.
+    status, ok = request("POST", "/api/auth/complete",
+                         {"url": f"http://localhost:51121/oauth-callback?code=fake&state={token}"})
+    assert status == 200 and ok.get("ok") is True, ok
+    request("POST", "/api/auth/cancel")
+    request("POST", "/api/server/update", {"public_url": ""})
+    print("  ok public OAuth callback (state-checked, no admin key needed)")
+
     print("\nALL CLIENT KEYS AND MODELS TESTS PASSED!")
 
 

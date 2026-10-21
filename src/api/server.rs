@@ -34,6 +34,8 @@ pub struct ServerDto {
     /// Secrets are never sent to the browser — only whether they are configured.
     api_key_set: bool,
     admin_key_set: bool,
+    /// Public base URL for OAuth redirects (empty = loopback only).
+    public_url: Option<String>,
     /// Every configurable timing/limit (see `config::Tuning`).
     tuning: crate::config::Tuning,
 }
@@ -54,6 +56,8 @@ pub struct ServerUpdate {
     api_key: Option<String>,
     admin_key: Option<String>,
     state_file: Option<String>,
+    /// Empty string clears it (back to the loopback OAuth flow).
+    public_url: Option<String>,
     /// Partial update of `[tuning]`; omitted fields keep their value.
     tuning: Option<TuningUpdate>,
 }
@@ -131,6 +135,7 @@ pub async fn get_server(State(state): State<Arc<AppState>>) -> Response {
         state_file: s.state_file.clone(),
         api_key_set: s.api_key.is_some(),
         admin_key_set: s.admin_key.is_some(),
+        public_url: s.public_url.clone(),
         tuning: cfg.tuning.clone(),
     })
     .into_response()
@@ -285,6 +290,24 @@ pub async fn update_server(
     {
         server["state_file"] = toml_edit::value(v.trim());
         changed.push("state_file");
+    }
+    if let Some(v) = &body.public_url {
+        let v = v.trim().trim_end_matches('/');
+        if v != cur.public_url.as_deref().unwrap_or("") {
+            if v.is_empty() {
+                server.remove("public_url");
+                changed.push("public_url");
+            } else if !v.starts_with("http://") && !v.starts_with("https://") {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "public_url must start with http:// or https://",
+                )
+                    .into_response();
+            } else {
+                server["public_url"] = toml_edit::value(v);
+                changed.push("public_url");
+            }
+        }
     }
     if let Some(v) = &body.proxy
         // The form sends the masked value back unchanged; writing it would

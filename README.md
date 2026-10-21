@@ -240,6 +240,28 @@ Errors are always the same envelope, including for malformed bodies:
 | `/metrics` | GET | Prometheus exposition |
 | `/healthz` | GET | liveness, no auth |
 
+## OAuth sign-in (account providers)
+
+Antigravity and Codex accounts are added through the provider's OAuth flow. Two transports
+are supported, chosen automatically:
+
+| Situation | Transport |
+| --- | --- |
+| Panel opened on the gateway host (default) | loopback listener on `127.0.0.1:51121` (`codex`: `:1455`) |
+| `[server] public_url = "https://gw.example.com"` | the provider redirects to `<public_url>/api/auth/callback`, which the gateway serves itself |
+
+Google and OpenAI only allow a loopback redirect for their installed-app clients, so when the
+browser runs on another machine it lands on `http://localhost:51121/oauth-callback?code=…` and
+shows "connection refused". That is fine: copy the **whole address** from the address bar and
+paste it into the panel ("Browser could not reach this gateway?" → *Complete sign-in*). The code
+is exchanged server-side either way, and the OAuth `state` is verified before use.
+
+```bash
+# what the panel does under the hood
+curl -X POST localhost:8080/api/auth/complete -H "Authorization: Bearer $ADMIN" \
+     -d '{"url":"http://localhost:51121/oauth-callback?code=…&state=…"}'
+```
+
 ## Dashboard
 
 `/dashboard` is a pure client of the JSON API — everything it does is also available over HTTP.

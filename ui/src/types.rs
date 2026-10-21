@@ -197,6 +197,9 @@ pub struct ServerDto {
     #[serde(default)]
     pub proxy: Option<String>,
     pub state_file: String,
+    /// Public base URL used for OAuth redirects (empty = loopback only).
+    #[serde(default)]
+    pub public_url: Option<String>,
     /// Secrets are never returned — only whether they are configured.
     pub api_key_set: bool,
     pub admin_key_set: bool,
@@ -206,7 +209,12 @@ pub struct ServerDto {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct AuthStateDto {
     pub kind: String,
+    #[serde(default)]
+    pub provider: String,
     pub status: String,
     pub url: String,
+    /// loopback | public
+    #[serde(default)]
+    pub mode: String,
     pub message: String,
 }
