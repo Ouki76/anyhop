@@ -1,16 +1,59 @@
 //! Shared SSE parser/serializer for upstream translation streams.
 //! Reuses a single BytesMut buffer: no per-event String allocations.
 
+use std::fmt;
+
 use bytes::{Bytes, BytesMut};
+
+/// Largest partial event the parser will buffer, in bytes.
+///
+/// `feed` copies every chunk it is given into `buf` and only releases the
+/// *complete* prefix, so a provider that never sends a blank line (an endless
+/// `data:` line, or a body that is simply one long line) grows that buffer
+/// without bound. That is an allocation paid for by whoever can make us read such
+/// an upstream — one connection per stalled stream, unbounded bytes each. A real
+/// event is a few hundred bytes (a chat delta, a usage chunk), so 1 MiB is far
+/// above any working provider and small enough to be irrelevant when a stream
+/// does stall. Same reasoning as the WebSocket frame cap in [`crate::ws`].
+const MAX_EVENT_BYTES: usize = 1024 * 1024;
+
+/// Reported when the buffered partial event exceeds [`MAX_EVENT_BYTES`].
+///
+/// The parser stays failed after this: the bytes that were buffered have been
+/// released, so there is no state left to resume from, and pretending a stream
+/// is healthy after dropping its tail would hand the client a truncated message
+/// as if it were complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventTooLarge {
+    /// Bytes that had accumulated for one event when the cap was hit.
+    pub buffered: usize,
+}
+
+impl fmt::Display for EventTooLarge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "upstream SSE event exceeded the {MAX_EVENT_BYTES} byte cap: {} bytes buffered \
+             without a blank line",
+            self.buffered
+        )
+    }
+}
+
+impl std::error::Error for EventTooLarge {}
 
 pub struct SseParser {
     buf: BytesMut,
+    /// Set when an event overran [`MAX_EVENT_BYTES`]; sticky, see
+    /// [`EventTooLarge`].
+    failed: bool,
 }
 
 impl SseParser {
     pub fn new() -> Self {
         Self {
             buf: BytesMut::with_capacity(16 * 1024),
+            failed: false,
         }
     }
 
@@ -21,7 +64,33 @@ impl SseParser {
     /// Returns a fresh `Vec` on purpose: the callers bulk-`extend` it into their
     /// queue, which is measurably faster than pushing events one by one into a
     /// `VecDeque` (see `cargo bench`: 516 vs 549 ns per 10-event chunk).
+    ///
+    /// This is the infallible wrapper for translators whose response has already
+    /// started (they can only stop producing events, not fail the stream). On
+    /// overflow the buffered event is dropped and the parse ends, which keeps the
+    /// memory bounded; [`SseParser::feed_checked`] is the same parse with the
+    /// error handed back, for callers that can fail cleanly.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<Bytes> {
+        self.feed_checked(chunk).unwrap_or_default()
+    }
+
+    /// Feed raw bytes, get back complete `data:` payloads, or the error that says
+    /// the upstream is not framing events at all.
+    pub fn feed_checked(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, EventTooLarge> {
+        if self.failed {
+            // The stream is already abandoned; reporting it again keeps every
+            // later caller on the same error path instead of silently resuming.
+            return Err(EventTooLarge { buffered: 0 });
+        }
+        // A single chunk larger than the whole cap can never become a legal
+        // event, so fail before copying it in: there is no point allocating a
+        // buffer we would immediately abandon.
+        if chunk.len() > MAX_EVENT_BYTES {
+            self.failed = true;
+            return Err(EventTooLarge {
+                buffered: chunk.len(),
+            });
+        }
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::with_capacity(4);
         let mut consumed = 0;
@@ -32,18 +101,34 @@ impl SseParser {
         if consumed > 0 {
             let _ = self.buf.split_to(consumed);
         }
-        out
+        // Everything left is one *incomplete* event: cap it, and release it when
+        // it overruns rather than keeping the bytes around for a parse that can
+        // no longer succeed.
+        if self.buf.len() > MAX_EVENT_BYTES {
+            let buffered = self.buf.len();
+            self.failed = true;
+            self.buf = BytesMut::new();
+            return Err(EventTooLarge { buffered });
+        }
+        Ok(out)
     }
 
     /// Remaining buffered bytes (call at EOF to flush a trailing partial event).
     pub fn finish(&mut self) -> Vec<Bytes> {
-        if self.buf.is_empty() {
+        if self.failed || self.buf.is_empty() {
+            // A failed parse has no trustworthy tail to flush.
             return Vec::new();
         }
         let chunk = self.buf.split().freeze();
         let mut out = Vec::with_capacity(1);
         push_event(&chunk, &mut out);
         out
+    }
+
+    /// Bytes currently held for a partial event (test-only).
+    #[cfg(test)]
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
     }
 }
 
@@ -173,5 +258,77 @@ mod tests {
         let mut p = SseParser::new();
         let out = p.feed(b": comment\nevent: message\ndata: x\n\n");
         assert_eq!(texts(out), vec!["x"]);
+    }
+
+    // ----- the buffer cap -----
+
+    /// A provider that never sends a blank line must not be able to grow the
+    /// buffer forever: the parse fails, the buffer is released, and it stays
+    /// failed instead of resuming on a torn event.
+    #[test]
+    fn an_event_without_a_blank_line_is_refused_at_the_cap() {
+        let mut p = SseParser::new();
+        // 64 KiB of `data: aaaa…` per chunk, no newline anywhere: every chunk is
+        // one more swallow for a buffer that can never complete an event.
+        let chunk = vec![b'a'; 64 * 1024];
+        let mut fed = 0usize;
+        let err = loop {
+            match p.feed_checked(&chunk) {
+                Ok(out) => {
+                    assert!(out.is_empty(), "no event can complete without a newline");
+                    fed += chunk.len();
+                    assert!(
+                        p.buffered_len() <= MAX_EVENT_BYTES,
+                        "the buffer grew to {} bytes",
+                        p.buffered_len()
+                    );
+                    assert!(fed <= MAX_EVENT_BYTES + chunk.len(), "the cap never bit");
+                }
+                Err(e) => break e,
+            }
+        };
+        assert!(err.buffered > MAX_EVENT_BYTES, "{err}");
+        assert!(err.to_string().contains("cap"), "{err}");
+        assert_eq!(p.buffered_len(), 0, "the overrun buffer is released");
+        // Sticky: the stream is over, not just this event.
+        assert!(p.feed_checked(b"data: ok\n\n").is_err());
+        assert!(
+            p.finish().is_empty(),
+            "no tail may be flushed after a failure"
+        );
+    }
+
+    /// One chunk that is larger than the cap is refused without being copied.
+    #[test]
+    fn a_single_oversized_chunk_is_refused_before_it_is_buffered() {
+        let mut p = SseParser::new();
+        let chunk = vec![b'x'; MAX_EVENT_BYTES + 1];
+        let err = p
+            .feed_checked(&chunk)
+            .expect_err("a whole chunk over the cap cannot become an event");
+        assert_eq!(err.buffered, MAX_EVENT_BYTES + 1);
+        assert!(p.buffered_len() <= MAX_EVENT_BYTES);
+    }
+
+    /// The infallible wrapper stays bounded too (it is what the streaming
+    /// translators use), and a healthy stream still parses after a huge *event*,
+    /// because events are released as they complete.
+    #[test]
+    fn the_infallible_wrapper_stops_instead_of_growing() {
+        let mut p = SseParser::new();
+        let chunk = vec![b'b'; 64 * 1024];
+        for _ in 0..40 {
+            assert!(p.feed(&chunk).is_empty());
+        }
+        assert!(p.buffered_len() <= MAX_EVENT_BYTES);
+
+        // Ordinary traffic is unaffected: many complete events in one feed.
+        let mut p = SseParser::new();
+        let mut body = Vec::new();
+        for i in 0..100 {
+            body.extend_from_slice(format!("data: {i}\n\n").as_bytes());
+        }
+        assert_eq!(p.feed(&body).len(), 100);
+        assert_eq!(p.buffered_len(), 0);
     }
 }

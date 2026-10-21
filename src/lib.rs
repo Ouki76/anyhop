@@ -224,6 +224,7 @@ async fn async_main() -> anyhow::Result<()> {
         auth_code_tx: std::sync::Mutex::new(None),
         auth_state_token: std::sync::Mutex::new(None),
         auth_fails: std::sync::Mutex::new(crate::middleware::AuthFailures::default()),
+        tls_enabled_flag: std::sync::atomic::AtomicBool::new(cfg.server.tls_cert.is_some()),
         catalog_epoch: std::sync::atomic::AtomicU64::new(1),
         models_cache: std::sync::Mutex::new(None),
         request_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -323,6 +324,10 @@ pub fn reload_config(state: &Arc<proxy::AppState>) -> anyhow::Result<usize> {
         providers,
         combos: cfg.combos.clone(),
     }));
+    state.tls_enabled_flag.store(
+        cfg.server.tls_cert.is_some(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     *state.cfg.write().unwrap_or_else(|e| e.into_inner()) = proxy::RtConfig {
         max_retries: cfg.server.max_retries,
         attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),

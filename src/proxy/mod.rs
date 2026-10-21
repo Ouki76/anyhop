@@ -77,6 +77,9 @@ pub struct AppState {
     /// Bumped whenever the model catalogue can change (reload, enable/disable,
     /// refresh). `/v1/models` caches its serialized body per epoch.
     pub catalog_epoch: std::sync::atomic::AtomicU64,
+    /// Lock-free mirror of `RtConfig::tls_enabled` for the per-request hardening
+    /// layer, which must not clone the whole config to read one bool.
+    pub tls_enabled_flag: std::sync::atomic::AtomicBool,
     /// (epoch, full body) of the unfiltered catalogue. Client-key allowlists
     /// bypass it — that is the only per-request variable.
     pub models_cache: std::sync::Mutex<Option<(u64, String)>>,
@@ -186,6 +189,16 @@ fn local_bucket(
         .map(std::sync::Arc::new)
 }
 
+/// A client-key name safe to put in a label: the configured name, else a short
+/// digest of the key. The secret itself must never reach metrics, logs or the
+/// request feed — a Prometheus label is copied into a TSDB and kept forever.
+pub fn client_key_label(key: &str, name: Option<&str>) -> String {
+    name.map(str::to_string).unwrap_or_else(|| {
+        let digest = crate::storage::secret_hash(key);
+        format!("key-{}", &digest[..8.min(digest.len())])
+    })
+}
+
 /// Client key permissions, populated by the auth middleware.
 #[derive(Debug, Clone)]
 pub struct KeyPermissions {
@@ -274,7 +287,19 @@ mod tests {
         let shared = ClientKeyRuntime::new_with(key(Some(60), Some(2)), &redis_cfg);
         match shared.shared.as_deref() {
             Some(crate::distributed::SharedLimiter::Redis(l)) => {
-                assert_eq!(l.key(), "anyhop:rl:sk-wiring:60:2");
+                // The bucket name is a digest: the client's bearer token must never
+                // reach Redis, where it would sit in KEYS/MONITOR/RDB/backups.
+                assert_eq!(
+                    l.key(),
+                    format!(
+                        "anyhop:rl:{}:60:2",
+                        crate::distributed::redis::digest("sk-wiring", 16)
+                    )
+                );
+                assert!(
+                    !l.key().contains("sk-wiring"),
+                    "the secret must not appear in the bucket name"
+                );
             }
             other => panic!("expected a redis limiter, got {other:?}"),
         }

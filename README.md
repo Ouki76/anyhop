@@ -206,6 +206,19 @@ sticky_mode = "hash"              # rendezvous hashing: no shared state at all
   correctness-preserving trade-off (an extra failed attempt, not a wrong answer),
   and `[server] state_file` can point at a per-instance file.
 
+## Known limits
+
+Honest list — every item is a deliberate boundary, not a bug:
+
+| Area | Limit |
+| --- | --- |
+| Media/realtime | pass-through only, and only for `openai_compat` providers that declare the capability. Translating Gemini/DashScope-native image or speech APIs is not implemented; the gateway answers `400 unsupported_capability` instead of guessing. |
+| Realtime | the provider connection ignores `[server] proxy`/SOCKS (reqwest cannot hand out an upgraded stream); `wss://` upstreams verify against the system CA bundle; no permessage-deflate. |
+| Response store | capped by `[tuning] response_store_max` (default 1000) and stored per instance in `state_file`; there is no cross-instance response store. |
+| Multi-instance | rate limits and sticky routing are shared/shm-consistent; key health, cooldowns, event and request history stay per instance. |
+| OAuth | token exchange is covered by unit tests with fixed payloads; the live exchange is verified manually, not in CI (it needs real credentials). |
+| i18n | the dashboard is English only. |
+
 ## TLS
 
 Two supported shapes — pick one:

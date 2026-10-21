@@ -237,9 +237,11 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
         Some(b) if b > 0 => {
             // Anthropic 400s when max_tokens <= budget_tokens — grow max_tokens
             // to fit the budget (clients rarely set both).
+            // saturating: `budget_tokens` is client-supplied, and i64::MAX would
+            // otherwise panic on the add (debug) or wrap (release).
             let cur = req["max_tokens"].as_i64().unwrap_or(0);
             if cur <= b {
-                req["max_tokens"] = json!(b + 1);
+                req["max_tokens"] = json!(b.saturating_add(1));
             }
             // ...and rejects temperature/top_p combined with thinking — drop them.
             if let Some(o) = req.as_object_mut() {
@@ -593,4 +595,22 @@ fn add_usage(key: &crate::pool::KeyState, prompt: u64, completion: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     key.prompt_tokens.fetch_add(prompt, Relaxed);
     key.completion_tokens.fetch_add(completion, Relaxed);
+}
+
+#[cfg(test)]
+mod translate_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `budget_tokens` is client-supplied: i64::MAX used to panic on `b + 1`.
+    #[test]
+    fn budget_tokens_of_i64_max_does_not_overflow() {
+        let out = translate_request(&json!({
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"budget_tokens": i64::MAX},
+        }))
+        .expect("translation must not fail on a huge budget");
+        assert!(out["max_tokens"].as_i64().is_some());
+    }
 }

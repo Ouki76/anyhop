@@ -38,6 +38,44 @@ use super::{
 /// Largest upstream body we buffer to build a non-streaming response.
 const MAX_UPSTREAM_BODY: usize = 32 << 20;
 
+/// Largest flattened input text accepted, in bytes.
+///
+/// The transport already caps the request body (`[server] max_body_bytes`, 32 MiB
+/// by default), but this endpoint cannot relay that body: it flattens it into
+/// messages and the pipeline re-serializes them on every attempt, so the text is
+/// copied several times and the copies outlive the request body. Capping the
+/// flattened text keeps that amplification bounded even if the body limit is
+/// raised, and 8 MiB is already far beyond any model's context window.
+const MAX_INPUT_BYTES: usize = 8 << 20;
+
+/// Largest number of `input` items accepted.
+///
+/// A JSON string costs three bytes on the wire but far more as a `Value` plus a
+/// translated message, so a body full of empty strings would be amplified tenfold
+/// or worse without a count cap. 100 000 items is orders of magnitude beyond any
+/// real conversation and still bounds the derived message vector.
+const MAX_INPUT_ITEMS: usize = 100_000;
+
+/// Largest assistant text accumulated while streaming, in bytes.
+///
+/// `StreamMapper` keeps every delta it relays so it can emit
+/// `output_text.done` and store the reply, so a provider that streams forever
+/// grows a `String` without bound: the same amplification [`MAX_INPUT_BYTES`]
+/// bounds on the way in, with no bound at all on the way out. It reuses the same
+/// 8 MiB figure (no model's output reaches it) and, unlike the input path,
+/// overflow *truncates* instead of failing: the client has already received the
+/// deltas, and the event sequence has to stay intact.
+const MAX_OUTPUT_TEXT: usize = MAX_INPUT_BYTES;
+
+/// Upper bound on a requested output budget.
+///
+/// The value is forwarded to the translating providers as `max_tokens`. A caller
+/// asking for 2^64-1 tokens would at best be rejected upstream, and a translator
+/// that narrows the number (e.g. `as_i64().unwrap_or(…)`) would read it as
+/// something else entirely, so it is clamped to a number every provider can at
+/// least parse. It is not a promise: each provider still enforces its own cap.
+const MAX_OUTPUT_TOKENS: u64 = 1_000_000;
+
 /// Accept a Responses request and answer it in the Responses shape, using the
 /// same provider/retry/fallback pipeline as `/v1/chat/completions`.
 pub async fn responses(
@@ -64,7 +102,11 @@ pub async fn responses(
         // (one relaxed store) and let it do the work on its own thread.
         s.set_response_max(store_max);
     }
-    let previous = match resolve_previous(&req, storage, store_max) {
+    // Who owns the stored record. `key_name` is the key's configured name, or a
+    // hash-derived label for an unnamed key, so it identifies the key without
+    // keeping the secret around.
+    let owner = key_perm.as_ref().and_then(|e| e.0.key_name.clone());
+    let previous = match resolve_previous(&req, storage, store_max, owner.as_deref()) {
         Ok(p) => p,
         Err((status, message)) => return error_response(status, message, "invalid_request_error"),
     };
@@ -108,6 +150,7 @@ pub async fn responses(
         provider,
         previous_response_id: previous.as_ref().map(|p| p.id.clone()),
         storage: storage.cloned(),
+        owner,
     };
     if is_stream {
         sse_response(resp, ctx)
@@ -128,6 +171,14 @@ struct ResponseContext {
     previous_response_id: Option<String>,
     /// `None` when the feature is off (no state file, or a zero cap).
     storage: Option<Storage>,
+    /// The client key that owns the record this request stores.
+    ///
+    /// A stored response is replayed as the assistant turn of a later request, so
+    /// the id is a capability: without an owner, any key that learns another
+    /// key's id could read that conversation back. The label comes from
+    /// [`KeyPermissions::key_name`] (configured name, else a hash-derived label),
+    /// so the secret itself is never stored.
+    owner: Option<String>,
 }
 
 impl ResponseContext {
@@ -150,8 +201,12 @@ impl ResponseContext {
                 usage: Some(json!({
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
-                    "total_tokens": input_tokens + output_tokens,
+                    // Saturating: both numbers come from the upstream body, and a
+                    // hostile/broken provider must not turn the totals into a
+                    // debug-build panic.
+                    "total_tokens": input_tokens.saturating_add(output_tokens),
                 })),
+                owner: self.owner.clone(),
             },
         );
     }
@@ -166,6 +221,7 @@ fn resolve_previous(
     v: &Value,
     storage: Option<&Storage>,
     store_max: usize,
+    owner: Option<&str>,
 ) -> Result<Option<StoredResponse>, (StatusCode, String)> {
     let id = match v.get("previous_response_id") {
         None | Some(Value::Null) => return Ok(None),
@@ -181,7 +237,24 @@ fn resolve_previous(
         ));
     };
     match storage.load_response(&id) {
-        Some(rec) => Ok(Some(rec)),
+        Some(rec) => {
+            // Ownership: a record that belongs to another key is answered with the
+            // *same* 400 as a record that does not exist. Saying "not yours" would
+            // confirm that the id is real, which is exactly what an attacker
+            // probing for other keys' conversations wants to know.
+            if let Some(stored) = rec.owner.as_deref()
+                && Some(stored) != owner
+            {
+                debug!(
+                    id,
+                    "rejecting a previous_response_id owned by another client key"
+                );
+                return Err(bad_request(format!(
+                    "'previous_response_id' '{id}' is unknown or expired"
+                )));
+            }
+            Ok(Some(rec))
+        }
         None => Err(bad_request(format!(
             "'previous_response_id' '{id}' is unknown or expired"
         ))),
@@ -429,22 +502,26 @@ fn to_chat_request(v: &Value) -> Result<Value, (StatusCode, String)> {
         Some(x) => Some(
             x.as_u64()
                 .filter(|n| *n > 0)
-                .ok_or_else(|| bad_request("'max_output_tokens' must be a positive integer"))?,
+                .ok_or_else(|| bad_request("'max_output_tokens' must be a positive integer"))?
+                .min(MAX_OUTPUT_TOKENS),
         ),
     };
 
     let mut messages = Vec::new();
+    // Bytes of text flattened so far, against MAX_INPUT_BYTES.
+    let mut used = 0usize;
     match v.get("instructions") {
         None | Some(Value::Null) => {}
         Some(Value::String(s)) => {
             // An empty instruction adds a system turn that says nothing.
             if !s.is_empty() {
+                charge_input(&mut used, s.len())?;
                 messages.push(json!({"role": "system", "content": s}));
             }
         }
         Some(_) => return Err(bad_request("'instructions' must be a string")),
     }
-    push_input_messages(v.get("input"), &mut messages)?;
+    push_input_messages(v.get("input"), &mut messages, &mut used)?;
     if messages.is_empty() {
         return Err(bad_request("'input' contains no messages"));
     }
@@ -494,19 +571,44 @@ fn is_plain_text_format(v: &Value) -> bool {
     }
 }
 
+/// Account for `n` more bytes of input text.
+///
+/// Charged while the input is flattened, so an oversized request is refused
+/// before the message vector (and the JSON derived from it) is built, instead of
+/// after it has already been copied.
+fn charge_input(used: &mut usize, n: usize) -> Result<(), (StatusCode, String)> {
+    *used = used.saturating_add(n);
+    if *used > MAX_INPUT_BYTES {
+        return Err(bad_request(format!(
+            "'input' is too large: more than {MAX_INPUT_BYTES} bytes of text"
+        )));
+    }
+    Ok(())
+}
+
 fn push_input_messages(
     input: Option<&Value>,
     out: &mut Vec<Value>,
+    used: &mut usize,
 ) -> Result<(), (StatusCode, String)> {
     match input {
         None | Some(Value::Null) => Err(bad_request("missing 'input' field")),
         Some(Value::String(s)) => {
+            charge_input(used, s.len())?;
             out.push(user_message(s));
             Ok(())
         }
         Some(Value::Array(items)) => {
+            // Checked before any message is built, so the bound is on the work
+            // done, not just on what is kept.
+            if items.len() > MAX_INPUT_ITEMS {
+                return Err(bad_request(format!(
+                    "'input' has {} items; the cap is {MAX_INPUT_ITEMS}",
+                    items.len()
+                )));
+            }
             for item in items {
-                push_input_item(item, out)?;
+                push_input_item(item, out, used)?;
             }
             Ok(())
         }
@@ -514,9 +616,14 @@ fn push_input_messages(
     }
 }
 
-fn push_input_item(item: &Value, out: &mut Vec<Value>) -> Result<(), (StatusCode, String)> {
+fn push_input_item(
+    item: &Value,
+    out: &mut Vec<Value>,
+    used: &mut usize,
+) -> Result<(), (StatusCode, String)> {
     // Bare strings inside the array mean the same as a string `input`.
     if let Some(text) = item.as_str() {
+        charge_input(used, text.len())?;
         out.push(user_message(text));
         return Ok(());
     }
@@ -538,12 +645,13 @@ fn push_input_item(item: &Value, out: &mut Vec<Value>) -> Result<(), (StatusCode
                     return Err(bad_request(format!("unsupported message role '{other}'")));
                 }
             };
-            let text = message_text(obj.get("content"))?;
+            let text = message_text(obj.get("content"), used)?;
             out.push(json!({"role": role, "content": text}));
             Ok(())
         }
         "input_text" => {
             let text = obj.get("text").and_then(Value::as_str).unwrap_or_default();
+            charge_input(used, text.len())?;
             out.push(user_message(text));
             Ok(())
         }
@@ -554,15 +662,21 @@ fn push_input_item(item: &Value, out: &mut Vec<Value>) -> Result<(), (StatusCode
 }
 
 /// Flatten a message `content` (string or array of parts) to plain text.
-fn message_text(content: Option<&Value>) -> Result<String, (StatusCode, String)> {
+fn message_text(content: Option<&Value>, used: &mut usize) -> Result<String, (StatusCode, String)> {
     match content {
         None | Some(Value::Null) => Ok(String::new()),
-        Some(Value::String(s)) => Ok(s.clone()),
+        Some(Value::String(s)) => {
+            charge_input(used, s.len())?;
+            Ok(s.clone())
+        }
         Some(Value::Array(parts)) => {
             let mut text = String::new();
             for part in parts {
                 match part {
-                    Value::String(s) => text.push_str(s),
+                    Value::String(s) => {
+                        charge_input(used, s.len())?;
+                        text.push_str(s);
+                    }
                     Value::Object(o) => {
                         let ty = o
                             .get("type")
@@ -572,9 +686,10 @@ fn message_text(content: Option<&Value>) -> Result<String, (StatusCode, String)>
                             // `output_text` appears when a client replays a previous
                             // assistant turn back to us.
                             "input_text" | "output_text" | "text" => {
-                                text.push_str(
-                                    o.get("text").and_then(Value::as_str).unwrap_or_default(),
-                                );
+                                let piece =
+                                    o.get("text").and_then(Value::as_str).unwrap_or_default();
+                                charge_input(used, piece.len())?;
+                                text.push_str(piece);
                             }
                             other => {
                                 return Err(bad_request(format!(
@@ -674,7 +789,7 @@ fn response_object(
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
+            "total_tokens": input_tokens.saturating_add(output_tokens),
         },
     })
 }
@@ -800,7 +915,7 @@ impl StreamMapper {
             "usage": {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
+                "total_tokens": input_tokens.saturating_add(output_tokens),
             },
         })
     }
@@ -862,7 +977,7 @@ impl StreamMapper {
             self.item_added = true;
             out.push(self.item_added_event());
         }
-        self.text.push_str(delta);
+        self.push_text(delta);
         let item_id = self.item_id.clone();
         out.push(self.emit(
             "response.output_text.delta",
@@ -874,6 +989,24 @@ impl StreamMapper {
             }),
         ));
         out
+    }
+
+    /// Append a delta to the accumulated reply, stopping at [`MAX_OUTPUT_TEXT`].
+    ///
+    /// Truncating on a `char` boundary keeps the stored/reported text valid
+    /// UTF-8 even when the cut lands inside a multi-byte character, and the delta
+    /// itself has already gone to the client untouched — only the copy we keep is
+    /// bounded.
+    fn push_text(&mut self, delta: &str) {
+        let remaining = MAX_OUTPUT_TEXT.saturating_sub(self.text.len());
+        if remaining == 0 {
+            return;
+        }
+        let mut end = delta.len().min(remaining);
+        while end > 0 && !delta.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&delta[..end]);
     }
 
     /// Terminal frames: `output_text.done` then `response.completed`.
@@ -985,13 +1118,26 @@ fn sse_response(resp: Response, ctx: ResponseContext) -> Response {
                 return None;
             }
             match st.upstream.next().await {
-                Some(Ok(chunk)) => {
-                    let payloads = st.parser.feed(&chunk);
-                    for payload in payloads {
-                        let frames = st.mapper.feed(&payload);
+                Some(Ok(chunk)) => match st.parser.feed_checked(&chunk) {
+                    Ok(payloads) => {
+                        for payload in payloads {
+                            let frames = st.mapper.feed(&payload);
+                            st.queue.extend(frames);
+                        }
+                    }
+                    Err(e) => {
+                        // The upstream is not framing events at all (an endless
+                        // line): end the response with `response.failed` instead of
+                        // relaying a truncated conversation as if it had finished.
+                        debug!(error = %e, "upstream SSE event exceeded the parser cap");
+                        st.ended = true;
+                        let frames = st.mapper.fail(&json!({
+                            "type": "upstream_error",
+                            "message": e.to_string(),
+                        }));
                         st.queue.extend(frames);
                     }
-                }
+                },
                 Some(Err(e)) => {
                     debug!(error = %e, "upstream stream error");
                     st.ended = true;
@@ -1033,6 +1179,7 @@ mod tests {
             provider: "test".to_string(),
             previous_response_id: previous.map(str::to_string),
             storage: None,
+            owner: None,
         }
     }
 
@@ -1060,6 +1207,7 @@ mod tests {
             ]),
             output_text: "hello".to_string(),
             usage: None,
+            owner: None,
         }
     }
 
@@ -1263,7 +1411,7 @@ mod tests {
     #[test]
     fn previous_response_id_without_a_store_is_a_400() {
         let (status, message) =
-            resolve_previous(&json!({"previous_response_id": "resp_1"}), None, 1000)
+            resolve_previous(&json!({"previous_response_id": "resp_1"}), None, 1000, None)
                 .expect_err("no store: the id must be refused, not ignored");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(message.contains("previous_response_id"), "{message}");
@@ -1275,15 +1423,16 @@ mod tests {
 
     #[test]
     fn a_null_previous_response_id_starts_a_conversation() {
-        let prev = resolve_previous(&json!({"previous_response_id": null}), None, 1000)
+        let prev = resolve_previous(&json!({"previous_response_id": null}), None, 1000, None)
             .expect("null means 'no previous response'");
         assert!(prev.is_none());
     }
 
     #[test]
     fn a_non_string_previous_response_id_is_a_400() {
-        let (status, message) = resolve_previous(&json!({"previous_response_id": 7}), None, 1000)
-            .expect_err("an id must be a string");
+        let (status, message) =
+            resolve_previous(&json!({"previous_response_id": 7}), None, 1000, None)
+                .expect_err("an id must be a string");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(message.contains("previous_response_id"), "{message}");
     }
@@ -1297,15 +1446,21 @@ mod tests {
         store.save_response("resp_1", stored("resp_1", 1));
         store.flush_async().await;
 
-        let prev = resolve_previous(&json!({"previous_response_id": "resp_1"}), Some(&store), 10)
-            .expect("a stored id resolves")
-            .expect("the record comes back");
+        let prev = resolve_previous(
+            &json!({"previous_response_id": "resp_1"}),
+            Some(&store),
+            10,
+            None,
+        )
+        .expect("a stored id resolves")
+        .expect("the record comes back");
         assert_eq!(prev.output_text, "hello");
 
         let (status, message) = resolve_previous(
             &json!({"previous_response_id": "resp_gone"}),
             Some(&store),
             10,
+            None,
         )
         .expect_err("nothing was stored under that id");
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1324,13 +1479,89 @@ mod tests {
 
         // The record is still on disk, but the feature is off: refusing is the
         // only honest answer (a fresh conversation would look like a replay).
-        let (status, message) =
-            resolve_previous(&json!({"previous_response_id": "resp_1"}), Some(&store), 0)
-                .expect_err("a zero cap disables the store");
+        let (status, message) = resolve_previous(
+            &json!({"previous_response_id": "resp_1"}),
+            Some(&store),
+            0,
+            None,
+        )
+        .expect_err("a zero cap disables the store");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
             message.contains("response storage is disabled"),
             "{message}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A record can carry an owner; the base helper stays ownerless so the
+    /// upgrade path (records written before ownership) keeps a test too.
+    fn owned(id: &str, created_at: u64, owner: &str) -> StoredResponse {
+        StoredResponse {
+            owner: Some(owner.to_string()),
+            ..stored(id, created_at)
+        }
+    }
+
+    /// The record is bound to the key that produced it: the same key replays it,
+    /// another key gets exactly the "unknown or expired" 400 an id that never
+    /// existed would get.
+    #[tokio::test]
+    async fn a_stored_response_only_replays_for_its_own_key() {
+        let path = scratch("owner");
+        let store = Storage::open(path.to_str().expect("temp path is UTF-8"))
+            .expect("the state file opens");
+        store.set_response_max(10);
+        store.save_response("resp_mine", owned("resp_mine", 1, "key-a"));
+        store.flush_async().await;
+
+        let prev = resolve_previous(
+            &json!({"previous_response_id": "resp_mine"}),
+            Some(&store),
+            10,
+            Some("key-a"),
+        )
+        .expect("the owner replays its own turn")
+        .expect("the record comes back");
+        assert_eq!(prev.output_text, "hello");
+
+        let (status, message) = resolve_previous(
+            &json!({"previous_response_id": "resp_mine"}),
+            Some(&store),
+            10,
+            Some("key-b"),
+        )
+        .expect_err("another key must not read this conversation");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("unknown or expired"), "{message}");
+        // Indistinguishable from an id that was never stored: the answer must not
+        // confirm that this response id exists. Only the echoed id differs.
+        let (_, missing) = resolve_previous(
+            &json!({"previous_response_id": "resp_missing"}),
+            Some(&store),
+            10,
+            Some("key-b"),
+        )
+        .expect_err("unknown id");
+        assert_eq!(
+            message.replace("resp_mine", "<id>"),
+            missing.replace("resp_missing", "<id>")
+        );
+
+        // A record with no owner (written before ownership was tracked) still
+        // replays: an upgrade must not cut live conversations off.
+        store.save_response("resp_legacy", stored("resp_legacy", 2));
+        store.flush_async().await;
+        assert!(
+            resolve_previous(
+                &json!({"previous_response_id": "resp_legacy"}),
+                Some(&store),
+                10,
+                Some("key-b"),
+            )
+            .is_ok(),
+            "an unowned record stays replayable"
         );
 
         let _ = std::fs::remove_file(&path);
@@ -1350,6 +1581,7 @@ mod tests {
             provider: "mock".to_string(),
             previous_response_id: Some("resp_prev".to_string()),
             storage: Some(store.clone()),
+            owner: None,
         };
         let upstream = json!({
             "choices": [{"message": {"role": "assistant", "content": "hello"}}],
@@ -1399,6 +1631,7 @@ mod tests {
             provider: "mock".to_string(),
             previous_response_id: None,
             storage: Some(store.clone()),
+            owner: None,
         };
         let upstream = futures::stream::iter(vec![
             Ok::<Bytes, std::io::Error>(Bytes::from_static(
@@ -1590,6 +1823,49 @@ mod tests {
         assert!(mapper.ok, "a completed stream is worth storing");
     }
 
+    /// A provider streaming forever must not grow the retained reply without
+    /// bound: the deltas reach the client, the copy we keep stops at the cap, and
+    /// the terminal events still describe valid UTF-8.
+    #[test]
+    fn the_accumulated_text_stops_at_the_cap_on_a_char_boundary() {
+        let mut mapper = StreamMapper::new("m".to_string(), None);
+        let _ = mapper.start();
+        // "€" is three bytes, so the cap lands inside a character.
+        let big = "€".repeat((MAX_OUTPUT_TEXT / 3) + 1000);
+        let chunk = json!({"choices": [{"delta": {"content": big}}]}).to_string();
+        let frames = mapper.feed(chunk.as_bytes());
+        assert_eq!(
+            event_names(&frames),
+            vec!["response.output_item.added", "response.output_text.delta"]
+        );
+        assert!(
+            mapper.text.len() <= MAX_OUTPUT_TEXT,
+            "retained {} bytes, cap is {MAX_OUTPUT_TEXT}",
+            mapper.text.len()
+        );
+        assert!(
+            mapper.text.len() > MAX_OUTPUT_TEXT - 3,
+            "the cap must be reached, not undershot"
+        );
+        assert_eq!(
+            mapper.text.chars().count() * 3,
+            mapper.text.len(),
+            "truncation cut through a character"
+        );
+        // The terminal events report exactly the text that was kept.
+        let done = mapper.finish();
+        assert_eq!(
+            data_of(&done[0])["text"].as_str().map(str::len),
+            Some(mapper.text.len())
+        );
+        assert_eq!(
+            data_of(&done[1])["response"]["output_text"]
+                .as_str()
+                .map(str::len),
+            Some(mapper.text.len())
+        );
+    }
+
     #[test]
     fn a_failed_stream_is_not_stored() {
         let mut mapper = StreamMapper::new("m".to_string(), None);
@@ -1645,6 +1921,35 @@ mod tests {
         );
     }
 
+    /// A provider that never sends a blank line is not framing SSE at all: the
+    /// response ends with `response.failed` instead of relaying a truncated
+    /// conversation as if it had completed.
+    #[tokio::test]
+    async fn an_endless_upstream_event_fails_the_stream_cleanly() {
+        let huge = vec![b'x'; 1536 * 1024]; // > the 1 MiB event cap, no blank line
+        let upstream = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(huge))]);
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(upstream))
+            .expect("in-memory response is well formed");
+
+        let relayed = sse_response(resp, test_ctx("m", None));
+        let body = axum::body::to_bytes(relayed.into_body(), 1 << 20)
+            .await
+            .expect("the relayed body collects");
+        let text = std::str::from_utf8(&body).expect("frames are UTF-8");
+        assert!(
+            text.contains("event: response.failed"),
+            "the stream must fail loudly: {text}"
+        );
+        assert!(
+            !text.contains("event: response.completed"),
+            "an unfinished reply must not be reported as complete"
+        );
+        assert!(text.contains("cap"), "the error names the cap: {text}");
+    }
+
     #[test]
     fn upstream_error_frame_ends_the_stream_as_failed() {
         let mut mapper = StreamMapper::new("m".to_string(), None);
@@ -1656,5 +1961,287 @@ mod tests {
         );
         assert!(mapper.finish().is_empty(), "failed is terminal too");
         assert_eq!(data_of(&frames[1])["error"]["message"], "boom");
+    }
+
+    // ----- hostile request bodies -----
+    //
+    // `input` is attacker-controlled and this endpoint cannot relay it verbatim:
+    // it flattens it into chat messages, so every test here pins the bound that
+    // stops a small body from becoming a large allocation.
+
+    #[test]
+    fn deeply_nested_input_is_a_clean_error() {
+        // 1000 levels of `[[[…]]]` as an input item. The translator inspects one
+        // level only, so there is nothing to recurse into and the answer is a
+        // plain 400.
+        let mut item = json!("bottom");
+        for _ in 0..1000 {
+            item = Value::Array(vec![item]);
+        }
+        let (status, message) =
+            to_chat_request(&json!({"model": "m", "input": [item]})).expect_err("not a message");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("object or a string"), "{message}");
+
+        // The same shape inside a message's `content` is refused just as flatly.
+        let mut part = json!("bottom");
+        for _ in 0..1000 {
+            part = Value::Array(vec![part]);
+        }
+        let (status, message) = to_chat_request(&json!({
+            "model": "m",
+            "input": [{"type": "message", "role": "user", "content": [part]}]
+        }))
+        .expect_err("not a content part");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("content parts"), "{message}");
+    }
+
+    #[test]
+    fn a_thousand_levels_of_json_is_refused_by_the_parser_first() {
+        // The handler parses before it translates; serde_json's own recursion
+        // limit means such a body never even becomes a `Value`, which is the
+        // outermost of the two guards.
+        let deep = format!("{}{}", "[".repeat(1000), "]".repeat(1000));
+        assert!(
+            serde_json::from_slice::<Value>(deep.as_bytes()).is_err(),
+            "a 1000-deep body must not deserialize"
+        );
+        // A depth that really is harmless still parses, so the limit is not
+        // rejecting ordinary nesting.
+        assert!(serde_json::from_slice::<Value>(b"[[1]]").is_ok());
+    }
+
+    #[test]
+    fn a_ten_megabyte_input_is_refused_and_a_large_one_still_works() {
+        // 10 MiB of text: refused before the message is built.
+        let (status, message) = to_chat_request(&json!({
+            "model": "m",
+            "input": "x".repeat(10 << 20),
+        }))
+        .expect_err("over the input cap");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("too large"), "{message}");
+
+        // Just under the cap is translated unchanged: ordinary large prompts keep
+        // working, so the cap is a bound and not a behaviour change.
+        let text = "y".repeat((8 << 20) - 16);
+        let chat = to_chat_request(&json!({"model": "m", "input": text}))
+            .expect("under the cap is accepted");
+        assert_eq!(
+            chat["messages"][0]["content"].as_str().map(str::len),
+            Some((8 << 20) - 16)
+        );
+    }
+
+    #[test]
+    fn too_many_input_items_are_refused_before_they_become_messages() {
+        // Empty strings are three bytes of body each but a whole `Value` plus a
+        // whole message each, so the count is capped independently of the bytes.
+        let items: Vec<Value> = (0..=MAX_INPUT_ITEMS).map(|_| json!("")).collect();
+        let (status, message) = to_chat_request(&json!({"model": "m", "input": items}))
+            .expect_err("item cap must bite");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("items"), "{message}");
+
+        // Exactly at the cap is still translated.
+        let items: Vec<Value> = (0..MAX_INPUT_ITEMS).map(|_| json!("")).collect();
+        let chat =
+            to_chat_request(&json!({"model": "m", "input": items})).expect("the cap is inclusive");
+        assert_eq!(
+            chat["messages"].as_array().map(Vec::len),
+            Some(MAX_INPUT_ITEMS)
+        );
+    }
+
+    #[test]
+    fn non_object_input_items_are_rejected() {
+        for item in [json!(42), json!(1.5), json!(true), json!(null), json!([])] {
+            let (status, _) = to_chat_request(&json!({"model": "m", "input": [item.clone()]}))
+                .expect_err("not a message");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{item}");
+        }
+        // An object with an unsupported item type is refused by name.
+        let (status, message) = to_chat_request(&json!({
+            "model": "m",
+            "input": [{"type": "function_call"}]
+        }))
+        .expect_err("unsupported item type");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("function_call"), "{message}");
+
+        // …and `input` itself must be a string or an array.
+        for bad in [json!(7), json!(true), json!({"a": 1})] {
+            let (status, message) =
+                to_chat_request(&json!({"model": "m", "input": bad})).expect_err("not an input");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(message.contains("string or an array"), "{message}");
+        }
+    }
+
+    #[test]
+    fn null_and_empty_content_become_an_empty_message() {
+        // Not an error: a message with no content is a legal (if empty) turn.
+        let chat = to_chat_request(&json!({
+            "model": "m",
+            "input": [{"type": "message", "role": "user", "content": null}]
+        }))
+        .expect("null content is legal");
+        assert_eq!(chat["messages"], json!([{"role": "user", "content": ""}]));
+
+        // An empty part array does the same, and a part with no `text` adds "".
+        let chat = to_chat_request(&json!({
+            "model": "m",
+            "input": [
+                {"role": "user", "content": []},
+                {"role": "user", "content": [{"type": "input_text"}, {"type": "input_text", "text": "tail"}]}
+            ]
+        }))
+        .expect("empty parts are legal");
+        assert_eq!(chat["messages"][0]["content"], "");
+        assert_eq!(chat["messages"][1]["content"], "tail");
+    }
+
+    #[test]
+    fn huge_max_output_tokens_is_clamped_not_overflowed() {
+        for asked in [
+            u64::MAX,
+            u64::MAX / 2,
+            MAX_OUTPUT_TOKENS + 1,
+            1_000_000_000_000,
+        ] {
+            let chat = to_chat_request(&json!({
+                "model": "m",
+                "input": "hi",
+                "max_output_tokens": asked,
+            }))
+            .expect("an over-large budget is clamped, not fatal");
+            assert_eq!(
+                chat["max_tokens"],
+                json!(MAX_OUTPUT_TOKENS),
+                "{asked} was not clamped"
+            );
+            // The clamped value must be readable both ways: the translators use
+            // `as_u64` and `as_i64`.
+            assert_eq!(chat["max_tokens"].as_u64(), Some(MAX_OUTPUT_TOKENS));
+            assert_eq!(chat["max_tokens"].as_i64(), Some(MAX_OUTPUT_TOKENS as i64));
+        }
+        // A sane budget is forwarded untouched.
+        let chat = to_chat_request(&json!({"model": "m", "input": "hi", "max_output_tokens": 256}))
+            .expect("sane budget");
+        assert_eq!(chat["max_tokens"], 256);
+        // Zero, negatives and non-numbers are still refused.
+        for bad in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("256"),
+            json!({}),
+            json!([]),
+        ] {
+            let (status, message) = to_chat_request(&json!({
+                "model": "m",
+                "input": "hi",
+                "max_output_tokens": bad,
+            }))
+            .expect_err("not a positive integer");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(message.contains("max_output_tokens"), "{bad}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_previous_response_id_chain_grows_linearly_and_cannot_cycle() {
+        // Replay is a *flatten*, not a walk: `replay_history` copies the stored
+        // messages and never follows `previous_response_id`. A cycle is therefore
+        // structurally impossible — there is no pointer to loop on — and the only
+        // cost is the linear growth of the flattened history shown here.
+        let mut prev = stored("resp_0", 0);
+        let mut prev_len = 2; // `stored()` carries two messages
+        for turn in 1..=100u64 {
+            let mut chat = to_chat_request(&json!({"model": "m", "input": format!("turn {turn}")}))
+                .expect("a plain follow-up translates");
+            replay_history(&mut chat, &prev);
+            let messages = chat["messages"].as_array().expect("messages").clone();
+            assert_eq!(messages.len(), prev_len + 2, "turn {turn}");
+            assert_eq!(messages[0]["content"], "be terse");
+            assert_eq!(messages[prev_len]["role"], "assistant");
+            assert_eq!(messages[prev_len]["content"], "hello");
+            assert_eq!(messages[prev_len + 1]["content"], format!("turn {turn}"));
+            // The next record stores exactly what went upstream — the expansion
+            // itself, not a reference — which is what makes the chain terminate.
+            prev_len = messages.len();
+            prev = StoredResponse {
+                id: format!("resp_{turn}"),
+                input: Value::Array(messages),
+                ..stored("scratch", turn)
+            };
+        }
+        assert_eq!(prev_len, 2 + 2 * 100);
+
+        // Records with an unexpected shape still replay, defensively.
+        let mut rec = stored("resp_s", 0);
+        rec.input = json!("legacy string input");
+        let mut chat = to_chat_request(&json!({"model": "m", "input": "next"})).expect("ok");
+        replay_history(&mut chat, &rec);
+        assert_eq!(
+            chat["messages"],
+            json!([
+                {"role": "user", "content": "legacy string input"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "next"},
+            ])
+        );
+        rec.input = Value::Null;
+        let mut chat = to_chat_request(&json!({"model": "m", "input": "next"})).expect("ok");
+        replay_history(&mut chat, &rec);
+        assert_eq!(chat["messages"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn absurd_upstream_usage_saturates_instead_of_overflowing() {
+        // `usage` comes from the upstream body, so both numbers are arbitrary
+        // u64s. `u64::MAX + 1` must not panic a debug build (or wrap into a tiny
+        // total in release).
+        let chat = json!({"usage": {"prompt_tokens": u64::MAX, "completion_tokens": 1}});
+        let usage = usage_pair(&chat);
+        assert_eq!(usage, (u64::MAX, 1));
+
+        let out = response_object("resp_x", 0, "m", "msg_x", "hi", usage, None);
+        assert_eq!(out["usage"]["input_tokens"], json!(u64::MAX));
+        assert_eq!(out["usage"]["output_tokens"], json!(1));
+        assert_eq!(out["usage"]["total_tokens"], json!(u64::MAX));
+
+        // The streaming snapshots sum the same numbers.
+        let mut mapper = StreamMapper::new("m".to_string(), None);
+        mapper.usage = usage;
+        let snapshot = mapper.snapshot("completed", json!([]));
+        assert_eq!(snapshot["usage"]["total_tokens"], json!(u64::MAX));
+    }
+
+    #[tokio::test]
+    async fn storing_absurd_usage_saturates_too() {
+        let path = scratch("usage");
+        let store = Storage::open(path.to_str().expect("temp path is UTF-8"))
+            .expect("the state file opens");
+        store.set_response_max(10);
+        let ctx = ResponseContext {
+            input: json!([{"role": "user", "content": "hi"}]),
+            model: "m".to_string(),
+            provider: "mock".to_string(),
+            previous_response_id: None,
+            storage: Some(store.clone()),
+            owner: None,
+        };
+        ctx.persist("resp_huge", 1, "hi", (u64::MAX, 1));
+        store.flush_async().await;
+        let rec = store
+            .load_response("resp_huge")
+            .expect("the reply was stored");
+        assert_eq!(
+            rec.usage.as_ref().and_then(|u| u.get("total_tokens")),
+            Some(&json!(u64::MAX))
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

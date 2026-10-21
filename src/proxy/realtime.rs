@@ -44,9 +44,12 @@
 //! # Limits
 //!
 //! A session is bounded by [`IDLE_TIMEOUT`] (no frame in *either* direction),
-//! [`MAX_SESSION_BYTES`] per direction, and the frame/message caps in
-//! [`crate::ws`]. Realtime audio is a few KiB per event, so these limits are
-//! generous for real clients and useless as an amplifier for hostile ones.
+//! [`MAX_SESSION_LIFETIME`] (an absolute ceiling, because pings refresh the idle
+//! timer), [`MAX_SESSION_BYTES`] per direction, the per-write [`WRITE_TIMEOUT`],
+//! and the frame/message caps in [`crate::ws`]. The number of sessions in the
+//! process is bounded too ([`MAX_SESSIONS`]). Realtime audio is a few KiB per
+//! event, so these limits are generous for real clients and useless as an
+//! amplifier for hostile ones.
 //!
 //! # Known limitations
 //!
@@ -60,9 +63,11 @@
 //!   extensions (permessage-deflate) are not negotiated, so neither side
 //!   compresses — the upstream offer is not forwarded.
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -99,9 +104,9 @@ const MAX_PENDING_FRAMES: usize = 8;
 
 /// Total payload buffered while waiting for the model.
 ///
-/// Without this cap a client could park [`MAX_PENDING_FRAMES`] × 16 MiB of
-/// frames per connection before ever naming a model, which is exactly the sort
-/// of pre-session memory amplification the frame caps exist to prevent.
+/// Without this cap a client could park [`MAX_PENDING_FRAMES`] × one full-size
+/// frame per connection before ever naming a model, which is exactly the sort of
+/// pre-session memory amplification the frame caps exist to prevent.
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
 
 /// Connect (TCP + TLS) budget for the provider.
@@ -115,6 +120,86 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Per-direction byte budget for one session (payload bytes, both ways).
 const MAX_SESSION_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Deadline for a single frame write to either peer.
+///
+/// Every write happens **inside** a `select!` arm body, not as a select branch.
+/// A peer that stops reading drives its receive window to zero, `write_all` then
+/// pends forever, and the relay never gets back to `select!` — so the idle timer
+/// (and every other deadline) is never polled again and the task, both sockets and
+/// the provider key slot stay pinned by a client that simply does not read. That
+/// is a cheap resource-exhaustion attack, so each write carries a deadline and
+/// expiry is a session error (close 1011) instead of a stall. 10 s is far beyond
+/// what any working peer needs to drain a frame, and short enough that a stalled
+/// session gives its slots back promptly.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many realtime sessions this process may run at once.
+///
+/// One session costs a client socket, an upstream socket, a provider key slot and
+/// a task; without a budget a client opens sockets until the process runs out of
+/// descriptors, and each of them also holds a provider key (starving every other
+/// endpoint). 512 is far above what a single process serves comfortably in
+/// practice, so a real deployment never notices the cap while the hostile case is
+/// bounded. Kept as a constant rather than configuration: it describes what one
+/// process can hold, not an operator policy.
+const MAX_SESSIONS: usize = 512;
+
+/// Hard ceiling on how long one session may live.
+///
+/// The idle timer is refreshed by *any* frame, pings included, so a peer that
+/// pings on schedule can keep a session (and its provider key slot) forever.
+/// Realtime sessions are interactive: a client reconnects and resumes, so an hour
+/// is far beyond any legitimate session. The close code is 1001 ("going away"),
+/// which tells the client to reconnect rather than to treat it as an error.
+const MAX_SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60);
+
+/// Running sessions, kept honest by [`SessionSlot`].
+static ACTIVE_SESSIONS: LazyLock<Arc<AtomicUsize>> =
+    LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
+
+/// A reserved session slot: the process-wide budget is held as long as this lives.
+///
+/// Acquired before the 101 and released by `Drop`, so *every* way a session can
+/// end — a normal close, a protocol error, a write timeout, an upgrade that never
+/// completes — returns the slot. Nothing else decrements the counter.
+struct SessionSlot {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for SessionSlot {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Reserve one slot, or `None` when `cap` sessions are already running.
+///
+/// Compare-and-increment in one atomic step: a `load() < cap` check followed by a
+/// separate increment would let two upgrades both take the last slot. The cap is a
+/// parameter (rather than only the global) so the limit itself is testable.
+fn acquire_session_slot(active: &Arc<AtomicUsize>, cap: usize) -> Option<SessionSlot> {
+    let mut running = active.load(Ordering::Relaxed);
+    loop {
+        if running >= cap {
+            return None;
+        }
+        match active.compare_exchange_weak(
+            running,
+            running + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                return Some(SessionSlot {
+                    active: Arc::clone(active),
+                });
+            }
+            // Somebody else took/released a slot: retry against the new value.
+            Err(current) => running = current,
+        }
+    }
+}
 
 /// Where to look for the system trust anchors used by `wss://` targets.
 const CA_BUNDLES: [&str; 3] = [
@@ -140,6 +225,18 @@ pub async fn realtime(
     let client_key = key_perm.as_ref().and_then(|e| e.0.key_name.clone());
     let allowed = key_perm.as_ref().and_then(|e| e.0.allowed_models.clone());
 
+    // The per-client-key concurrency slot for an upgrade arrives in the *request*
+    // extensions, unlike every other request, where the middleware attaches it to
+    // the response. A websocket answers its 101 from here and then lives on in a
+    // spawned task, so a response-attached guard would be dropped the instant the
+    // 101 was returned: the key's `max_concurrent` counter would fall back to zero
+    // while the session (and its provider key slot) is still in use, which is
+    // precisely the concurrency the guard exists to cap. Taking it out of the
+    // request and keeping it in `SessionCtx` releases it when the session ends.
+    let client_slot = req
+        .extensions_mut()
+        .remove::<crate::middleware::ClientKeyGuard>();
+
     // Everything that can fail *before* the upgrade is answered with a normal
     // HTTP error, so the client never has to guess why its socket closed.
     let handshake = match validate_handshake(&headers) {
@@ -159,6 +256,21 @@ pub async fn realtime(
     };
 
     let on_upgrade = hyper::upgrade::on(&mut req);
+
+    // Capacity, not policy: refused before the upgrade so the client gets a real
+    // HTTP error instead of a socket that is closed right after its 101. The slot
+    // is dropped with `session_slot` when the session ends (or immediately, if the
+    // builder below fails).
+    let Some(session_slot) = acquire_session_slot(&ACTIVE_SESSIONS, MAX_SESSIONS) else {
+        warn!("realtime: refusing a session, {MAX_SESSIONS} already running");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "the gateway is already running {MAX_SESSIONS} realtime sessions; retry shortly"
+            ),
+            "overloaded",
+        );
+    };
 
     let mut builder = axum::http::Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
@@ -185,6 +297,8 @@ pub async fn realtime(
         subprotocol: handshake.subprotocol,
         model_hint,
         started: Instant::now(),
+        _client_slot: client_slot,
+        _session_slot: session_slot,
     };
     tokio::spawn(async move { run_session(ctx, on_upgrade).await });
     response
@@ -648,6 +762,14 @@ struct SessionCtx {
     subprotocol: Option<String>,
     model_hint: Option<String>,
     started: Instant,
+    /// The client key's concurrency slot, held (never read) until this context is
+    /// dropped at the end of the session task.
+    ///
+    /// `None` when the key has no concurrency cap, when no client keys are
+    /// configured, or when the middleware took the response path.
+    _client_slot: Option<crate::middleware::ClientKeyGuard>,
+    /// The process-wide session budget slot, held for the same reason.
+    _session_slot: SessionSlot,
 }
 
 /// Drive one websocket session: upgrade, resolve, connect upstream, relay, log.
@@ -661,16 +783,27 @@ async fn run_session(ctx: SessionCtx, on_upgrade: hyper::upgrade::OnUpgrade) {
         subprotocol,
         model_hint,
         started,
+        // Both guards are bound (not read) for the whole function: they release
+        // the per-key concurrency counter and the session budget only when this
+        // task ends, whatever ended it.
+        _client_slot,
+        _session_slot,
     } = ctx;
 
-    let upgraded = match on_upgrade.await {
-        Ok(upgraded) => upgraded,
-        Err(e) => {
+    // A peer that accepts the 101 and then never lets the upgrade complete would
+    // otherwise hold a session slot forever, so the handover is bounded too.
+    let upgraded = match tokio::time::timeout(CONNECT_TIMEOUT, on_upgrade).await {
+        Err(_) => {
+            warn!(model = ?model_hint, "realtime: the connection did not upgrade in time");
+            return;
+        }
+        Ok(Err(e)) => {
             // The client vanished (or the transport was not upgradeable, e.g.
             // HTTP/2) before hyper could hand the socket over.
             warn!(model = ?model_hint, error = %e, "realtime: the connection could not be upgraded");
             return;
         }
+        Ok(Ok(upgraded)) => upgraded,
     };
 
     let (client_reader, mut client_writer) = tokio::io::split(HyperIo::new(upgraded));
@@ -834,9 +967,17 @@ where
             // Keepalives are answered on this hop; they are not part of the
             // session and must not be replayed upstream.
             OpCode::Ping => {
-                ws::write_frame(writer, &Frame::pong(frame.payload))
-                    .await
-                    .map_err(|e| Reject::bad_request(format!("cannot answer a ping: {e}")))?;
+                // Deadline here too: this runs before the relay loop exists, and a
+                // client with a zero receive window would otherwise pin the task
+                // (and the session budget slot) in a write that never completes.
+                let pong = Frame::pong(frame.payload);
+                write_within(
+                    WRITE_TIMEOUT,
+                    "pong to the client",
+                    ws::write_frame(writer, &pong),
+                )
+                .await
+                .map_err(|e| Reject::bad_request(format!("cannot answer a ping: {e}")))?;
                 continue;
             }
             OpCode::Pong => continue,
@@ -920,8 +1061,20 @@ async fn fail_session<W: AsyncWrite + Unpin>(
         "type": "error",
         "error": {"type": kind, "message": message},
     });
-    let _ = ws::write_frame(writer, &Frame::text(event.to_string())).await;
-    let _ = ws::write_frame(writer, &Frame::close(1011, "gateway: upstream unavailable")).await;
+    // Both writes carry the write deadline: a client that stopped reading must
+    // not be able to pin this task (and the session slot it holds) here either.
+    let _ = write_within(
+        WRITE_TIMEOUT,
+        "error event to the client",
+        ws::write_frame(writer, &Frame::text(event.to_string())),
+    )
+    .await;
+    let _ = write_within(
+        WRITE_TIMEOUT,
+        "close to the client",
+        ws::write_frame(writer, &Frame::close(1011, "gateway: upstream unavailable")),
+    )
+    .await;
     state.log_request(crate::events::RequestRecord {
         ts: unix_now(),
         provider: target.map_or_else(|| "realtime".to_string(), |t| t.provider_name.clone()),
@@ -1088,11 +1241,23 @@ fn handshake_request(
     Ok(request)
 }
 
-/// Verify the provider's `101` and its `Sec-WebSocket-Accept`.
+/// Verify the provider's `101`: status, the two upgrade tokens, no body, and the
+/// `Sec-WebSocket-Accept` value.
 ///
-/// The accept check proves the peer actually understood the websocket
-/// handshake (and is not a caching proxy replaying someone else's 101), which is
-/// why it is not optional.
+/// The accept check proves the peer actually understood the websocket handshake
+/// (and is not a caching proxy replaying someone else's 101), which is why it is
+/// not optional. It is not sufficient on its own either:
+///
+/// * A `101` must also confirm the switch with `Upgrade: websocket` **and**
+///   `Connection: Upgrade` (RFC 6455 §4.1 — the client has to see both to switch
+///   protocols). A response that merely happens to carry the right accept could
+///   be a plain `200`-style reply from something that is not a websocket gateway,
+///   and treating it as a socket would relay HTTP bytes as frames.
+/// * A `101` declares the connection is now a websocket, so it cannot have a
+///   body. `Content-Length: 5` (or any `Transfer-Encoding`) means the peer is
+///   about to send bytes that *are not frames*; they would be replayed into the
+///   frame reader, which is precisely the request-smuggling shape: one peer's
+///   framing becoming another's payload. Both are refused instead.
 fn verify_handshake_response(head: &str, expected_accept: &str) -> Result<(), String> {
     let mut lines = head.split("\r\n");
     let status_line = lines
@@ -1110,12 +1275,57 @@ fn verify_handshake_response(head: &str, expected_accept: &str) -> Result<(), St
         ));
     }
     let mut accept = None;
+    let mut upgrade = false;
+    let mut connection_upgrade = false;
+    let mut declares_body = false;
     for line in lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("sec-websocket-accept")
-        {
-            accept = Some(value.trim().to_string());
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("upgrade") {
+            // A token list: `Upgrade: websocket` (anything else listed with it is
+            // ignored, the token is what matters).
+            upgrade |= value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("websocket"));
+        } else if name.eq_ignore_ascii_case("connection") {
+            connection_upgrade |= value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            // Any transfer coding means a body follows.
+            declares_body = true;
+        } else if name.eq_ignore_ascii_case("content-length") {
+            // `Content-Length: 0` is harmless and some servers send it; anything
+            // else (including an unparsable value) promises body bytes.
+            declares_body |= match value.parse::<u64>() {
+                Ok(len) => len != 0,
+                Err(_) => true,
+            };
+        } else if name.eq_ignore_ascii_case("sec-websocket-accept") {
+            accept = Some(value.to_string());
         }
+    }
+    // Checked in this order so the message names the first thing that is wrong;
+    // all four properties are required.
+    if !upgrade {
+        return Err(
+            "the provider's 101 has no 'Upgrade: websocket' header (RFC 6455 §4.1)".to_string(),
+        );
+    }
+    if !connection_upgrade {
+        return Err(
+            "the provider's 101 has no 'Connection: Upgrade' token (RFC 6455 §4.1)".to_string(),
+        );
+    }
+    if declares_body {
+        return Err(
+            "the provider's 101 declares a body (Content-Length/Transfer-Encoding); those \
+             bytes would not be websocket frames"
+                .to_string(),
+        );
     }
     match accept {
         Some(value) if value == expected_accept => Ok(()),
@@ -1446,6 +1656,10 @@ struct Limits {
     idle: Duration,
     /// Per-direction payload budget for the whole session.
     max_bytes: u64,
+    /// Deadline for one frame write (see [`WRITE_TIMEOUT`]).
+    write_timeout: Duration,
+    /// Absolute session lifetime (see [`MAX_SESSION_LIFETIME`]).
+    lifetime: Duration,
 }
 
 impl Default for Limits {
@@ -1453,6 +1667,8 @@ impl Default for Limits {
         Self {
             idle: IDLE_TIMEOUT,
             max_bytes: MAX_SESSION_BYTES,
+            write_timeout: WRITE_TIMEOUT,
+            lifetime: MAX_SESSION_LIFETIME,
         }
     }
 }
@@ -1468,6 +1684,8 @@ enum Outcome {
     Idle,
     /// A per-direction byte budget was exceeded.
     Budget,
+    /// [`Limits::lifetime`] elapsed (pings kept the idle timer alive).
+    Lifetime,
     /// Framing or transport failure (the message says which).
     Error(String),
 }
@@ -1506,11 +1724,29 @@ where
     let mut sent_up: u64 = 0;
     let mut sent_down: u64 = 0;
     let mut last_frame = Instant::now();
+    // Absolute, not refreshed by traffic: this is what bounds a session whose
+    // peer keeps it alive with pings.
+    let lifetime_deadline = tokio::time::Instant::now() + limits.lifetime;
 
     // Frames the client sent before it named a model are replayed first.
     for frame in initial.drain(..) {
         sent_up += frame.len() as u64;
-        if let Err(e) = ws::write_frame_masked(&mut to_upstream, &frame).await {
+        // By value: masking is done in place instead of cloning the payload.
+        if let Err(e) = write_within(
+            limits.write_timeout,
+            "write to the provider",
+            ws::write_frame_with(&mut to_upstream, frame, true),
+        )
+        .await
+        {
+            close_both(
+                &mut to_client,
+                &mut to_upstream,
+                1011,
+                "relay write failed",
+                limits.write_timeout,
+            )
+            .await;
             return Outcome::Error(format!("cannot write to the provider: {e}"));
         }
     }
@@ -1520,30 +1756,67 @@ where
         tokio::select! {
             incoming = client.next_message() => match incoming {
                 Err(e) => {
-                    close_both(&mut to_client, &mut to_upstream, 1002, "protocol error").await;
+                    close_both(
+                        &mut to_client,
+                        &mut to_upstream,
+                        1002,
+                        "protocol error",
+                        limits.write_timeout,
+                    )
+                    .await;
                     return Outcome::Error(format!("client framing error: {e}"));
                 }
                 Ok(None) => {
-                    // Clean close between messages: close the upstream hop too.
-                    let _ = ws::write_frame(&mut to_upstream, &Frame::close(1000, "")).await;
+                    // Clean close between messages: close the upstream hop too,
+                    // under the write deadline (a provider that stopped reading
+                    // must not pin the task on the way out).
+                    let _ = write_within(
+                        limits.write_timeout,
+                        "close to the provider",
+                        ws::write_frame(&mut to_upstream, &Frame::close(1000, "")),
+                    )
+                    .await;
                     return Outcome::ClientClosed;
                 }
                 Ok(Some(frame)) => match frame.opcode {
                     OpCode::Close => {
                         // Complete the closing handshake on both hops: the client
                         // gets its close echoed, the provider is told the session
-                        // is over.
-                        let _ = ws::write_frame(&mut to_client, &frame).await;
-                        let _ = ws::write_frame_masked(&mut to_upstream, &frame).await;
+                        // is over. The frame is only a few bytes, so lending it to
+                        // both hops is cheaper than cloning it for the masked one.
+                        let _ = write_within(
+                            limits.write_timeout,
+                            "close to the client",
+                            ws::write_frame(&mut to_client, &frame),
+                        )
+                        .await;
+                        let _ = write_within(
+                            limits.write_timeout,
+                            "close to the provider",
+                            ws::write_frame_masked(&mut to_upstream, &frame),
+                        )
+                        .await;
                         return Outcome::ClientClosed;
                     }
                     OpCode::Ping => {
                         last_frame = Instant::now();
-                        if ws::write_frame(&mut to_client, &Frame::pong(frame.payload))
-                            .await
-                            .is_err()
+                        let pong = Frame::pong(frame.payload);
+                        if let Err(e) = write_within(
+                            limits.write_timeout,
+                            "pong to the client",
+                            ws::write_frame(&mut to_client, &pong),
+                        )
+                        .await
                         {
-                            return Outcome::Error("cannot answer a ping".to_string());
+                            close_both(
+                                &mut to_client,
+                                &mut to_upstream,
+                                1011,
+                                "relay write failed",
+                                limits.write_timeout,
+                            )
+                            .await;
+                            return Outcome::Error(format!("cannot answer a ping: {e}"));
                         }
                     }
                     OpCode::Pong => {
@@ -1553,10 +1826,33 @@ where
                         last_frame = Instant::now();
                         sent_up += frame.len() as u64;
                         if sent_up > limits.max_bytes {
-                            close_both(&mut to_client, &mut to_upstream, 1008, "byte budget exceeded").await;
+                            close_both(
+                                &mut to_client,
+                                &mut to_upstream,
+                                1008,
+                                "byte budget exceeded",
+                                limits.write_timeout,
+                            )
+                            .await;
                             return Outcome::Budget;
                         }
-                        if let Err(e) = ws::write_frame_masked(&mut to_upstream, &frame).await {
+                        // By value: the relay owns this frame, so the mask is
+                        // applied in place instead of on a clone.
+                        if let Err(e) = write_within(
+                            limits.write_timeout,
+                            "write to the provider",
+                            ws::write_frame_with(&mut to_upstream, frame, true),
+                        )
+                        .await
+                        {
+                            close_both(
+                                &mut to_client,
+                                &mut to_upstream,
+                                1011,
+                                "relay write failed",
+                                limits.write_timeout,
+                            )
+                            .await;
                             return Outcome::Error(format!("cannot write to the provider: {e}"));
                         }
                     }
@@ -1564,26 +1860,62 @@ where
             },
             incoming = from_upstream.next_message() => match incoming {
                 Err(e) => {
-                    close_both(&mut to_client, &mut to_upstream, 1002, "upstream protocol error").await;
+                    close_both(
+                        &mut to_client,
+                        &mut to_upstream,
+                        1002,
+                        "upstream protocol error",
+                        limits.write_timeout,
+                    )
+                    .await;
                     return Outcome::Error(format!("provider framing error: {e}"));
                 }
                 Ok(None) => {
-                    let _ = ws::write_frame(&mut to_client, &Frame::close(1000, "")).await;
+                    let _ = write_within(
+                        limits.write_timeout,
+                        "close to the client",
+                        ws::write_frame(&mut to_client, &Frame::close(1000, "")),
+                    )
+                    .await;
                     return Outcome::UpstreamClosed;
                 }
                 Ok(Some(frame)) => match frame.opcode {
                     OpCode::Close => {
-                        let _ = ws::write_frame(&mut to_client, &frame).await;
-                        let _ = ws::write_frame_masked(&mut to_upstream, &frame).await;
+                        let _ = write_within(
+                            limits.write_timeout,
+                            "close to the client",
+                            ws::write_frame(&mut to_client, &frame),
+                        )
+                        .await;
+                        let _ = write_within(
+                            limits.write_timeout,
+                            "close to the provider",
+                            ws::write_frame_masked(&mut to_upstream, &frame),
+                        )
+                        .await;
                         return Outcome::UpstreamClosed;
                     }
                     OpCode::Ping => {
                         last_frame = Instant::now();
-                        if ws::write_frame_masked(&mut to_upstream, &Frame::pong(frame.payload))
-                            .await
-                            .is_err()
+                        let pong = Frame::pong(frame.payload);
+                        if let Err(e) = write_within(
+                            limits.write_timeout,
+                            "pong to the provider",
+                            ws::write_frame_with(&mut to_upstream, pong, true),
+                        )
+                        .await
                         {
-                            return Outcome::Error("cannot answer an upstream ping".to_string());
+                            close_both(
+                                &mut to_client,
+                                &mut to_upstream,
+                                1011,
+                                "relay write failed",
+                                limits.write_timeout,
+                            )
+                            .await;
+                            return Outcome::Error(format!(
+                                "cannot answer an upstream ping: {e}"
+                            ));
                         }
                     }
                     OpCode::Pong => {
@@ -1593,10 +1925,31 @@ where
                         last_frame = Instant::now();
                         sent_down += frame.len() as u64;
                         if sent_down > limits.max_bytes {
-                            close_both(&mut to_client, &mut to_upstream, 1008, "byte budget exceeded").await;
+                            close_both(
+                                &mut to_client,
+                                &mut to_upstream,
+                                1008,
+                                "byte budget exceeded",
+                                limits.write_timeout,
+                            )
+                            .await;
                             return Outcome::Budget;
                         }
-                        if let Err(e) = ws::write_frame(&mut to_client, &frame).await {
+                        if let Err(e) = write_within(
+                            limits.write_timeout,
+                            "write to the client",
+                            ws::write_frame(&mut to_client, &frame),
+                        )
+                        .await
+                        {
+                            close_both(
+                                &mut to_client,
+                                &mut to_upstream,
+                                1011,
+                                "relay write failed",
+                                limits.write_timeout,
+                            )
+                            .await;
                             return Outcome::Error(format!("cannot write to the client: {e}"));
                         }
                     }
@@ -1607,22 +1960,81 @@ where
                 // while this timer was pending, in which case the next iteration
                 // arms a later deadline.
                 if last_frame.elapsed() >= limits.idle {
-                    close_both(&mut to_client, &mut to_upstream, 1001, "idle timeout").await;
+                    close_both(
+                        &mut to_client,
+                        &mut to_upstream,
+                        1001,
+                        "idle timeout",
+                        limits.write_timeout,
+                    )
+                    .await;
                     return Outcome::Idle;
                 }
+            }
+            _ = tokio::time::sleep_until(lifetime_deadline) => {
+                // Absolute: pings cannot extend this one. 1001 tells the client to
+                // reconnect (and it can resume the conversation), which is the
+                // honest answer for "this session lived long enough".
+                close_both(
+                    &mut to_client,
+                    &mut to_upstream,
+                    1001,
+                    "maximum session lifetime reached",
+                    limits.write_timeout,
+                )
+                .await;
+                return Outcome::Lifetime;
             }
         }
     }
 }
 
-/// Best-effort close on both hops, so neither peer is left waiting.
-async fn close_both<W1, W2>(client: &mut W1, upstream: &mut W2, code: u16, reason: &str)
+/// Run one frame write under a deadline, turning expiry into a distinct error.
+///
+/// Every write in the session goes through this: see [`WRITE_TIMEOUT`] for why a
+/// write with no deadline is a denial of service. `what` names the hop so the
+/// session log says which peer stopped reading.
+async fn write_within<F>(timeout: Duration, what: &str, write: F) -> io::Result<()>
 where
+    F: Future<Output = io::Result<()>>,
+{
+    match tokio::time::timeout(timeout, write).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{what} timed out after {timeout:?}: the peer is not reading"),
+        )),
+    }
+}
+
+/// Best-effort close on both hops, so neither peer is left waiting.
+///
+/// Both writes carry the session's write deadline: a close to a peer that is not
+/// reading must not pin the task either, and the result is deliberately ignored —
+/// the session is over either way.
+async fn close_both<W1, W2>(
+    client: &mut W1,
+    upstream: &mut W2,
+    code: u16,
+    reason: &str,
+    write_timeout: Duration,
+) where
     W1: AsyncWrite + Unpin,
     W2: AsyncWrite + Unpin,
 {
-    let _ = ws::write_frame(client, &Frame::close(code, reason)).await;
-    let _ = ws::write_frame_masked(upstream, &Frame::close(code, reason)).await;
+    let frame = Frame::close(code, reason);
+    let _ = write_within(
+        write_timeout,
+        "close to the client",
+        ws::write_frame(client, &frame),
+    )
+    .await;
+    let _ = write_within(
+        write_timeout,
+        "close to the provider",
+        ws::write_frame_masked(upstream, &frame),
+    )
+    .await;
 }
 
 fn unix_now() -> u64 {
@@ -2168,9 +2580,23 @@ mod tests {
         let err = verify_handshake_response(&wrong, &accept).expect_err("wrong accept");
         assert!(err.contains("does not match"), "{err}");
 
-        let missing = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket";
-        let err = verify_handshake_response(missing, &accept).expect_err("missing accept");
+        // Both tokens present, but no accept: the accept is what proves the peer
+        // understood the handshake.
+        let missing =
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade"
+                .to_string();
+        let err = verify_handshake_response(&missing, &accept).expect_err("missing accept");
         assert!(err.contains("no Sec-WebSocket-Accept"), "{err}");
+
+        // Both tokens are matched case-insensitively and as list members.
+        let cased = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: WebSocket\r\n\
+             connection: keep-alive, UPGRADE\r\nSec-WebSocket-Accept: {accept}"
+        );
+        assert!(
+            verify_handshake_response(&cased, &accept).is_ok(),
+            "header names and tokens are case-insensitive"
+        );
 
         let refused = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0";
         let err = verify_handshake_response(refused, &accept).expect_err("401");
@@ -2179,6 +2605,61 @@ mod tests {
         let garbage = "SSH-2.0-OpenSSH";
         let err = verify_handshake_response(garbage, &accept).expect_err("not http");
         assert!(err.contains("not an HTTP response"), "{err}");
+    }
+
+    /// A 101 that does not actually confirm the protocol switch, or that promises
+    /// body bytes, must be refused: those bytes would be parsed as frames.
+    #[test]
+    fn a_101_that_is_not_a_clean_upgrade_is_refused() {
+        let accept = ws::accept_key("dGhlIHNhbXBsZSBub25jZQ==");
+        let make = |extra: &str| {
+            format!("HTTP/1.1 101 Switching Protocols\r\n{extra}Sec-WebSocket-Accept: {accept}")
+        };
+
+        // Missing `Upgrade: websocket`.
+        let err = verify_handshake_response(&make("Connection: Upgrade\r\n"), &accept)
+            .expect_err("no Upgrade header");
+        assert!(err.contains("Upgrade: websocket"), "{err}");
+
+        // Missing `Connection: Upgrade`.
+        let err = verify_handshake_response(&make("Upgrade: websocket\r\n"), &accept)
+            .expect_err("no Connection token");
+        assert!(err.contains("Connection: Upgrade"), "{err}");
+
+        // `Connection: keep-alive` on its own does not switch protocols.
+        let err = verify_handshake_response(
+            &make("Upgrade: websocket\r\nConnection: keep-alive\r\n"),
+            &accept,
+        )
+        .expect_err("connection is not an upgrade");
+        assert!(err.contains("Connection: Upgrade"), "{err}");
+
+        // A 101 that declares a body: those five bytes would be replayed as frames.
+        let err = verify_handshake_response(
+            &make("Upgrade: websocket\r\nConnection: Upgrade\r\nContent-Length: 5\r\n"),
+            &accept,
+        )
+        .expect_err("a 101 cannot have a body");
+        assert!(err.contains("declares a body"), "{err}");
+
+        // Any transfer coding is a body too, with or without a length.
+        let err = verify_handshake_response(
+            &make("Upgrade: websocket\r\nConnection: Upgrade\r\nTransfer-Encoding: chunked\r\n"),
+            &accept,
+        )
+        .expect_err("chunked is still a body");
+        assert!(err.contains("declares a body"), "{err}");
+
+        // `Content-Length: 0` (and 00) are harmless and still accepted.
+        for zero in ["0", "00"] {
+            let head = make(&format!(
+                "Upgrade: websocket\r\nConnection: Upgrade\r\nContent-Length: {zero}\r\n"
+            ));
+            assert!(
+                verify_handshake_response(&head, &accept).is_ok(),
+                "Content-Length: {zero} declares no body"
+            );
+        }
     }
 
     #[test]
@@ -2409,6 +2890,7 @@ mod tests {
             auth_state_token: Mutex::new(None),
             auth_fails: Mutex::new(crate::middleware::AuthFailures::default()),
             catalog_epoch: AtomicU64::new(0),
+            tls_enabled_flag: std::sync::atomic::AtomicBool::new(false),
             models_cache: Mutex::new(None),
             request_log: Mutex::new(VecDeque::new()),
             client_keys: RwLock::new(HashMap::new()),
@@ -2582,6 +3064,147 @@ mod tests {
         gateway.abort();
     }
 
+    /// Status code of one plain GET through the gateway.
+    ///
+    /// The concurrency check needs a second request while a websocket is open, and
+    /// a raw request keeps the test free of a client dependency.
+    async fn http_status(addr: std::net::SocketAddr, path: &str) -> u16 {
+        let mut sock = TcpStream::connect(addr).await.expect("connect");
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer sk-ws\r\n\
+             Connection: close\r\n\r\n"
+        );
+        sock.write_all(request.as_bytes()).await.expect("write");
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 512];
+        while head.len() < 64 {
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => head.extend_from_slice(&chunk[..n]),
+            }
+        }
+        String::from_utf8_lossy(&head)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// The per-client-key concurrency slot must survive the 101.
+    ///
+    /// `require_api_key` puts the guard in the *request* extensions for an upgrade,
+    /// so the handler has to take it and keep it in the session context. Left on
+    /// the (already returned) response instead, the key's counter would drop back
+    /// to zero the moment the 101 left the handler and a second request from the
+    /// same key would be let in while this socket is still live — exactly the cap
+    /// `max_concurrent` exists to enforce. With `max_concurrent = 1` that is the
+    /// difference between 429 and 200 below.
+    #[tokio::test]
+    async fn the_client_key_concurrency_slot_is_held_for_the_whole_session() {
+        let provider_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let provider_addr = provider_listener.local_addr().expect("addr");
+        let provider_task = tokio::spawn(fake_echo_provider(
+            provider_listener,
+            "/v1/realtime?model=echo-model",
+        ));
+
+        let source = format!(
+            r#"
+            name = "rt"
+            type = "openai_compat"
+            base_url = "http://{provider_addr}/v1"
+            keys = ["sk-echo"]
+            models = ["echo-model"]
+            capabilities = ["realtime"]
+            "#
+        );
+        let state = test_state(router(vec![provider(&source)], &[]));
+        state
+            .client_keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                "sk-ws".to_string(),
+                Arc::new(crate::proxy::ClientKeyRuntime::new(
+                    crate::config::ClientKeyConfig {
+                        key: "sk-ws".to_string(),
+                        name: Some("ws-key".to_string()),
+                        models: Vec::new(),
+                        created_at: None,
+                        rpm: None,
+                        burst: None,
+                        max_concurrent: Some(1),
+                    },
+                )),
+            );
+        let app = axum::Router::new()
+            .route("/v1/realtime", axum::routing::get(realtime))
+            .route("/v1/ping", axum::routing::get(|| async { "pong" }))
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::middleware::require_api_key,
+            ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let gateway_addr = listener.local_addr().expect("addr");
+        let gateway = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut socket = TcpStream::connect(gateway_addr).await.expect("connect");
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let request = format!(
+            "GET /v1/realtime?model=rt/echo-model HTTP/1.1\r\nHost: localhost\r\n\
+             Authorization: Bearer sk-ws\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Protocol: realtime\r\n\r\n"
+        );
+        socket
+            .write_all(request.as_bytes())
+            .await
+            .expect("write handshake");
+        let (head, leftover) = tokio::time::timeout(CONNECT_TIMEOUT, read_http_head(&mut socket))
+            .await
+            .expect("the gateway answered the upgrade")
+            .expect("readable head");
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+        // The socket is open and nothing has closed it: the key's only slot is
+        // still taken, so the same key cannot start another request.
+        assert_eq!(
+            http_status(gateway_addr, "/v1/ping").await,
+            429,
+            "the concurrency slot must still be held after the 101 was returned"
+        );
+
+        // Closing the websocket ends the session, which must give the slot back.
+        let (reader, mut writer) = tokio::io::split(socket);
+        let mut client = FrameReader::client_side(reader);
+        client.prepend(&leftover);
+        ws::write_frame_masked(&mut writer, &Frame::close(1000, "bye"))
+            .await
+            .expect("send close");
+        let closed = tokio::time::timeout(Duration::from_secs(10), client.next_message())
+            .await
+            .expect("the close was echoed")
+            .expect("read")
+            .expect("frame");
+        assert_eq!(closed.close_code(), Some(1000));
+
+        let mut released = false;
+        for _ in 0..100 {
+            if http_status(gateway_addr, "/v1/ping").await == 200 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(released, "the slot must be released when the session ends");
+
+        provider_task.await.expect("fake provider");
+        gateway.abort();
+    }
+
     #[tokio::test]
     async fn a_silent_session_hits_the_idle_timeout() {
         let (_client_io, relay_client) = tokio::io::duplex(1024);
@@ -2596,10 +3219,147 @@ mod tests {
             Limits {
                 idle: Duration::from_millis(20),
                 max_bytes: 1024,
+                ..Limits::default()
             },
         )
         .await;
         assert_eq!(outcome, Outcome::Idle);
+    }
+
+    /// A peer that stops reading used to pin the relay forever: `write_all` sat
+    /// inside a `select!` arm body, so the idle timer was never polled again and
+    /// the task, both sockets and the provider key slot stayed allocated. The write
+    /// deadline turns that into an ordinary session error.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_cannot_pin_the_session() {
+        // 1 KiB window, and nobody ever reads the far end.
+        let (_stuck_client, relay_client) = tokio::io::duplex(1024);
+        let (upstream_io, mut upstream_peer) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(relay_client);
+        let relay = tokio::spawn(relay_io(
+            FrameReader::server_side(reader),
+            writer,
+            Vec::new(),
+            upstream_io,
+            Vec::new(),
+            Limits {
+                idle: Duration::from_secs(30),
+                max_bytes: MAX_SESSION_BYTES,
+                write_timeout: Duration::from_millis(20),
+                lifetime: Duration::from_secs(30),
+            },
+        ));
+
+        // The provider sends one frame far larger than the client's window.
+        ws::write_frame(&mut upstream_peer, &Frame::binary(vec![9u8; 32 * 1024]))
+            .await
+            .expect("the provider's frame is buffered");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("a peer that does not read must not pin the relay task")
+            .expect("relay task");
+        match outcome {
+            Outcome::Error(message) => {
+                assert!(message.contains("timed out"), "{message}");
+            }
+            other => panic!("expected a write timeout, got {other:?}"),
+        }
+    }
+
+    /// Pings refresh the idle timer, so without an absolute lifetime a peer could
+    /// hold a session (and a provider key slot) forever. The close code is 1001:
+    /// "going away", i.e. reconnect, not "you did something wrong".
+    #[tokio::test]
+    async fn a_session_kept_alive_with_pings_still_ends_at_its_lifetime() {
+        let (client_peer, relay_client) = tokio::io::duplex(8192);
+        let (peer_reader, mut peer_writer) = tokio::io::split(client_peer);
+        let (upstream_io, _upstream_peer) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(relay_client);
+        let relay = tokio::spawn(relay_io(
+            FrameReader::server_side(reader),
+            writer,
+            Vec::new(),
+            upstream_io,
+            Vec::new(),
+            Limits {
+                // Idle is far away: only the absolute lifetime can end this.
+                idle: Duration::from_secs(30),
+                max_bytes: MAX_SESSION_BYTES,
+                write_timeout: Duration::from_millis(200),
+                lifetime: Duration::from_millis(50),
+            },
+        ));
+        let pinger = tokio::spawn(async move {
+            loop {
+                if ws::write_frame_masked(&mut peer_writer, &Frame::ping(b"k".to_vec()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("the lifetime must end the session")
+            .expect("relay task");
+        assert_eq!(outcome, Outcome::Lifetime);
+        pinger.abort();
+
+        // Every ping was answered before the close, so the close is at the end.
+        let mut peer = FrameReader::client_side(peer_reader);
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), peer.next_message())
+                .await
+                .expect("a frame before the close")
+                .expect("readable")
+                .expect("frame");
+            if frame.opcode == OpCode::Close {
+                assert_eq!(
+                    frame.close_code(),
+                    Some(1001),
+                    "1001 tells the client to reconnect"
+                );
+                break;
+            }
+            assert_eq!(frame.opcode, OpCode::Pong);
+        }
+    }
+
+    /// The session budget is a hard cap: it refuses at the limit, does not count a
+    /// refused attempt, and a dropped slot is immediately reusable.
+    #[test]
+    fn the_session_budget_refuses_at_the_cap_and_releases_on_drop() {
+        // A build-time check of the number itself, not of runtime behaviour.
+        const { assert!(MAX_SESSIONS >= 64, "the budget must fit a real deployment") };
+        let active = Arc::new(AtomicUsize::new(0));
+        let cap = 3;
+        let mut held: Vec<SessionSlot> = Vec::new();
+        for _ in 0..cap {
+            held.push(acquire_session_slot(&active, cap).expect("a slot under the cap"));
+        }
+        assert_eq!(active.load(Ordering::Relaxed), cap);
+        assert!(
+            acquire_session_slot(&active, cap).is_none(),
+            "the cap must refuse"
+        );
+        assert_eq!(
+            active.load(Ordering::Relaxed),
+            cap,
+            "a refused acquire must not be counted"
+        );
+        held.pop();
+        assert_eq!(active.load(Ordering::Relaxed), cap - 1);
+        let again = acquire_session_slot(&active, cap).expect("the freed slot is reusable");
+        assert_eq!(active.load(Ordering::Relaxed), cap);
+        drop(again);
+        assert_eq!(active.load(Ordering::Relaxed), cap - 1);
+        // Dropping the rest returns to zero, so nothing leaks per session.
+        drop(held);
+        assert_eq!(active.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -2616,6 +3376,7 @@ mod tests {
             Limits {
                 idle: Duration::from_secs(5),
                 max_bytes: 4,
+                ..Limits::default()
             },
         ));
         ws::write_frame_masked(&mut client_io, &Frame::text("far more than four bytes"))

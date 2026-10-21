@@ -32,6 +32,33 @@ const RESPONSES: TableDefinition<&str, &[u8]> = TableDefinition::new("responses"
 /// itself always runs in the writer task.
 const DEFAULT_RESPONSE_MAX: usize = 1000;
 
+/// Largest serialized record the response store accepts, in bytes.
+///
+/// A count cap alone is not a memory bound: 1000 records of 32 MiB would be 32 GB
+/// of state file written by one client that keeps sending long conversations.
+/// Records are a conversation's messages plus the assistant text, and a real one
+/// is tens of KiB, so 256 KiB is generous — while keeping the worst case at
+/// `response_store_max × 256 KiB`. A larger record is simply not stored: the
+/// reply it belongs to has already been sent, and refusing the *request* would
+/// break a working conversation just because it cannot be resumed later.
+const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+
+/// How many responses the immediate-read window keeps.
+///
+/// `recent` exists so a follow-up can see the reply it continues before the
+/// two-second batch flush; it is a short-lived write buffer, so a small count is
+/// plenty (a client making more than this many calls inside one flush window is
+/// not waiting on any of them).
+const RECENT_MAX_ENTRIES: usize = 64;
+
+/// Approximate byte budget for the immediate-read window.
+///
+/// Same reasoning as [`MAX_RESPONSE_BYTES`], for the in-memory copy: entries are
+/// dropped (they are still queued for the state file) once the window holds more
+/// than this, so a burst of large replies cannot pin memory that the disk write
+/// does not need.
+const RECENT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 /// Stable short id for a credential: sha256(secret)[..16] as hex.
 pub fn secret_hash(secret: &str) -> String {
     let digest = sha2::Sha256::digest(secret.as_bytes());
@@ -90,6 +117,17 @@ pub struct StoredResponse {
     /// Usage in Responses naming (`input_tokens`/`output_tokens`/`total_tokens`),
     /// when the provider reported it.
     pub usage: Option<serde_json::Value>,
+    /// Which client key produced this response.
+    ///
+    /// `resp_*` ids are unguessable, but an id is also a capability: whoever has
+    /// it can make the gateway replay that conversation as the assistant turn of
+    /// a new request. Binding the record to its owner means a key that somehow
+    /// learns another key's id cannot read that conversation back. `None` is a
+    /// record from before ownership was tracked (or from a gateway that requires
+    /// no key at all); it stays replayable so an upgrade does not break live
+    /// conversations, and it reveals nothing a caller could not have sent itself.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// Storage key for a stored response. Kept in one place so the batched write and
@@ -123,9 +161,13 @@ enum StorageMsg {
         data: Vec<u8>,
     },
     /// A completed Responses API reply, keyed by its `resp_*` id.
+    ///
+    /// The record travels **pre-serialized**: `save_response` has to measure the
+    /// encoded size to enforce [`MAX_RESPONSE_BYTES`], so encoding it again in the
+    /// writer would be pure work.
     Response {
         id: String,
-        rec: StoredResponse,
+        data: Vec<u8>,
     },
     /// Drop a stored response now (immediate, like `ExtraKeys`).
     DeleteResponse {
@@ -167,7 +209,17 @@ pub struct Storage {
     /// the reply it continues — within the same second, not in two. Reads check
     /// this map first so `previous_response_id` works on the very next request;
     /// the writer drops each entry once its record is on disk.
-    recent: Arc<Mutex<HashMap<String, StoredResponse>>>,
+    ///
+    /// Bounded by both entry count and approximate bytes: it is a cache for one
+    /// flush window, not a second copy of the store.
+    recent: Arc<Mutex<HashMap<String, RecentEntry>>>,
+}
+
+/// One entry of the immediate-read window: the record plus the serialized size it
+/// costs, kept so the window's byte budget is a sum and not a re-serialize.
+struct RecentEntry {
+    rec: StoredResponse,
+    bytes: usize,
 }
 
 impl Storage {
@@ -192,8 +244,7 @@ impl Storage {
         wtx.commit()?;
 
         let response_max = Arc::new(AtomicUsize::new(DEFAULT_RESPONSE_MAX));
-        let recent: Arc<Mutex<HashMap<String, StoredResponse>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let recent: Arc<Mutex<HashMap<String, RecentEntry>>> = Arc::new(Mutex::new(HashMap::new()));
         let writer_max = response_max.clone();
         let writer_recent = recent.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StorageMsg>();
@@ -334,13 +385,36 @@ impl Storage {
     /// but the record is visible to [`Storage::load_response`] immediately through
     /// `recent`: the next turn of a conversation arrives right away, not after
     /// the two-second flush.
+    ///
+    /// A record whose serialized form exceeds [`MAX_RESPONSE_BYTES`] is *not*
+    /// stored: it is logged and skipped, and the reply the client already received
+    /// is unaffected. Failing the request instead would turn "this conversation is
+    /// too long to resume" into "this conversation cannot continue at all".
     pub fn save_response(&self, id: &str, rec: StoredResponse) {
-        self.remember(id, &rec);
+        let data = match serde_json::to_vec(&rec) {
+            Ok(data) => data,
+            Err(e) => {
+                // Cannot happen for a struct of plain serde types, but a record we
+                // cannot encode must not poison the batch.
+                tracing::debug!(id, error = %e, "storage: response record is not encodable");
+                return;
+            }
+        };
+        if data.len() > MAX_RESPONSE_BYTES {
+            tracing::debug!(
+                id,
+                bytes = data.len(),
+                cap = MAX_RESPONSE_BYTES,
+                "storage: response record is too large to store; the reply is still served"
+            );
+            return;
+        }
+        self.remember(id, &rec, data.len());
         if self
             .tx
             .send(StorageMsg::Response {
                 id: id.to_string(),
-                rec,
+                data,
             })
             .is_err()
         {
@@ -392,11 +466,37 @@ impl Storage {
     }
 
     /// Record a not-yet-flushed response for immediate reads.
-    fn remember(&self, id: &str, rec: &StoredResponse) {
-        self.recent
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.to_string(), rec.clone());
+    ///
+    /// The window is bounded in both dimensions. Evicting here only drops the
+    /// *in-memory* copy: the record is already queued for the state file, so it
+    /// becomes readable again (from disk) at the next flush — at worst a couple of
+    /// seconds later, which is the same window a fresh process has.
+    fn remember(&self, id: &str, rec: &StoredResponse, bytes: usize) {
+        let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        recent.insert(
+            id.to_string(),
+            RecentEntry {
+                rec: rec.clone(),
+                bytes,
+            },
+        );
+        // Oldest first (created_at, then id so eviction is deterministic), the
+        // same order the disk store evicts in.
+        while recent.len() > RECENT_MAX_ENTRIES
+            || recent.values().map(|e| e.bytes).sum::<usize>() > RECENT_MAX_BYTES
+        {
+            let oldest = recent
+                .iter()
+                .min_by(|a, b| {
+                    a.1.rec
+                        .created_at
+                        .cmp(&b.1.rec.created_at)
+                        .then_with(|| a.0.cmp(b.0))
+                })
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else { break };
+            recent.remove(&oldest);
+        }
     }
 
     /// Drop a response from the immediate-read window.
@@ -413,7 +513,14 @@ impl Storage {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
-            .cloned()
+            .map(|entry| entry.rec.clone())
+    }
+
+    /// `(entries, approximate bytes)` of the immediate-read window (test-only).
+    #[cfg(test)]
+    fn recent_stats(&self) -> (usize, usize) {
+        let recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        (recent.len(), recent.values().map(|e| e.bytes).sum())
     }
 
     /// Flush all pending writes and wait for the ack (shutdown path).
@@ -432,7 +539,7 @@ fn dispatch(
     pending: &mut HashMap<String, StorageMsg>,
     m: StorageMsg,
     response_max: usize,
-    recent: &Mutex<HashMap<String, StoredResponse>>,
+    recent: &Mutex<HashMap<String, RecentEntry>>,
 ) {
     match m {
         StorageMsg::Flush(ack) => {
@@ -576,7 +683,7 @@ fn flush(
     db: &Arc<Database>,
     pending: &mut HashMap<String, StorageMsg>,
     response_max: usize,
-    recent: &Mutex<HashMap<String, StoredResponse>>,
+    recent: &Mutex<HashMap<String, RecentEntry>>,
 ) {
     if pending.is_empty() {
         return;
@@ -633,9 +740,8 @@ fn flush(
         }
         if let Ok(mut t) = wtx.open_table(RESPONSES) {
             for m in &msgs {
-                if let StorageMsg::Response { id, rec } = m
-                    && let Ok(j) = serde_json::to_vec(rec)
-                    && t.insert(id.as_str(), j.as_slice()).is_ok()
+                if let StorageMsg::Response { id, data } = m
+                    && t.insert(id.as_str(), data.as_slice()).is_ok()
                 {
                     flushed.push(id.clone());
                 }
@@ -690,6 +796,7 @@ mod tests {
                 "output_tokens": 1,
                 "total_tokens": 2
             })),
+            owner: None,
         }
     }
 
@@ -829,6 +936,83 @@ mod tests {
         assert!(store.load_response("resp_queued").is_none());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A record is a *conversation*: the count cap alone would let one client
+    /// write `response_store_max × 32 MiB` of state file. Anything over the
+    /// per-record cap is skipped (and the caller keeps serving its reply), while
+    /// ordinary records are unaffected.
+    #[tokio::test]
+    async fn an_oversized_record_is_skipped_instead_of_stored() {
+        let (store, path) = open_scratch("oversized").await;
+        store.set_response_max(10);
+
+        let ordinary = rec("resp_ok", 1);
+        store.save_response("resp_ok", ordinary.clone());
+
+        let mut huge = rec("resp_huge", 2);
+        huge.output_text = "x".repeat(MAX_RESPONSE_BYTES);
+        assert!(
+            serde_json::to_vec(&huge).map(|j| j.len()).unwrap_or(0) > MAX_RESPONSE_BYTES,
+            "the fixture must really exceed the cap"
+        );
+        store.save_response("resp_huge", huge);
+        store.flush_async().await;
+
+        assert_eq!(store.load_response("resp_ok"), Some(ordinary));
+        assert!(
+            store.load_response("resp_huge").is_none(),
+            "an over-large record must not be stored"
+        );
+        assert_eq!(sorted(store.list_responses()), vec!["resp_ok".to_string()]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The immediate-read window is a cache for one flush window, so it is capped
+    /// by count *and* approximate bytes; evicting only drops the in-memory copy,
+    /// the queued disk write still happens.
+    #[tokio::test]
+    async fn the_recent_window_is_bounded_in_entries_and_bytes() {
+        let (store, path) = open_scratch("recent-caps").await;
+        store.set_response_max(10_000);
+
+        // Count: many small records, no flush in between.
+        for i in 0..(RECENT_MAX_ENTRIES + 20) {
+            let id = format!("resp_{i:03}");
+            store.save_response(&id, rec(&id, i as u64));
+        }
+        let (entries, _) = store.recent_stats();
+        assert!(
+            entries <= RECENT_MAX_ENTRIES,
+            "the read window kept {entries} entries"
+        );
+
+        // Bytes: 200 KiB records inside the per-record cap, enough of them to
+        // overrun the window's byte budget long before the entry count.
+        let (store, path2) = open_scratch("recent-byte-cap").await;
+        store.set_response_max(10_000);
+        for i in 0..40u64 {
+            let id = format!("resp_big_{i:03}");
+            let mut big = rec(&id, i);
+            big.output_text = "y".repeat(200 * 1024);
+            store.save_response(&id, big);
+        }
+        let (entries, bytes) = store.recent_stats();
+        assert!(bytes <= RECENT_MAX_BYTES, "{bytes} bytes retained");
+        assert!(entries <= RECENT_MAX_ENTRIES, "{entries} entries retained");
+        assert!(entries > 0, "the newest record must stay readable");
+        // The newest one is the one that survived.
+        assert!(
+            store.load_response("resp_big_039").is_some(),
+            "the most recent record must still be readable"
+        );
+        // Eviction dropped only the memory copy: the records still reach the file.
+        store.flush_async().await;
+        assert!(store.load_response("resp_big_000").is_some());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
     }
 
     #[tokio::test]

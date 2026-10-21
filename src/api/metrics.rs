@@ -143,7 +143,10 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         );
         for rt in keys.values() {
             let Some(limiter) = &rt.limiter else { continue };
-            let name = esc(rt.cfg.name.as_deref().unwrap_or(&rt.cfg.key));
+            let name = esc(&crate::proxy::client_key_label(
+                &rt.cfg.key,
+                rt.cfg.name.as_deref(),
+            ));
             let n = rt.limited.load(std::sync::atomic::Ordering::Relaxed);
             let _ = writeln!(
                 out,

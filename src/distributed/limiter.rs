@@ -17,6 +17,11 @@ use crate::ratelimit::KeyRateLimit;
 /// Warn at most this often while Redis is failing (per key).
 const WARN_EVERY: Duration = Duration::from_secs(60);
 
+/// Digest bytes in a bucket name: 128 bits, i.e. a collision needs ~2^64 keys.
+/// Shorter would make the name prettier for no benefit; longer would only make
+/// every `MONITOR` line noisier.
+const CLIENT_KEY_DIGEST_BYTES: usize = 16;
+
 /// Atomic token bucket. One `EVAL`, one round trip, exact across instances.
 ///
 /// State is a single string `"<tokens>:<last_ms>"`: one `GET` + one `SET` inside
@@ -131,8 +136,18 @@ impl SharedLimiter {
 #[derive(Debug)]
 pub struct RedisLimiter {
     pool: Arc<RedisPool>,
-    /// `<prefix>:rl:<key>:<rpm>:<burst>` — the limits are part of the key, so
-    /// changing a key's limit starts from a fresh, full bucket.
+    /// `<prefix>:rl:<digest>:<rpm>:<burst>` — the name of the bucket.
+    ///
+    /// `digest` is the SHA-256 of the client key, **not** the key: the key is
+    /// the bearer token clients authenticate with, and a Redis key is anything
+    /// but private — it crosses `redis://` in plaintext and lives on in
+    /// `KEYS`/`SCAN`/`MONITOR`, in `RDB`/`AOF` files and in every backup that
+    /// copies them. A plain, unsalted hash (see [`redis::digest`]) keeps the
+    /// name identical on every instance and across restarts while keeping the
+    /// secret out of the server entirely.
+    ///
+    /// The limits are part of the name, so changing a key's limit starts from a
+    /// fresh, full bucket.
     key: String,
     capacity: f64,
     rate_per_sec: f64,
@@ -154,7 +169,13 @@ impl RedisLimiter {
         let capacity = if burst == 0 { rpm.max(1) } else { burst };
         Ok(Self {
             pool: redis::shared_pool(&url, timeout),
-            key: format!("{}:rl:{}:{}:{}", rl.key_prefix, client_key, rpm, capacity),
+            key: format!(
+                "{}:rl:{}:{}:{}",
+                rl.key_prefix,
+                redis::digest(client_key, CLIENT_KEY_DIGEST_BYTES),
+                rpm,
+                capacity
+            ),
             capacity: capacity as f64,
             rate_per_sec: rpm as f64 / 60.0,
             ttl_secs: bucket_ttl(rpm, capacity),
@@ -200,7 +221,9 @@ impl RedisLimiter {
                     Err(secs_from_ms(retry_ms))
                 }
             }
-            Ok(other) => self.degraded(format!("unexpected EVAL reply: {other:?}")),
+            // `summary()`, not `{other:?}`: the reply came off the wire, and an
+            // 8 MiB sibling bulk would become a ~32 MB log line here.
+            Ok(other) => self.degraded(format!("unexpected EVAL reply: {}", other.summary())),
             Err(e) => self.degraded(e.to_string()),
         }
     }
@@ -292,6 +315,15 @@ mod tests {
             .expect("limiter")
     }
 
+    /// The bucket name the limiter must derive for `key`: the prefix, a **digest**
+    /// of the client key, then the limits.
+    fn bucket(client_key: &str, rpm: u32, capacity: u32) -> String {
+        format!(
+            "anyhop:rl:{}:{rpm}:{capacity}",
+            redis::digest(client_key, CLIENT_KEY_DIGEST_BYTES)
+        )
+    }
+
     /// A port that was just free — the "Redis is down" case.
     async fn dead_redis_url() -> String {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -318,10 +350,10 @@ mod tests {
             .expect_err("budget is shared, so this is limited");
         // 60 rpm = 1 token/s, and the bucket is empty.
         assert_eq!(retry, 1, "retry_after must be about a second");
-        // One key, named after the prefix and the limits.
+        // One key, named after the prefix, the key's digest and the limits.
         assert!(
-            fake.value("anyhop:rl:sk-test:60:3").is_some(),
-            "bucket must live under <prefix>:rl:<key>:<rpm>:<burst>"
+            fake.value(&bucket("sk-test", 60, 3)).is_some(),
+            "bucket must live under <prefix>:rl:<digest>:<rpm>:<burst>"
         );
         // Refill is continuous, so a later call is allowed again.
         tokio::time::sleep(Duration::from_millis(1_100)).await;
@@ -336,17 +368,64 @@ mod tests {
         let evals = fake.commands_named("EVAL");
         assert_eq!(evals.len(), 1, "one round trip per request");
         assert_eq!(evals[0][2], "1", "exactly one key");
-        assert_eq!(evals[0][3], "anyhop:rl:sk-test:60:5");
+        assert_eq!(evals[0][3], bucket("sk-test", 60, 5));
         // rpm 60 / burst 5 refills in 5s, so the 60s floor applies.
         assert_eq!(evals[0][7], "60", "ttl is never below 60s");
         // The fake honours `SET … EX`, so the bucket really expires.
-        let ttl = fake.ttl("anyhop:rl:sk-test:60:5");
+        let ttl = fake.ttl(&bucket("sk-test", 60, 5));
         assert!((1..=60).contains(&ttl), "bucket ttl {ttl}");
         // A larger bucket gets 2x its refill time (see bucket_ttl).
         let big = shared(&fake, 60, 60, true);
         big.try_acquire().await.expect("first");
         let evals = fake.commands_named("EVAL");
         assert_eq!(evals.last().expect("eval")[7], "120");
+    }
+
+    /// Finding 1: the client key is a bearer token. It must never appear in a
+    /// Redis key, because that name travels in plaintext and is persisted by
+    /// `KEYS`/`SCAN`/`MONITOR`, `RDB`/`AOF` and every backup of them.
+    #[tokio::test]
+    async fn the_bucket_name_is_a_digest_and_the_secret_never_reaches_redis() {
+        let fake = FakeRedis::start().await;
+        let a = shared(&fake, 60, 3, true);
+        let SharedLimiter::Redis(a) = &*a else {
+            panic!("redis backend expected");
+        };
+        assert!(a.try_acquire().await.is_ok());
+
+        // Shape: <prefix>:rl:<32 hex>:<rpm>:<burst> — a digest, not the token.
+        let name = a.key();
+        assert!(name.starts_with("anyhop:rl:"), "{name}");
+        assert!(name.ends_with(":60:3"), "{name}");
+        assert!(
+            !name.contains("sk-test"),
+            "the secret is in the key: {name}"
+        );
+        let tag = name
+            .strip_prefix("anyhop:rl:")
+            .and_then(|rest| rest.strip_suffix(":60:3"))
+            .expect("bucket shape");
+        assert_eq!(tag.len(), 32, "16 digest bytes, hex: {tag}");
+        assert!(
+            tag.bytes().all(|b| b.is_ascii_hexdigit()),
+            "bucket tag is not hex: {tag}"
+        );
+
+        // Stable: another instance derives the same name, so the budget is
+        // shared (a random salt would silently give each instance its own).
+        let b = shared(&fake, 60, 3, true);
+        let SharedLimiter::Redis(b) = &*b else {
+            panic!("redis backend expected");
+        };
+        assert_eq!(a.key(), b.key(), "the name must be deterministic");
+
+        // …and nothing the client sent names the key: not one command on the
+        // wire (script, KEYS or ARGV) mentions the token.
+        let wire = format!("{:?}", fake.commands());
+        assert!(
+            !wire.contains("sk-test"),
+            "the client key reached the server: {wire}"
+        );
     }
 
     #[tokio::test]

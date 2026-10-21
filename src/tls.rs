@@ -23,6 +23,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use axum::Router;
@@ -130,13 +131,43 @@ impl TlsConfig {
 /// Implements [`Listener`], so it plugs into [`axum::serve`] wherever a
 /// `tokio::net::TcpListener` would — which keeps `axum::serve`'s graceful
 /// shutdown and HTTP/1 keep-alive behaviour intact.
-#[derive(Clone)]
-pub struct TlsListener<L> {
+/// Queue of finished handshakes waiting for axum to take them.
+type ReadyQueue<L> = Arc<
+    std::sync::Mutex<
+        std::collections::VecDeque<(TlsStream<<L as Listener>::Io>, <L as Listener>::Addr)>,
+    >,
+>;
+
+pub struct TlsListener<L>
+where
+    L: Listener,
+{
     inner: L,
     acceptor: TlsAcceptor,
+    /// Handshakes that finished before axum asked for them. A queue, not a
+    /// future: awaiting the handshake inside `accept()` would let one silent TCP
+    /// connection stall the whole listener (`axum::serve` calls `accept()` in
+    /// sequence).
+    ready: ReadyQueue<L>,
+    /// Woken when `ready` gains an entry.
+    notify: Arc<tokio::sync::Notify>,
+    /// In-flight handshakes, so a connection flood cannot spawn unbounded tasks.
+    pending: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl<L: std::fmt::Debug> std::fmt::Debug for TlsListener<L> {
+impl<L: Listener + Clone> Clone for TlsListener<L> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            acceptor: self.acceptor.clone(),
+            ready: Arc::clone(&self.ready),
+            notify: Arc::clone(&self.notify),
+            pending: Arc::clone(&self.pending),
+        }
+    }
+}
+
+impl<L: Listener + std::fmt::Debug> std::fmt::Debug for TlsListener<L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `TlsAcceptor` is not `Debug`; the wrapped listener is the only useful part.
         f.debug_struct("TlsListener")
@@ -145,40 +176,108 @@ impl<L: std::fmt::Debug> std::fmt::Debug for TlsListener<L> {
     }
 }
 
-impl<L> TlsListener<L> {
+impl<L: Listener> TlsListener<L> {
     /// Wraps `inner`, terminating every connection with `tls`.
     pub fn new(inner: L, tls: TlsConfig) -> Self {
         Self {
             inner,
             acceptor: tls.acceptor(),
+            ready: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
 
+/// How long a client may hold a connection without completing the handshake.
+///
+/// This is a denial-of-service guard, not a tuning knob: `axum::serve` awaits
+/// `accept()` sequentially, so a handshake awaited *inline* would let one silent
+/// TCP connection stall every future connection — the whole listener goes down
+/// for the price of one socket.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Concurrent handshakes allowed. Each costs one task and one socket; the cap
+/// keeps a connection flood from spawning tasks without bound.
+const MAX_HANDSHAKES: usize = 1024;
+
 impl<L> Listener for TlsListener<L>
 where
     L: Listener,
+    L::Io: Send + 'static,
+    L::Addr: Clone + Send + 'static,
 {
     type Io = TlsStream<L::Io>;
     type Addr = L::Addr;
 
-    /// Accepts a connection and completes the TLS handshake.
+    /// Accepts a connection, completing the TLS handshake off the accept path.
     ///
-    /// Handshake failures are logged and dropped: [`Listener`] has no way to
-    /// report a per-connection error, and the next iteration blocks on the next
-    /// connection, so a client that talks garbage cannot spin the loop.
+    /// Handshakes run in their own tasks and land in `ready`; the loop returns as
+    /// soon as one is available, or takes the next TCP connection in the
+    /// meantime. A client that connects and says nothing therefore costs one
+    /// task and at most [`HANDSHAKE_TIMEOUT`], never the listener.
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            let (stream, addr) = self.inner.accept().await;
-            match self.acceptor.accept(stream).await {
-                Ok(stream) => return (stream, addr),
-                Err(err) => debug!(error = %err, "tls handshake failed; connection dropped"),
+            if let Some(done) = self.take_ready() {
+                return done;
+            }
+            // At the cap, wait for a slot instead of accepting more sockets.
+            let at_cap = self.pending.load(std::sync::atomic::Ordering::Relaxed) >= MAX_HANDSHAKES;
+            if at_cap {
+                self.notify.notified().await;
+                continue;
+            }
+            tokio::select! {
+                biased;
+                // A handshake finished while we were waiting for a new socket.
+                () = self.notify.notified() => {}
+                (stream, addr) = self.inner.accept() => {
+                    self.spawn_handshake(stream, addr);
+                }
             }
         }
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
         self.inner.local_addr()
+    }
+}
+
+impl<L> TlsListener<L>
+where
+    L: Listener,
+    L::Io: Send + 'static,
+    L::Addr: Clone + Send + 'static,
+{
+    fn take_ready(&self) -> Option<(TlsStream<L::Io>, L::Addr)> {
+        self.ready
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+    }
+
+    fn spawn_handshake(&self, stream: L::Io, addr: L::Addr) {
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let acceptor = self.acceptor.clone();
+        let ready = Arc::clone(&self.ready);
+        let notify = Arc::clone(&self.notify);
+        let pending = Arc::clone(&self.pending);
+        tokio::spawn(async move {
+            let outcome = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
+            match outcome {
+                Ok(Ok(stream)) => {
+                    ready
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back((stream, addr));
+                }
+                Ok(Err(err)) => debug!(error = %err, "tls handshake failed; connection dropped"),
+                Err(_) => debug!("tls handshake timed out; connection dropped"),
+            }
+            pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            notify.notify_one();
+        });
     }
 }
 
@@ -215,7 +314,8 @@ where
 pub async fn serve<L, M>(listener: L, router: M, tls: TlsConfig) -> anyhow::Result<()>
 where
     L: Listener,
-    L::Addr: std::fmt::Debug,
+    L::Io: Send + 'static,
+    L::Addr: Clone + Send + std::fmt::Debug + 'static,
     M: Into<Router>,
 {
     let listener = TlsListener::new(listener, tls);

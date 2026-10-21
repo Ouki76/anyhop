@@ -890,45 +890,69 @@ fn splice_model(body: &Bytes, span: &Range<usize>, model: &str) -> Bytes {
 /// this module does not model (`n`, `size`, repeated `image[]` parts, provider
 /// specific options) and invent a new boundary. Locating the value's byte span is
 /// enough to splice the upstream model name in.
+///
+/// The scan is one linear pass over the body and copies nothing. That is a
+/// requirement, not an optimisation: the body is attacker-controlled, and
+/// re-deriving the line start (or re-testing the header line) from scratch for
+/// every occurrence of `name="model"` a prompt can quote would make this
+/// O(occurrences × line length) — a megabyte of quoted field names would pin a
+/// core for minutes.
 fn multipart_field_span(body: &[u8], field: &str) -> Option<Range<usize>> {
+    const DISPOSITION: &[u8] = b"content-disposition";
     let needle = format!("name=\"{field}\"");
-    let mut from = 0usize;
-    while let Some(offset) = memchr::memmem::find(&body[from..], needle.as_bytes()) {
-        let at = from + offset;
-        // `filename="model"` also contains `name="model"` (after "file"), so the
-        // preceding byte must not be part of an identifier.
-        let standalone = at == 0
-            || !matches!(
-                body[at - 1],
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'
-            );
-        // …and the match must sit in a `Content-Disposition` header line, not in
-        // the *value* of another part (a prompt may quote `name="model"`).
-        let line_start = body[..at]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |i| i + 1);
-        let line = &body[line_start..at];
-        let in_disposition = {
-            const DISPOSITION: &[u8] = b"content-disposition";
-            line.len() >= DISPOSITION.len()
-                && line
-                    .windows(DISPOSITION.len())
-                    .any(|w| w.eq_ignore_ascii_case(DISPOSITION))
+    let needle = needle.as_bytes();
+    let mut line_start = 0usize;
+    for line in body.split(|&b| b == b'\n') {
+        let this_line = line_start;
+        line_start += line.len() + 1;
+        // Only a part header can hold the field, and a part header is a
+        // `Content-Disposition` line, so one linear probe per line rejects every
+        // value line (prompts quoting the field name included).
+        let Some(disposition_at) = find_ignore_ascii_case(line, DISPOSITION) else {
+            continue;
         };
-        if standalone && in_disposition {
+        let mut from = 0usize;
+        while let Some(offset) = memchr::memmem::find(&line[from..], needle) {
+            let at = from + offset;
+            from = at + 1;
+            // `filename="model"` also contains `name="model"` (after "file"), so
+            // the preceding byte must not be part of an identifier…
+            let standalone = at == 0
+                || !matches!(
+                    line[at - 1],
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'
+                );
+            // …and the match must come *after* the `Content-Disposition` token,
+            // so it sits in the header rather than in the text of a value that
+            // happens to also mention the header name.
+            if !standalone || at < disposition_at {
+                continue;
+            }
             // Part headers end at the first empty line; the value follows it and
             // runs until the next CRLF (which begins the boundary).
-            let after = at + needle.len();
+            let after = this_line + at + needle.len();
             let sep = memchr::memmem::find(&body[after..], b"\r\n\r\n")?;
             let start = after + sep + 4;
             let end = memchr::memmem::find(&body[start..], b"\r\n").map(|i| start + i)?;
             let value = trim_span(&body[start..end]);
             return Some(start + value.start..start + value.end);
         }
-        from = at + 1;
     }
     None
+}
+
+/// Position of the first ASCII-case-insensitive occurrence of `needle`.
+///
+/// Header names are compared case-insensitively (RFC 7578 §4.2 sends
+/// `Content-Disposition`, but nothing stops a client from lower-casing it), and
+/// doing it here — once per line — keeps the cost linear in the body size.
+fn find_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// Trim ASCII whitespace (browsers/paste tools add some), keeping it a span.
@@ -1648,5 +1672,159 @@ whisper-1\r\n\
         );
 
         server.abort();
+    }
+
+    // ----- hostile multipart bodies -----
+    //
+    // The scanner reads an attacker-controlled byte string and must always answer
+    // "this span" or "no field", without panicking, without copying the body and
+    // without work proportional to anything but the body length.
+
+    #[test]
+    fn a_body_with_no_boundary_and_no_model_field_is_none() {
+        // A JSON body sent to a multipart endpoint.
+        assert!(multipart_field_span(br#"{"model":"gpt-image-1"}"#, "model").is_none());
+        // An empty body.
+        assert!(multipart_field_span(b"", "model").is_none());
+        // A preamble with no parts at all.
+        assert!(multipart_field_span(b"--X\r\n", "model").is_none());
+        // A well-formed form that simply has no model part.
+        let body = b"--X\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nhi\r\n--X--\r\n";
+        assert!(multipart_field_span(body, "model").is_none());
+    }
+
+    #[test]
+    fn field_name_lookalikes_are_not_mistaken_for_the_field() {
+        let cases: [&[u8]; 4] = [
+            // `filename="model"`: the `name=` of a filename is part of an identifier.
+            b"--X\r\nContent-Disposition: form-data; name=\"file\"; filename=\"model\"\r\n\r\n\x00\r\n--X--\r\n",
+            // The same with an extension.
+            b"--X\r\nContent-Disposition: form-data; name=\"file\"; filename=\"model.png\"\r\n\r\n\x00\r\n--X--\r\n",
+            // A longer field name is a different field.
+            b"--X\r\nContent-Disposition: form-data; name=\"modelx\"\r\n\r\nv\r\n--X--\r\n",
+            // The field name quoted inside another part's *value*, on its own line.
+            b"--X\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nname=\"model\"\r\n--X--\r\n",
+        ];
+        for body in cases {
+            assert!(
+                multipart_field_span(body, "model").is_none(),
+                "{:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn an_enormous_model_value_is_located_without_copying_the_body() {
+        // A 1 MiB value: the scanner must hand back the *span* (a window into the
+        // body) so the handler can reject it on length, instead of materialising
+        // a megabyte of "model".
+        let value = vec![b'm'; 1 << 20];
+        let mut body = b"--X\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n".to_vec();
+        body.extend_from_slice(&value);
+        body.extend_from_slice(b"\r\n--X--\r\n");
+
+        let span = multipart_field_span(&body, "model").expect("the field is there");
+        assert_eq!(
+            span.len(),
+            value.len(),
+            "the span covers the value, not the enclosing body"
+        );
+        assert_eq!(&body[span.clone()], value.as_slice());
+        assert!(
+            span.len() > 200,
+            "multipart_request's 200-byte cap is what rejects this"
+        );
+        // The splice is the only copy, and only for a value the cap accepted.
+        let spliced = splice_model(&Bytes::from(body.clone()), &span, "small");
+        assert_eq!(spliced.len(), body.len() - value.len() + "small".len());
+    }
+
+    #[test]
+    fn lf_only_line_endings_yield_no_field_rather_than_a_guessed_offset() {
+        // RFC 7578 §4 requires CRLF; a body that uses bare LF has no `\r\n\r\n`
+        // header terminator, so the field is reported missing (a 400) instead of
+        // being spliced at a guessed offset.
+        let body = b"--X\nContent-Disposition: form-data; name=\"model\"\n\ngpt-image-1\n--X--\n";
+        assert!(multipart_field_span(body, "model").is_none());
+
+        // The disposition line found with CRLF *and* a trailing bare LF is the
+        // same shape: the header separator is missing.
+        let body =
+            b"--X\r\nContent-Disposition: form-data; name=\"model\"\n\ngpt-image-1\r\n--X--\r\n";
+        assert!(multipart_field_span(body, "model").is_none());
+    }
+
+    #[test]
+    fn a_boundary_lookalike_inside_binary_data_does_not_derail_the_scan() {
+        // An image part whose bytes contain a boundary lookalike, a fake
+        // disposition line and the quoted field name. None of that is a real part
+        // header, so the real `model` part after it is the one that is used.
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            b"--X\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\n\
+              Content-Type: image/png\r\n\r\n",
+        );
+        body.extend_from_slice(b"\x89PNG\r\n--X\r\nname=\"model\"\r\n");
+        body.extend_from_slice(&[0x00, 0x01, 0xFE, 0xFF, 0x0D, 0x0A]);
+        body.extend_from_slice(
+            b"\r\n--X\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-image-1\r\n--X--\r\n",
+        );
+        let span = multipart_field_span(&body, "model").expect("the real part is found");
+        assert_eq!(&body[span], b"gpt-image-1".as_slice());
+    }
+
+    #[test]
+    fn a_body_that_ends_mid_part_is_none() {
+        // Truncated inside the part headers: no blank line to end them.
+        assert!(
+            multipart_field_span(
+                b"--X\r\nContent-Disposition: form-data; name=\"model\"",
+                "model"
+            )
+            .is_none()
+        );
+        // Truncated just after the headers: the value is empty and unterminated.
+        assert!(
+            multipart_field_span(
+                b"--X\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n",
+                "model"
+            )
+            .is_none()
+        );
+        // Truncated inside the value: no CRLF bounds it.
+        assert!(
+            multipart_field_span(
+                b"--X\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-im",
+                "model"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn many_quoted_field_names_are_scanned_in_bounded_time() {
+        // A prompt quoting `name="model"` 12 000 times on a single ~170 KiB line.
+        // Re-deriving the line start (or re-testing the header) per occurrence is
+        // O(occurrences × line length), which is minutes for this body; one linear
+        // pass is milliseconds.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"--X\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        for _ in 0..12_000 {
+            body.extend_from_slice(b"name=\"model\" ");
+        }
+        body.extend_from_slice(
+            b"\r\n--X\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-image-1\r\n--X--\r\n",
+        );
+
+        let started = std::time::Instant::now();
+        let span = multipart_field_span(&body, "model").expect("the real field is found");
+        let elapsed = started.elapsed();
+        assert_eq!(&body[span], b"gpt-image-1".as_slice());
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "scanning {} bytes took {elapsed:?}",
+            body.len()
+        );
     }
 }

@@ -30,9 +30,30 @@ const MAX_LINE: usize = 64 * 1024;
 /// Largest bulk string accepted (a rate-limiter value is a handful of bytes).
 const MAX_BULK: usize = 8 * 1024 * 1024;
 /// Largest array length accepted.
-const MAX_ARRAY: usize = 1_000_000;
+///
+/// A per-frame cap alone is not a bound on memory (see [`MAX_REPLY_BYTES`]), so
+/// this is deliberately far below the ~1M that RESP would allow: the only array
+/// reply this client consumes is the token-bucket script's `{allowed,
+/// retry_ms}`, and nothing in the gateway asks Redis for a wide result. 1024
+/// leaves room for a diagnostic reply (e.g. a future `KEYS`-free probe) while
+/// keeping one malicious header from costing a megabyte of `Vec` capacity.
+const MAX_ARRAY: usize = 1024;
 /// Nesting limit for arrays of arrays.
 const MAX_DEPTH: usize = 8;
+/// Total bytes a single reply may cost, across every element and every level.
+///
+/// Every field is bounded on its own (line, bulk, array count, depth), but a
+/// peer that is hostile or buggy can stay inside each limit while blowing up
+/// their product: `*1000000` of 8 MiB bulks is ~8 TB, and nesting multiplies
+/// even tiny frames. The parser therefore charges a budget as it goes and
+/// refuses the reply once the sum exceeds this cap. 32 MiB is far above any
+/// legitimate reply here (a token bucket answers with two integers) and small
+/// enough that a stuck reply cannot exhaust the gateway's memory.
+const MAX_REPLY_BYTES: usize = 32 << 20;
+/// Budget charged for each parsed node, on top of any payload bytes: this is
+/// what one `Resp` value costs before its data is counted, and it is what makes
+/// deeply nested arrays of empty frames pay for the tree they build.
+const NODE_COST: usize = std::mem::size_of::<Resp>();
 
 /// A failed Redis operation.
 ///
@@ -65,7 +86,7 @@ impl fmt::Display for RedisError {
             Self::Url(m) => write!(f, "redis url: {m}"),
             Self::Io(m) => write!(f, "redis io: {m}"),
             Self::Protocol(m) => write!(f, "redis protocol: {m}"),
-            Self::Server(m) => write!(f, "redis error reply: {m}"),
+            Self::Server(m) => write!(f, "redis error reply: {}", for_log(m)),
             Self::Timeout(m) => write!(f, "redis timeout: {m}"),
         }
     }
@@ -154,13 +175,13 @@ impl RedisUrl {
     }
 
     /// Identity for the process-wide pool registry. The password is reduced to a
-    /// short digest so the secret never lives in a map key or a log line.
+    /// digest so the secret never lives in a map key or a log line.
     fn identity(&self) -> String {
         let user = self.username.as_deref().unwrap_or("");
         let pass = self
             .password
             .as_deref()
-            .map(sha256_short)
+            .map(|p| digest(p, IDENTITY_DIGEST_BYTES))
             .unwrap_or_default();
         format!("{}:{}:{}:{user}:{pass}", self.host, self.port, self.db)
     }
@@ -227,10 +248,21 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn sha256_short(s: &str) -> String {
+/// Digest bytes kept in the pool-registry key: 128 bits, so two different
+/// passwords cannot share a pool by collision, while the key stays short.
+const IDENTITY_DIGEST_BYTES: usize = 16;
+
+/// Hex SHA-256 of `s`, truncated to `bytes` digest bytes.
+///
+/// This is how a secret is *referred to* without being stored: the Redis
+/// password in a pool identity, and a client's API key in its bucket name. The
+/// hash is unsalted and deterministic on purpose — every instance must derive
+/// the same name for the same key, across restarts — so the output is a name,
+/// not a password substitute for anything but lookup.
+pub fn digest(s: &str, bytes: usize) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(s.as_bytes());
-    hex::encode(&digest[..8])
+    let d = Sha256::digest(s.as_bytes());
+    hex::encode(&d[..bytes.min(d.len())])
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +314,45 @@ impl Resp {
             _ => None,
         }
     }
+
+    /// Compact rendering for logs and error messages: the type tag and the
+    /// size, never the payload.
+    ///
+    /// `{reply:?}` is wrong for anything that came off the wire: a reply can
+    /// carry an 8 MiB bulk, and `Debug` would turn one unexpected reply into a
+    /// ~32 MB log line (the `Debug` of a `Vec<u8>` is decimal ASCII), i.e. a
+    /// memory spike and log flooding for whoever sent it. Everything here is a
+    /// handful of bytes regardless of the reply, so a hostile or broken server
+    /// cannot choose the size of what the gateway writes to its log.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Simple(s) => format!("simple({})", s.len()),
+            Self::Error(s) => format!("error({})", s.len()),
+            // Bounded by construction, so the value itself is safe to print.
+            Self::Integer(i) => format!("integer({i})"),
+            Self::Bulk(Some(b)) => format!("bulk({})", b.len()),
+            Self::Bulk(None) => "bulk(nil)".to_string(),
+            Self::Array(Some(items)) => format!("array({})", items.len()),
+            Self::Array(None) => "array(nil)".to_string(),
+        }
+    }
+}
+
+/// Longest server-supplied text kept when it is rendered for a log line. A
+/// `-ERR …` reply can be 64 KiB, and it is only ever wanted as a hint.
+const MAX_LOG_TEXT: usize = 200;
+
+/// Shorten `s` to [`MAX_LOG_TEXT`] characters (at a UTF-8 boundary) for
+/// logging, keeping a note of the original size when it was cut.
+fn for_log(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.len() <= MAX_LOG_TEXT {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut end = MAX_LOG_TEXT;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}… ({} bytes)", &s[..end], s.len()))
 }
 
 /// Encode a command as a RESP array of bulk strings.
@@ -297,28 +368,82 @@ pub fn encode_command(args: &[&[u8]]) -> Vec<u8> {
 }
 
 /// Read one `\r\n`-terminated line (the terminator is stripped).
+///
+/// Two properties matter here, because the peer is a server that may be hostile
+/// or simply broken:
+///
+/// * **the line is buffered at most [`MAX_LINE`] bytes.** `read_until` would
+///   happily grow its `Vec` for a megabyte-long "line" and only then let us look
+///   at the result, so a server that never sends `\n` could make the parser hold
+///   an arbitrarily large buffer. Scanning with `fill_buf`/`consume` lets the cap
+///   fire while the line is still arriving.
+/// * **a line that ends at EOF without a `\n` is an error, not a short reply.**
+///   `+O` followed by a closed socket is not `+OK`, and `:1` is not `:12`; the
+///   truncated reply would otherwise be handed to the caller as a success.
 async fn read_line<R: AsyncBufRead + Unpin>(r: &mut R) -> Result<String, RedisError> {
-    let mut buf = Vec::with_capacity(32);
-    let n = r
-        .read_until(b'\n', &mut buf)
-        .await
-        .map_err(|e| io_err("read", e))?;
-    if n == 0 {
-        return Err(RedisError::Io("connection closed by server".into()));
+    let mut buf: Vec<u8> = Vec::with_capacity(32);
+    loop {
+        // The borrow of `r` from `fill_buf` must end before `consume`, hence the
+        // block: `(terminated, consumed)` carries everything out of it.
+        let (terminated, used) = {
+            let available = r.fill_buf().await.map_err(|e| io_err("read", e))?;
+            if available.is_empty() {
+                return Err(RedisError::Io(if buf.is_empty() {
+                    "connection closed by server".into()
+                } else {
+                    "connection closed in the middle of a protocol line".into()
+                }));
+            }
+            match memchr::memchr(b'\n', available) {
+                Some(i) => {
+                    if buf.len() + i + 1 > MAX_LINE {
+                        return Err(line_too_long());
+                    }
+                    buf.extend_from_slice(&available[..=i]);
+                    (true, i + 1)
+                }
+                None => {
+                    if buf.len() + available.len() > MAX_LINE {
+                        return Err(line_too_long());
+                    }
+                    buf.extend_from_slice(available);
+                    (false, available.len())
+                }
+            }
+        };
+        r.consume(used);
+        if terminated {
+            break;
+        }
     }
-    if buf.len() > MAX_LINE {
-        return Err(RedisError::Protocol(format!(
-            "line exceeds {MAX_LINE} bytes"
-        )));
-    }
-    while matches!(buf.last().copied(), Some(b'\n' | b'\r')) {
+    // Exactly one terminator is stripped: the `\n`, plus the `\r` that precedes
+    // it. Anything else is content (a bare `\r` inside a status line is).
+    buf.pop();
+    if buf.last() == Some(&b'\r') {
         buf.pop();
     }
     String::from_utf8(buf).map_err(|_| RedisError::Protocol("non-UTF-8 protocol line".into()))
 }
 
+fn line_too_long() -> RedisError {
+    RedisError::Protocol(format!("line exceeds {MAX_LINE} bytes"))
+}
+
 /// Parse one reply. `$-1` / `*-1` become `Bulk(None)` / `Array(None)`.
+///
+/// Bounds are enforced at every level: the line, the bulk, the array count, the
+/// nesting depth, and — through [`Budget`] — the reply as a whole.
 async fn parse_reply<R: AsyncBufRead + Unpin>(r: &mut R, depth: usize) -> Result<Resp, RedisError> {
+    let mut budget = Budget::new();
+    parse_bounded(r, depth, &mut budget).await
+}
+
+/// One reply within a shared byte budget.
+async fn parse_bounded<R: AsyncBufRead + Unpin>(
+    r: &mut R,
+    depth: usize,
+    budget: &mut Budget,
+) -> Result<Resp, RedisError> {
     if depth > MAX_DEPTH {
         return Err(RedisError::Protocol("arrays nested too deeply".into()));
     }
@@ -327,9 +452,17 @@ async fn parse_reply<R: AsyncBufRead + Unpin>(r: &mut R, depth: usize) -> Result
         Some((tag, rest)) => (tag, rest),
         None => return Err(RedisError::Protocol("empty reply line".into())),
     };
+    // Every node costs its own `Resp` value; payloads are charged on top.
+    budget.charge(NODE_COST)?;
     match tag {
-        "+" => Ok(Resp::Simple(rest.to_string())),
-        "-" => Ok(Resp::Error(rest.to_string())),
+        "+" => {
+            budget.charge(rest.len())?;
+            Ok(Resp::Simple(rest.to_string()))
+        }
+        "-" => {
+            budget.charge(rest.len())?;
+            Ok(Resp::Error(rest.to_string()))
+        }
         ":" => rest
             .parse::<i64>()
             .map(Resp::Integer)
@@ -342,6 +475,8 @@ async fn parse_reply<R: AsyncBufRead + Unpin>(r: &mut R, depth: usize) -> Result
                 return Ok(Resp::Bulk(None));
             }
             let len = useful_len(len, MAX_BULK, "bulk")?;
+            // Charged from the header, before the allocation it describes.
+            budget.charge(len + 2)?;
             let mut data = vec![0u8; len + 2];
             r.read_exact(&mut data)
                 .await
@@ -360,15 +495,49 @@ async fn parse_reply<R: AsyncBufRead + Unpin>(r: &mut R, depth: usize) -> Result
                 return Ok(Resp::Array(None));
             }
             let n = useful_len(n, MAX_ARRAY, "array")?;
-            let mut items = Vec::with_capacity(n.min(1024));
+            // The items vector is allocated up front at the *claimed* count, so
+            // it is charged from the header as well.
+            budget.charge(n.saturating_mul(NODE_COST))?;
+            let mut items = Vec::with_capacity(n);
             for _ in 0..n {
-                items.push(Box::pin(parse_reply(r, depth + 1)).await?);
+                items.push(Box::pin(parse_bounded(r, depth + 1, budget)).await?);
             }
             Ok(Resp::Array(Some(items)))
         }
         other => Err(RedisError::Protocol(format!(
             "unknown reply type '{other}'"
         ))),
+    }
+}
+
+/// The byte budget for one reply, threaded through the recursion.
+///
+/// Per-field caps bound each frame; this bounds the *sum*. It is charged before
+/// every allocation, so a peer cannot make the parser hold more than
+/// [`MAX_REPLY_BYTES`] however it slices the frames: one big bulk, a million
+/// small ones, or a tree of nested arrays all pay for what they will occupy.
+struct Budget {
+    left: usize,
+}
+
+impl Budget {
+    fn new() -> Self {
+        Self {
+            left: MAX_REPLY_BYTES,
+        }
+    }
+
+    /// Charge `n` bytes, or refuse the reply once the budget is spent.
+    fn charge(&mut self, n: usize) -> Result<(), RedisError> {
+        match self.left.checked_sub(n) {
+            Some(left) => {
+                self.left = left;
+                Ok(())
+            }
+            None => Err(RedisError::Protocol(format!(
+                "reply exceeds {MAX_REPLY_BYTES} bytes"
+            ))),
+        }
     }
 }
 
@@ -623,8 +792,10 @@ impl RedisPool {
     }
 }
 
+/// "Wrong reply type for this command" — with a bounded rendering of the reply,
+/// never its payload (see [`Resp::summary`]).
 fn unexpected(cmd: &str, got: &Resp) -> RedisError {
-    RedisError::Protocol(format!("{cmd}: unexpected reply {got:?}"))
+    RedisError::Protocol(format!("{cmd}: unexpected reply {}", got.summary()))
 }
 
 /// One pool per (server, credentials, timeout) for the whole process: N client
@@ -1142,6 +1313,31 @@ mod tests {
         assert!(u.redacted().contains("h:6379"));
     }
 
+    #[test]
+    fn pool_identity_is_a_wide_digest_of_the_password() {
+        // The identity names a pool in a process-wide map, so it must separate
+        // servers *and* credentials without ever holding the password. 16 digest
+        // bytes (32 hex) — 8 was small enough that two passwords could plausibly
+        // share a pool by accident, and that pool would send the *wrong*
+        // credentials.
+        let a = RedisUrl::parse("redis://gw:hunter2@h:6379/0").expect("url");
+        let b = RedisUrl::parse("redis://gw:other@h:6379/0").expect("url");
+        let anonymous = RedisUrl::parse("redis://h:6379/0").expect("url");
+        assert!(!a.identity().contains("hunter2"), "{}", a.identity());
+        assert_ne!(a.identity(), b.identity(), "another password, another pool");
+        assert_ne!(a.identity(), anonymous.identity(), "credentials matter");
+        assert_eq!(
+            a.identity(),
+            RedisUrl::parse("redis://gw:hunter2@h:6379/0")
+                .expect("url")
+                .identity(),
+            "the name must be stable, not salted"
+        );
+        let identity = a.identity();
+        let tag = identity.rsplit(':').next().expect("digest");
+        assert_eq!(tag.len(), 32, "16 digest bytes as hex: {tag}");
+    }
+
     // --- RESP parsing ------------------------------------------------------
 
     #[tokio::test]
@@ -1401,5 +1597,424 @@ mod tests {
             !Arc::ptr_eq(&a, &c),
             "a different timeout is a different pool"
         );
+    }
+
+    // --- hostile / broken servers ------------------------------------------
+    //
+    // The peer here is the *server*, so every one of these is something a
+    // compromised or malfunctioning Redis (or a MITM in front of it) can send.
+    // Each test asserts an `Err` — never a panic — and, where allocation is the
+    // risk, that the parser refused from the header instead of buffering the
+    // payload.
+
+    #[tokio::test]
+    async fn negative_lengths_other_than_the_nil_forms_are_rejected() {
+        for bad in [
+            "$-2\r\n",
+            "$-3\r\n",
+            "$-9223372036854775807\r\n",
+            "*-2\r\n",
+            "*-10\r\n",
+        ] {
+            let err = parse(bad.as_bytes())
+                .await
+                .expect_err("only -1 is a nil length");
+            assert!(
+                matches!(err, RedisError::Protocol(ref m) if m.contains("negative")),
+                "{bad}: {err}"
+            );
+        }
+        // The two legal nils still parse.
+        assert_eq!(parse(b"$-1\r\n").await.expect("nil bulk"), Resp::Bulk(None));
+        assert_eq!(
+            parse(b"*-1\r\n").await.expect("nil array"),
+            Resp::Array(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn array_counts_over_the_cap_are_refused_from_the_header() {
+        for bad in [
+            "*2000000\r\n",
+            "*1000000\r\n",
+            "*1000000000\r\n",
+            "*9223372036854775807\r\n",
+        ] {
+            let err = parse(bad.as_bytes()).await.expect_err("array cap");
+            assert!(
+                matches!(err, RedisError::Protocol(ref m) if m.contains("array length")),
+                "{bad}: {err}"
+            );
+        }
+        // The widest legal array is not preallocated beyond the cap either: the
+        // first missing element is what fails, so a claimed MAX_ARRAY-element
+        // reply costs one read, not a MAX_ARRAY-entry allocation.
+        let wire = format!("*{MAX_ARRAY}\r\n");
+        let err = parse(wire.as_bytes()).await.expect_err("elements missing");
+        assert!(matches!(err, RedisError::Io(_)), "{err:?}");
+        // One element over the cap is refused without reading any of them.
+        let wire = format!("*{}\r\n", MAX_ARRAY + 1);
+        let err = parse(wire.as_bytes()).await.expect_err("over the cap");
+        assert!(
+            matches!(err, RedisError::Protocol(ref m) if m.contains("exceeds")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_total_reply_budget_stops_nested_but_individually_legal_frames() {
+        // Every frame here is legal on its own: arrays of exactly MAX_ARRAY
+        // elements, depth 2, four-byte integers. Their *sum* is not: it is ~1M
+        // nodes, which is the shape a hostile server uses to make the parser
+        // hold gigabytes through frames that each pass the per-field caps.
+        // Nothing about a token bucket needs it, so the byte budget refuses it.
+        let mut wire = Vec::with_capacity(4 << 20);
+        wire.extend_from_slice(format!("*{MAX_ARRAY}\r\n").as_bytes());
+        for _ in 0..MAX_ARRAY {
+            wire.extend_from_slice(format!("*{MAX_ARRAY}\r\n").as_bytes());
+            for _ in 0..MAX_ARRAY {
+                wire.extend_from_slice(b":0\r\n");
+            }
+        }
+        let err = parse(&wire)
+            .await
+            .expect_err("the reply as a whole is over the budget");
+        assert!(
+            matches!(err, RedisError::Protocol(ref m) if m.contains("exceeds")),
+            "{err}"
+        );
+
+        // The same shape, but a reply the gateway could plausibly get — the
+        // token-bucket script's `{allowed, retry_ms}` — still parses, as does a
+        // bulk sitting at the per-field cap.
+        assert_eq!(
+            parse(b"*2\r\n:1\r\n:0\r\n")
+                .await
+                .expect("token bucket reply"),
+            Resp::Array(Some(vec![Resp::Integer(1), Resp::Integer(0)]))
+        );
+        let mut max_bulk = format!("${MAX_BULK}\r\n").into_bytes();
+        max_bulk.resize(max_bulk.len() + MAX_BULK, b'x');
+        max_bulk.extend_from_slice(b"\r\n");
+        let got = parse(&max_bulk)
+            .await
+            .expect("MAX_BULK is under the budget");
+        assert_eq!(got.as_bytes().map(<[u8]>::len), Some(MAX_BULK));
+    }
+
+    #[tokio::test]
+    async fn a_huge_reply_is_summarised_in_a_short_message() {
+        // Finding 3: `{reply:?}` on a reply with an 8 MiB sibling bulk is a
+        // ~32 MB log line — one unexpected reply, a memory spike and a flooded
+        // log. The message must describe the reply, not reproduce it.
+        let huge = Resp::Array(Some(vec![
+            Resp::Bulk(Some(vec![b'x'; MAX_BULK])),
+            Resp::Integer(1),
+        ]));
+        let msg = unexpected("GET", &huge).to_string();
+        assert!(
+            msg.len() < 200,
+            "the log line is {} bytes, not a summary: {msg}",
+            msg.len()
+        );
+        assert!(msg.contains("array(2)"), "{msg}");
+        assert!(!msg.contains("xxxx"), "the payload must not be printed");
+        // Children are not walked: the summary is O(1) in the reply, so a
+        // sibling bulk cannot choose even the length of the description.
+        let bulk = Resp::Bulk(Some(vec![b'x'; MAX_BULK]));
+        let msg = unexpected("GET", &bulk).to_string();
+        assert!(msg.contains(&format!("bulk({MAX_BULK})")), "{msg}");
+        assert!(msg.len() < 200, "{msg}");
+
+        // A `-ERR …` reply may be 64 KiB of server-chosen text; it is truncated
+        // the same way when it is formatted for a log.
+        let msg = RedisError::Server("E".repeat(MAX_LINE)).to_string();
+        assert!(msg.len() < 300, "server text is {} bytes: {msg}", msg.len());
+        assert!(msg.contains(&format!("{} bytes", MAX_LINE)), "{msg}");
+        // Short text is passed through untouched.
+        assert_eq!(
+            RedisError::Server("ERR nope".into()).to_string(),
+            "redis error reply: ERR nope"
+        );
+    }
+
+    #[test]
+    fn every_reply_summarises_to_a_tag_and_a_length() {
+        assert_eq!(Resp::Simple("OK".into()).summary(), "simple(2)");
+        assert_eq!(Resp::Error("ERR no".into()).summary(), "error(6)");
+        assert_eq!(Resp::Integer(-7).summary(), "integer(-7)");
+        assert_eq!(Resp::Bulk(Some(vec![0; 4096])).summary(), "bulk(4096)");
+        assert_eq!(Resp::Bulk(None).summary(), "bulk(nil)");
+        assert_eq!(
+            Resp::Array(Some(vec![Resp::Integer(1); 3])).summary(),
+            "array(3)"
+        );
+        assert_eq!(Resp::Array(None).summary(), "array(nil)");
+    }
+
+    #[tokio::test]
+    async fn the_pool_reports_a_huge_wrong_reply_in_a_few_bytes() {
+        // The same guarantee through the real path: a server that answers GET
+        // with a megabyte of payload must not make the gateway log it.
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("local address");
+        let server = tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut scratch = [0u8; 256];
+            let _ = sock.read(&mut scratch).await;
+            let payload = vec![b'y'; 1 << 20];
+            let _ = sock
+                .write_all(format!("*1\r\n${}\r\n", payload.len()).as_bytes())
+                .await;
+            let _ = sock.write_all(&payload).await;
+            let _ = sock.write_all(b"\r\n").await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+
+        let url = RedisUrl::parse(&format!("redis://127.0.0.1:{}/0", addr.port())).expect("url");
+        let p = RedisPool::new(url, Duration::from_millis(1_000));
+        let err = p.get("k").await.expect_err("an array is not a GET reply");
+        let msg = err.to_string();
+        assert!(msg.len() < 200, "{} bytes: {msg}", msg.len());
+        assert!(msg.contains("array(1)"), "{msg}");
+        assert!(!msg.contains("yyy"), "the payload must not be printed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nested_arrays_hit_a_depth_cap_instead_of_the_stack() {
+        // MAX_DEPTH levels fit …
+        let mut ok = Vec::new();
+        for _ in 0..MAX_DEPTH {
+            ok.extend_from_slice(b"*1\r\n");
+        }
+        ok.extend_from_slice(b":1\r\n");
+        assert!(parse(&ok).await.is_ok(), "MAX_DEPTH levels must parse");
+
+        // … one more does not, and neither does a thousand: the error comes from
+        // the counter, so the recursion never grows past the cap.
+        for levels in [MAX_DEPTH + 1, 1000] {
+            let mut bad = Vec::new();
+            for _ in 0..levels {
+                bad.extend_from_slice(b"*1\r\n");
+            }
+            bad.extend_from_slice(b":1\r\n");
+            let err = parse(&bad).await.expect_err("depth cap must bite");
+            assert!(
+                matches!(err, RedisError::Protocol(ref m) if m.contains("too deeply")),
+                "{levels} levels: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_headers_over_the_cap_are_refused_before_allocating() {
+        // Not even an integer.
+        for bad in ["$99999999999999999999\r\n", "$ 5\r\n", "$0x10\r\n", "$\r\n"] {
+            let err = parse(bad.as_bytes()).await.expect_err("bad bulk length");
+            assert!(
+                matches!(err, RedisError::Protocol(ref m) if m.contains("bulk length")),
+                "{bad}: {err}"
+            );
+        }
+        // An integer, but larger than MAX_BULK: refused from the header, so the
+        // 8 MiB+2 allocation in the `$` branch never happens.
+        for declared in [MAX_BULK + 1, i64::MAX as usize] {
+            let header = format!("${declared}\r\n");
+            let err = parse(header.as_bytes())
+                .await
+                .expect_err("over the bulk cap");
+            assert!(
+                matches!(err, RedisError::Protocol(ref m) if m.contains("exceeds")),
+                "{declared}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_integers_are_rejected() {
+        for bad in [
+            ":abc\r\n",
+            ":1.5\r\n",
+            ":\r\n",
+            ": 1\r\n",
+            ":99999999999999999999\r\n",
+            ":1e3\r\n",
+        ] {
+            let err = parse(bad.as_bytes()).await.expect_err("not an integer");
+            assert!(
+                matches!(err, RedisError::Protocol(ref m) if m.contains("integer")),
+                "{bad}: {err}"
+            );
+        }
+        assert_eq!(
+            parse(b":-7\r\n").await.expect("negative"),
+            Resp::Integer(-7)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_that_ends_at_eof_is_not_a_reply() {
+        // A truncated reply must fail the connection: `+O` is not `+OK`, and
+        // handing the caller `Simple("O")` would make a broken socket look like a
+        // successful command.
+        for truncated in ["+OK", ":42", "-ERR no", "$3", "*2"] {
+            let err = parse(truncated.as_bytes())
+                .await
+                .expect_err("no terminator, no reply");
+            assert!(
+                matches!(err, RedisError::Io(ref m) if m.contains("closed")),
+                "{truncated:?}: {err}"
+            );
+        }
+        // Garbage that is not even a reply type, and an empty line.
+        for bad in ["?what\r\n", "\r\n", "\n", "hello world\r\n"] {
+            let err = parse(bad.as_bytes()).await.expect_err("not RESP");
+            assert!(matches!(err, RedisError::Protocol(_)), "{bad:?}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_very_long_line_is_refused_without_buffering_it() {
+        // 1 MiB of `+aaa…` with no terminator. The error must come from the
+        // first MAX_LINE bytes, so the rest of the stream stays unread: a server
+        // cannot use one endless "line" to make the parser hold an unbounded
+        // buffer for as long as the socket stays open.
+        let mut wire = vec![b'+'];
+        wire.resize(1024 * 1024, b'a');
+        let mut cursor: &[u8] = &wire;
+        let err = {
+            let mut buffered = BufReader::new(&mut cursor);
+            parse_reply(&mut buffered, 0)
+                .await
+                .expect_err("unterminated megabyte line")
+        };
+        assert!(
+            matches!(err, RedisError::Protocol(ref m) if m.contains("line exceeds")),
+            "{err}"
+        );
+        assert!(
+            cursor.len() > wire.len() / 2,
+            "only ~MAX_LINE bytes may be consumed, {} of {} were",
+            wire.len() - cursor.len(),
+            wire.len()
+        );
+    }
+
+    /// An `AsyncRead` that hands out one byte per poll, the way a TCP connection
+    /// that fragments a reply into tiny segments would.
+    struct Trickle<'a> {
+        data: &'a [u8],
+    }
+
+    impl tokio::io::AsyncRead for Trickle<'_> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.data.is_empty() || buf.remaining() == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let (head, tail) = self.data.split_at(1);
+            buf.put_slice(head);
+            self.data = tail;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_split_across_packets_still_parses() {
+        // Every byte arrives in its own "packet": headers, bulk bodies and
+        // nested arrays must all survive being fragmented at arbitrary points.
+        for (wire, expected) in [
+            (&b"$5\r\nhello\r\n"[..], Resp::Bulk(Some(b"hello".to_vec()))),
+            (&b"+OK\r\n"[..], Resp::Simple("OK".into())),
+            (
+                &b"*2\r\n$3\r\nfoo\r\n:7\r\n"[..],
+                Resp::Array(Some(vec![
+                    Resp::Bulk(Some(b"foo".to_vec())),
+                    Resp::Integer(7),
+                ])),
+            ),
+            (&b"$-1\r\n"[..], Resp::Bulk(None)),
+        ] {
+            let mut reader = BufReader::new(Trickle { data: wire });
+            let got = parse_reply(&mut reader, 0)
+                .await
+                .expect("a fragmented reply is still one reply");
+            assert_eq!(got, expected, "{:?}", String::from_utf8_lossy(wire));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ten_megabyte_bulk_is_refused_by_the_pool() {
+        // The question the pool has to answer: a server that promises a 10 MiB
+        // value for a GET must not be able to make the gateway allocate it.
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("local address");
+        let server = tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut scratch = [0u8; 256];
+            let _ = sock.read(&mut scratch).await;
+            let _ = sock.write_all(b"$10485760\r\n").await;
+            let _ = sock.write_all(&[b'x'; 64]).await;
+            let _ = sock.flush().await;
+            // Hold the socket open, so a parser that waited for the body would
+            // time out instead of seeing a clean EOF.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+
+        let url = RedisUrl::parse(&format!("redis://127.0.0.1:{}/0", addr.port())).expect("url");
+        let p = RedisPool::new(url, Duration::from_millis(1_000));
+        let err = p
+            .get("k")
+            .await
+            .expect_err("a 10 MiB GET reply is over MAX_BULK");
+        assert!(
+            matches!(err, RedisError::Protocol(ref m) if m.contains("exceeds")),
+            "{err:?}"
+        );
+        assert!(
+            !err.keeps_connection(),
+            "an oversized reply leaves the stream at an unknown offset"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn deterministic_garbage_never_panics() {
+        // xorshift64 seeded with a constant: an unknown reply type followed by
+        // random bytes. Always an error, and always one of the defined variants.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..500 {
+            let mut wire = vec![b'?'];
+            for _ in 0..(state as usize % 64) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                wire.push((state >> 32) as u8);
+            }
+            let err = parse(&wire).await.expect_err("unknown reply type");
+            // Either the unknown type byte or an unterminated line: both are
+            // defined errors, which is the whole point.
+            assert!(
+                matches!(err, RedisError::Protocol(_) | RedisError::Io(_)),
+                "{err:?}"
+            );
+        }
     }
 }

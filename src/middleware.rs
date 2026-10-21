@@ -94,24 +94,6 @@ pub async fn require_api_key(
     let token = extract_bearer(&req);
     let ip = client_ip(&req);
 
-    // Locked out after repeated failures? Refuse before touching the keys.
-    {
-        let burst = rt.auth_fail_burst;
-        let window = rt.auth_fail_window;
-        let mut fails = state.auth_fails.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(retry) = fails.blocked(&ip, burst, window) {
-            let mut resp = proxy::error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many failed authentication attempts from this address",
-                "rate_limit_exceeded",
-            );
-            if let Ok(v) = axum::http::HeaderValue::from_str(&retry.to_string()) {
-                resp.headers_mut().insert(header::RETRY_AFTER, v);
-            }
-            return resp;
-        }
-    }
-
     let (auth_needed, client_key_info) = {
         // Poisoning-recoverable read: a panicking writer must not wedge all /v1 traffic.
         let client_keys = state.client_keys.read().unwrap_or_else(|e| e.into_inner());
@@ -150,6 +132,19 @@ pub async fn require_api_key(
         });
         return next.run(req).await;
     }
+
+    // An upgrade is served by a task that outlives the response, so the
+    // concurrency slot must follow the request rather than the response.
+    let upgrade = if req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+    {
+        Upgrade::WebSocket
+    } else {
+        Upgrade::Normal
+    };
 
     if let Some(ck) = client_key_info {
         // Per-key rate limit. Enforced after authentication (so an unauthorised
@@ -213,30 +208,62 @@ pub async fn require_api_key(
         };
         req.extensions_mut().insert(proxy::KeyPermissions {
             allowed_models: allowed,
-            key_name: ck.cfg.name.clone().or_else(|| Some(ck.cfg.key.clone())),
+            key_name: Some(proxy::client_key_label(&ck.cfg.key, ck.cfg.name.as_deref())),
         });
+        // A websocket upgrade returns its 101 immediately and then lives in a
+        // separate task, so for those the slot travels with the *request* and is
+        // taken by the handler that owns the session.
+        if limit > 0 && upgrade == Upgrade::WebSocket {
+            req.extensions_mut().insert(ClientKeyGuard(ck.clone()));
+        }
         let mut resp = next.run(req).await;
-        if limit > 0 {
+        if limit > 0 && upgrade == Upgrade::Normal {
             // Dropped with the response — i.e. after a streamed body completes.
             resp.extensions_mut().insert(ClientKeyGuard(ck));
         }
         return resp;
     }
 
-    {
-        let burst = rt.auth_fail_burst;
-        let window = rt.auth_fail_window;
-        state
-            .auth_fails
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .note(&ip, burst, window);
+    // The lockout is a *response to a failed credential*, never a pre-filter: a
+    // pre-check would let anyone holding a socket lock every legitimate caller
+    // out (behind a reverse proxy all of them share the proxy's address). The
+    // cost of the check is one constant-time comparison, which is cheap enough
+    // that an attacker gains nothing by hammering it.
+    if failed_attempt(&state, &ip) {
+        return too_many_failures();
     }
     proxy::error_response(
         StatusCode::UNAUTHORIZED,
         "invalid gateway API key",
         "authentication_error",
     )
+}
+
+/// Record one failed authentication and report whether the address is now over
+/// its budget. Totals ride the same counter the admin path uses.
+fn failed_attempt(state: &Arc<proxy::AppState>, ip: &str) -> bool {
+    let (burst, window) = {
+        let rt = state.rt();
+        (rt.auth_fail_burst, rt.auth_fail_window)
+    };
+    state
+        .auth_fails
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .note(ip, burst, window)
+}
+
+fn too_many_failures() -> Response {
+    let mut resp = proxy::error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many failed authentication attempts from this address",
+        "rate_limit_exceeded",
+    );
+    resp.headers_mut().insert(
+        header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("5"),
+    );
+    resp
 }
 
 /// Admin auth: `/api/*` requires `Bearer <admin_key>` (or `api_key`) when set.
@@ -251,30 +278,12 @@ pub async fn require_admin_key(
 ) -> Response {
     let rt = state.rt();
     let ip = client_ip(&req);
-    let burst = rt.auth_fail_burst;
-    let window = rt.auth_fail_window;
-    // Same lockout as /v1: the admin surface is the more valuable target.
-    {
-        let mut fails = state.auth_fails.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(retry) = fails.blocked(&ip, burst, window) {
-            let mut resp = proxy::error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many failed authentication attempts from this address",
-                "rate_limit_exceeded",
-            );
-            if let Ok(v) = axum::http::HeaderValue::from_str(&retry.to_string()) {
-                resp.headers_mut().insert(header::RETRY_AFTER, v);
-            }
-            return resp;
-        }
-    }
     if let Some(expected) = rt.admin_key.or(rt.api_key) {
         if !bearer_ok(&req, &expected) {
-            state
-                .auth_fails
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .note(&ip, burst, window);
+            // Same rule as /v1: count the failure, throttle only the failures.
+            if failed_attempt(&state, &ip) {
+                return too_many_failures();
+            }
             return proxy::error_response(
                 StatusCode::UNAUTHORIZED,
                 "invalid or missing admin key",
@@ -320,25 +329,19 @@ impl AuthFailures {
         e.0 >= burst
     }
 
-    /// Whether this IP is currently locked out (without counting an attempt).
-    pub fn blocked(&mut self, ip: &str, burst: u32, window: std::time::Duration) -> Option<u64> {
-        let now = std::time::Instant::now();
-        let (count, first) = self.seen.get(ip).copied()?;
-        let elapsed = now.duration_since(first);
-        if elapsed > window {
-            self.seen.remove(ip);
-            return None;
-        }
-        if count >= burst {
-            return Some((window - elapsed).as_secs().max(1));
-        }
-        None
-    }
-
     /// Clear the counter for an IP after a successful authentication.
     pub fn clear(&mut self, ip: &str) {
         self.seen.remove(ip);
     }
+}
+
+/// Whether the request asks for a connection upgrade (websocket) or is a plain
+/// HTTP request. Upgrade sessions outlive their response, so their concurrency
+/// slot is handed over differently.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Upgrade {
+    Normal,
+    WebSocket,
 }
 
 /// Decrements the key's in-flight counter when the response (including a streamed
@@ -472,7 +475,9 @@ pub async fn security_headers(
     next: Next,
 ) -> Response {
     // Our own listener serving TLS counts too — nobody sets X-Forwarded-Proto then.
-    let served_over_tls = state.rt().tls_enabled;
+    let served_over_tls = state
+        .tls_enabled_flag
+        .load(std::sync::atomic::Ordering::Relaxed);
     let req_is_https = served_over_tls || {
         // A TLS-terminating proxy tells us via X-Forwarded-Proto.
         req.headers()

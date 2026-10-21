@@ -32,6 +32,13 @@
 //!   buffer only grows when real bytes arrive. Fragmented messages are capped in
 //!   total by [`MAX_MESSAGE_BYTES`], so unlimited fragmentation cannot be used to
 //!   assemble a giant message out of small frames.
+//! * **Caps are sized to the traffic, and buffers are given back.** The relay
+//!   carries realtime events of a few KiB, so the caps are 1 MiB — high enough
+//!   that a legitimate provider never hits them, low enough that the worst case a
+//!   single connection can pin is bounded. A reader also shrinks its buffer once
+//!   the frame that needed it has been delivered (see
+//!   [`FrameReader::shrink_if_drained`]), because otherwise one big frame would
+//!   leave that allocation attached to a long-lived session.
 //! * **Control frames are checked strictly** (FIN set, payload ≤ 125 bytes): a
 //!   fragmented or oversized ping/close is a protocol error, not something to
 //!   tolerate, because both are used by the closing handshake.
@@ -51,15 +58,32 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// RFC 6455 §1.3: the GUID concatenated with `Sec-WebSocket-Key` before hashing.
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-/// Largest single frame accepted. 16 MiB is far above any realtime audio event
-/// (base64 audio deltas are a few KiB) while still bounding one allocation.
-pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+/// Largest single frame accepted.
+///
+/// Realtime traffic is chat/audio *events*: a base64 audio delta is a few KiB and
+/// the biggest control or session event is well under 100 KiB, so 1 MiB is
+/// already far above anything a working provider sends. It used to be 16 MiB,
+/// which no real client ever needed but every hostile one could use: a single
+/// frame at that size also left a 16 MiB buffer allocated for the rest of the
+/// session (the reader only ever consumed from it). One MiB keeps the same
+/// "refuse it from the length prefix" property with a sixteenth of the memory.
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Largest reassembled message accepted (fragments included).
-pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+///
+/// Same reasoning as [`MAX_FRAME_BYTES`]: a fragmented message is reassembled
+/// into a single `Vec`, so this is the per-session memory bound for one message.
+pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
 /// How much we try to read per syscall; also the buffer growth step.
 const READ_CHUNK: usize = 16 * 1024;
+
+/// Capacity above which an idle read buffer is released after a frame is parsed.
+///
+/// Buffers at or below this stay put: freeing and reallocating a 16–64 KiB buffer
+/// per message would cost more than the memory it saves, and this is also the
+/// size a busy session settles at.
+const SHRINK_THRESHOLD: usize = 64 * 1024;
 
 /// WebSocket opcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,7 +359,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Frame> {
 /// Frames are never fragmented on write: every message this gateway produces is
 /// a single frame, so there is no interleaving to get wrong.
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io::Result<()> {
-    write_frame_with(w, frame, false).await
+    validate_outbound(frame)?;
+    // Nothing has to be transformed for the unmasked direction, so the payload is
+    // written straight out of the caller's frame.
+    write_parts(w, frame.fin, frame.opcode, &frame.payload, None).await
 }
 
 /// Write one masked frame (the client→server direction) and flush it.
@@ -344,15 +371,42 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io:
 /// stops the payload bytes from being guessable by an intermediary that can
 /// predict them.
 pub async fn write_frame_masked<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io::Result<()> {
-    write_frame_with(w, frame, true).await
+    // The payload has to be XORed, and this signature only lends it to us, so
+    // this one copy is unavoidable. The relay (which already owns the frame it
+    // just decoded) uses `write_frame_with` and avoids it.
+    write_frame_with(w, frame.clone(), true).await
 }
 
-/// Write one frame, optionally masked.
+/// Write one frame, optionally masked, **taking the payload by value**.
+///
+/// Masking is an XOR over the payload. Doing it through a `&Frame` would require
+/// cloning the payload first, and the client→server hop of the relay is exactly
+/// where frames are both masked and largest, so a relayed frame would be copied
+/// twice: once out of the socket buffer by the decoder and again by the masker.
+/// Taking the frame by value lets [`apply_mask`] run in place; the unmasked
+/// direction keeps borrowing the payload, so no path copies a payload it owns.
 pub async fn write_frame_with<W: AsyncWrite + Unpin>(
     w: &mut W,
-    frame: &Frame,
+    mut frame: Frame,
     mask: bool,
 ) -> io::Result<()> {
+    validate_outbound(&frame)?;
+    if !mask {
+        return write_parts(w, frame.fin, frame.opcode, &frame.payload, None).await;
+    }
+    let mut key = [0u8; 4];
+    getrandom::fill(&mut key).map_err(|e| io::Error::other(format!("CSPRNG unavailable: {e}")))?;
+    // In place: `frame` is ours, so this is the only mutation of the payload.
+    apply_mask(&mut frame.payload, key);
+    write_parts(w, frame.fin, frame.opcode, &frame.payload, Some(key)).await
+}
+
+/// What we refuse to put *on the wire*.
+///
+/// Only these two rules exist, and both mirror the reader side: emitting a frame
+/// the peer's reader would have to reject (too large, or a fragmented/oversized
+/// control frame) would turn our own bug into the peer's protocol error.
+fn validate_outbound(frame: &Frame) -> io::Result<()> {
     if frame.payload.len() > MAX_FRAME_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -367,11 +421,25 @@ pub async fn write_frame_with<W: AsyncWrite + Unpin>(
             "a control frame must be final and carry at most 125 bytes",
         ));
     }
+    Ok(())
+}
 
+/// Serialize one frame: header (with the mask bit and key, when masking) then
+/// payload, then flush.
+///
+/// `payload` must already be masked when `key` is `Some`; keeping the XOR out of
+/// here is what lets the caller do it in place.
+async fn write_parts<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    fin: bool,
+    opcode: OpCode,
+    payload: &[u8],
+    key: Option<[u8; 4]>,
+) -> io::Result<()> {
     let mut header = [0u8; 14];
-    header[0] = if frame.fin { 0x80 } else { 0 } | frame.opcode.as_u8();
-    let mask_bit = if mask { 0x80u8 } else { 0 };
-    let payload_len = frame.payload.len();
+    header[0] = if fin { 0x80 } else { 0 } | opcode.as_u8();
+    let mask_bit = if key.is_some() { 0x80u8 } else { 0 };
+    let payload_len = payload.len();
     let mut header_len = 2;
     if payload_len < 126 {
         header[1] = mask_bit | payload_len as u8;
@@ -384,26 +452,13 @@ pub async fn write_frame_with<W: AsyncWrite + Unpin>(
         header[2..10].copy_from_slice(&(payload_len as u64).to_be_bytes());
         header_len = 10;
     }
-
-    if mask {
-        let mut key = [0u8; 4];
-        getrandom::fill(&mut key)
-            .map_err(|e| io::Error::other(format!("CSPRNG unavailable: {e}")))?;
+    if let Some(key) = key {
         header[header_len..header_len + 4].copy_from_slice(&key);
         header_len += 4;
-        w.write_all(&header[..header_len]).await?;
-        // `write_frame` takes `&Frame`, so the masked copy is unavoidable here;
-        // a caller that owns the payload could mask in place with `write_frame_with`
-        // by building the frame itself.
-        let mut payload = frame.payload.clone();
-        apply_mask(&mut payload, key);
-        w.write_all(&payload).await?;
-    } else {
-        w.write_all(&header[..header_len]).await?;
-        w.write_all(&frame.payload).await?;
     }
-    w.flush().await?;
-    Ok(())
+    w.write_all(&header[..header_len]).await?;
+    w.write_all(payload).await?;
+    w.flush().await
 }
 
 /// A buffered, cancel-safe frame/message reader.
@@ -455,6 +510,24 @@ impl<R> FrameReader<R> {
     /// Recover the underlying stream (any buffered bytes are dropped with it).
     pub fn into_inner(self) -> R {
         self.io
+    }
+
+    /// Bytes currently sitting in the read buffer.
+    ///
+    /// Test-only: the hostile-input tests assert that a rejected frame leaves a
+    /// *small* buffer behind (i.e. the decoder failed from the bytes it had,
+    /// instead of having to accumulate the payload first).
+    #[cfg(test)]
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Allocated capacity of the read buffer.
+    ///
+    /// Test-only: pins the "a big frame does not stay allocated" property.
+    #[cfg(test)]
+    pub fn buffered_capacity(&self) -> usize {
+        self.buf.capacity()
     }
 }
 
@@ -557,11 +630,36 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     async fn next_wire_frame(&mut self) -> io::Result<Option<Frame>> {
         loop {
             if let Some(frame) = parse_frame(&mut self.buf, self.mask, self.max_frame)? {
+                self.shrink_if_drained();
                 return Ok(Some(frame));
             }
             if !self.fill().await? {
                 return Ok(None);
             }
+        }
+    }
+
+    /// Give a large read buffer back to the allocator once the frame that needed
+    /// it has been delivered.
+    ///
+    /// A `BytesMut` only grows: after one 1 MiB frame the buffer stays 1 MiB for
+    /// the rest of the session even though every later event is a few KiB. Over
+    /// hundreds of concurrent sessions (and sessions that live for an hour) that
+    /// is the difference between a bounded relay and a memory leak with extra
+    /// steps, so the buffer is replaced with a read-chunk-sized one as soon as it
+    /// is drained past [`SHRINK_THRESHOLD`]. Any partial next frame is copied —
+    /// at most `READ_CHUNK` bytes, since a larger remainder is left alone — and
+    /// this runs once per delivered frame, never per read.
+    fn shrink_if_drained(&mut self) {
+        if self.buf.capacity() <= SHRINK_THRESHOLD {
+            return;
+        }
+        if self.buf.is_empty() {
+            self.buf = BytesMut::with_capacity(READ_CHUNK);
+        } else if self.buf.len() <= READ_CHUNK {
+            let mut small = BytesMut::with_capacity(READ_CHUNK);
+            small.extend_from_slice(&self.buf);
+            self.buf = small;
         }
     }
 
@@ -693,6 +791,14 @@ fn parse_frame(buf: &mut BytesMut, mask: Mask, max_frame: usize) -> io::Result<O
             ],
         );
     }
+    // A close frame's body is not opaque: RFC 6455 §5.5.1 fixes its length to
+    // "empty or at least 2 bytes", and §7.4.1 forbids the reserved codes on the
+    // wire. Both are checked here, before the frame reaches the relay, because a
+    // code the peer could not legally have sent leaves the close handshake in an
+    // undefined state.
+    if opcode == OpCode::Close {
+        validate_close(&payload)?;
+    }
     buf.advance(total);
     Ok(Some(Frame {
         fin,
@@ -717,6 +823,39 @@ fn validate_text(opcode: OpCode, payload: &[u8]) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Whether a close status code may appear *on the wire* (RFC 6455 §7.4.1).
+///
+/// 0–999 are undefined; 1004, 1005, 1006 and 1015 are reserved and MUST NOT be
+/// sent (they exist so an endpoint can *report* "no status"/"abnormal close"
+/// locally); 1016–2999 are reserved for future protocol revisions; 3000–4999 are
+/// the registered-library and private-use ranges, which are legal to send.
+fn close_code_is_valid(code: u16) -> bool {
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
+}
+
+/// Validate a close frame payload: empty, or a 2-byte code plus a reason.
+///
+/// A one-byte payload cannot carry a code, so accepting it would mean guessing
+/// what the peer meant by the close.
+fn validate_close(payload: &[u8]) -> io::Result<()> {
+    match *payload {
+        [] => Ok(()),
+        [_] => Err(protocol(
+            "a close frame's payload must be empty or carry a 2-byte status code",
+        )),
+        [hi, lo, ..] => {
+            let code = u16::from_be_bytes([hi, lo]);
+            if close_code_is_valid(code) {
+                Ok(())
+            } else {
+                Err(protocol(format!(
+                    "close status code {code} must not appear on the wire (RFC 6455 §7.4.1)"
+                )))
+            }
+        }
+    }
 }
 
 /// A protocol violation (RFC 6455 §7.1.7 "fail the WebSocket connection").
@@ -946,6 +1085,106 @@ mod tests {
         assert!(err.to_string().contains("exceeds"), "{err}");
     }
 
+    /// The caps are a *security* number, not a tuning knob: they decide how much
+    /// memory one connection can pin, so a change here must be deliberate.
+    #[test]
+    fn frame_and_message_caps_are_one_mib() {
+        assert_eq!(MAX_FRAME_BYTES, 1024 * 1024);
+        assert_eq!(MAX_MESSAGE_BYTES, 1024 * 1024);
+        // Far above the biggest realtime event (a few KiB)…
+        const { assert!(MAX_FRAME_BYTES >= 256 * 1024) };
+    }
+
+    /// A frame exactly at the cap is legal; the *default* reader refuses one byte
+    /// more, but a caller that really needs a bigger frame can raise the limit —
+    /// which is why the cap is a parameter and not a hard-coded constant in the
+    /// parser.
+    #[tokio::test]
+    async fn a_frame_at_the_cap_is_legal_and_one_past_it_needs_a_raised_limit() {
+        let payload = vec![0x5A; MAX_FRAME_BYTES];
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &Frame::binary(payload))
+            .await
+            .expect("a frame at the cap is writable");
+        let mut cursor: &[u8] = &wire;
+        let frame = read_frame(&mut cursor).await.expect("a frame at the cap");
+        assert_eq!(frame.payload.len(), MAX_FRAME_BYTES);
+
+        // One byte over: refused from the header the default reader sees.
+        let mut wire = Vec::new();
+        wire.push(0x82); // FIN + binary
+        wire.push(127); // unmasked + 64-bit length
+        wire.extend_from_slice(&((MAX_FRAME_BYTES as u64) + 1).to_be_bytes());
+        let mut reader = FrameReader::client_side(&wire[..]);
+        let err = reader
+            .next_frame()
+            .await
+            .expect_err("one byte over the cap");
+        assert!(err.to_string().contains("exceeds"), "{err}");
+
+        // The same bytes are fine when the caller raises the limit (tests and any
+        // future endpoint that genuinely carries bigger payloads).
+        let mut wire = Vec::new();
+        wire.push(0x82);
+        wire.push(127);
+        let declared = (MAX_FRAME_BYTES as u64) + 1;
+        wire.extend_from_slice(&declared.to_be_bytes());
+        let body = vec![0x11u8; MAX_FRAME_BYTES + 1];
+        wire.extend_from_slice(&body);
+        let mut reader = FrameReader::with_limits(
+            &wire[..],
+            Mask::Forbidden,
+            MAX_FRAME_BYTES + 1,
+            MAX_MESSAGE_BYTES * 2,
+        );
+        let frame = reader
+            .next_frame()
+            .await
+            .expect("a raised frame limit accepts it");
+        assert_eq!(frame.payload.len(), MAX_FRAME_BYTES + 1);
+    }
+
+    /// One big frame must not leave its buffer attached to the connection: the
+    /// allocation is handed back as soon as the frame is delivered.
+    #[tokio::test]
+    async fn a_delivered_big_frame_does_not_leave_its_buffer_allocated() {
+        let payload = vec![7u8; 256 * 1024];
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &Frame::binary(payload.clone()))
+            .await
+            .expect("encode");
+        let mut reader = FrameReader::client_side(&wire[..]);
+        let frame = reader.next_message().await.expect("read").expect("frame");
+        assert_eq!(frame.payload.len(), 256 * 1024);
+        assert_eq!(reader.buffered_len(), 0, "the frame consumed the buffer");
+        assert!(
+            reader.buffered_capacity() <= SHRINK_THRESHOLD,
+            "a 256 KiB frame left {} bytes allocated",
+            reader.buffered_capacity()
+        );
+        // …and the reader still works afterwards.
+        assert!(reader.next_message().await.expect("clean eof").is_none());
+        assert!(reader.buffered_capacity() <= SHRINK_THRESHOLD);
+    }
+
+    /// `write_frame_with` takes the payload by value so the mask is applied in
+    /// place; the wire format must be identical to the borrowed variant's.
+    #[tokio::test]
+    async fn masked_write_by_value_round_trips() {
+        let mut wire = Vec::new();
+        write_frame_with(&mut wire, Frame::text("in place"), true)
+            .await
+            .expect("write");
+        assert_eq!(wire[1] & 0x80, 0x80, "the mask bit is set");
+        let mut cursor: &[u8] = &wire;
+        let got = FrameReader::server_side(&mut cursor)
+            .next_message()
+            .await
+            .expect("read")
+            .expect("frame");
+        assert_eq!(got.payload, b"in place");
+    }
+
     #[tokio::test]
     async fn fragmented_message_is_reassembled() {
         let key = [1, 2, 3, 4];
@@ -1147,5 +1386,291 @@ mod tests {
         assert_eq!(OpCode::from_u8(3), None);
         assert_eq!(Frame::text("abc").len(), 3);
         assert!(Frame::binary(vec![]).is_empty());
+    }
+
+    // ----- hostile byte streams -----
+    //
+    // Every test below feeds bytes a peer would never legitimately send and
+    // asserts three things at once: an `Err` (never a panic), a buffer the
+    // decoder did not have to grow (hostile input is a few KiB), and that the
+    // connection is failed rather than half-consumed.
+
+    /// A raw header with an explicit length field and no body, optionally with a
+    /// mask key. Lets a test lie about the payload length.
+    fn raw_header(
+        opcode: u8,
+        fin: bool,
+        masked: bool,
+        len7: u8,
+        extra: &[u8],
+        key: bool,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(if fin { 0x80 } else { 0 } | opcode);
+        out.push(if masked { 0x80 } else { 0 } | len7);
+        out.extend_from_slice(extra);
+        if masked && key {
+            out.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        }
+        out
+    }
+
+    /// Deterministic xorshift64: reproducible hostile-ish bytes without a crate.
+    fn xorshift(state: &mut u64) -> u8 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        (x >> 32) as u8
+    }
+
+    #[tokio::test]
+    async fn hostile_length_prefixes_fail_from_the_header_alone() {
+        // u64::MAX (MSB set), 2^63, and one byte over the frame cap. Only the
+        // 14-byte header is given: the decoder must reject it from the prefix
+        // instead of waiting for — or reserving — the announced bytes.
+        for declared in [u64::MAX, 1u64 << 63, (MAX_FRAME_BYTES as u64) + 1] {
+            let wire = raw_header(0x1, true, true, 127, &declared.to_be_bytes(), true);
+            let wire_len = wire.len();
+            assert_eq!(wire_len, 14);
+            let mut reader = FrameReader::server_side(&wire[..]);
+            let err = reader
+                .next_frame()
+                .await
+                .expect_err("a hostile length prefix must be refused");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{declared}");
+            // Nothing was consumed and nothing beyond the header was buffered.
+            assert!(
+                reader.buffered_len() <= wire_len,
+                "buffer grew to {} bytes for a {declared}-byte claim",
+                reader.buffered_len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_bodies_are_errors_not_partial_frames() {
+        // 126-form: claims 300 bytes, carries 3 plus the mask key.
+        let mut wire = raw_header(0x2, true, true, 126, &300u16.to_be_bytes(), true);
+        wire.extend_from_slice(b"abc");
+        let mut cursor: &[u8] = &wire;
+        let err = FrameReader::server_side(&mut cursor)
+            .next_frame()
+            .await
+            .expect_err("truncated 16-bit body");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // 127-form: claims 70_000 bytes, carries 8.
+        let mut wire = raw_header(0x2, true, true, 127, &70_000u64.to_be_bytes(), true);
+        wire.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut cursor: &[u8] = &wire;
+        let err = FrameReader::server_side(&mut cursor)
+            .next_frame()
+            .await
+            .expect_err("truncated 64-bit body");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // The 126 length itself truncated to two bytes: "not enough yet", then EOF.
+        let wire = raw_header(0x1, true, true, 126, b"", false);
+        let mut cursor: &[u8] = &wire;
+        let err = FrameReader::server_side(&mut cursor)
+            .next_frame()
+            .await
+            .expect_err("truncated 16-bit length field");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn zero_length_frames_are_framed_but_never_vanish() {
+        // A masked empty text frame is a legal (empty) message and consumes
+        // exactly its 6 header bytes.
+        let wire = masked_wire_frame(true, OpCode::Text, b"", [1, 2, 3, 4]);
+        assert_eq!(wire.len(), 6);
+        let mut reader = FrameReader::server_side(&wire[..]);
+        let msg = reader.next_message().await.expect("read").expect("message");
+        assert_eq!(msg.opcode, OpCode::Text);
+        assert!(msg.is_empty());
+        assert_eq!(reader.buffered_len(), 0);
+        assert!(reader.next_message().await.expect("clean eof").is_none());
+
+        // An empty *close* payload is legal: it means "no status code".
+        let wire = masked_wire_frame(true, OpCode::Close, b"", [1, 2, 3, 4]);
+        let got = read_bytes(&wire).await.expect("empty close is legal");
+        assert_eq!(got.close_code(), None);
+
+        // An empty continuation is still an orphan and must be refused, not
+        // swallowed as "nothing happened".
+        let wire = masked_wire_frame(true, OpCode::Continuation, b"", [1, 2, 3, 4]);
+        let mut cursor: &[u8] = &wire;
+        let err = FrameReader::server_side(&mut cursor)
+            .next_message()
+            .await
+            .expect_err("orphan empty continuation");
+        assert!(err.to_string().contains("continuation"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mask_bit_without_a_mask_key_is_an_error() {
+        // Masked, claims 5 bytes, but the four "mask key" bytes are missing: the
+        // payload bytes that follow must not be mistaken for the key.
+        let wire = vec![0x81, 0x80 | 5, b'h', b'e', b'l', b'l', b'o'];
+        let mut cursor: &[u8] = &wire;
+        let mut reader = FrameReader::server_side(&mut cursor);
+        let err = reader
+            .next_frame()
+            .await
+            .expect_err("no mask key on the wire");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn mask_key_with_a_truncated_payload_is_an_error() {
+        // Masked, claims 10 bytes, key present, only 3 payload bytes.
+        let mut wire = raw_header(0x1, true, true, 10, b"", true);
+        wire.extend_from_slice(&[0xFF; 3]);
+        let mut cursor: &[u8] = &wire;
+        let mut reader = FrameReader::server_side(&mut cursor);
+        let err = reader.next_frame().await.expect_err("payload cut mid-mask");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(reader.buffered_len() <= wire.len());
+    }
+
+    #[tokio::test]
+    async fn five_thousand_one_byte_continuations_stay_bounded() {
+        // 1 + 5000 + 1 fragments: a peer trying to make the reader hold one
+        // allocation per frame. The message is reassembled into a single buffer
+        // and the frame scratch space is released as we go.
+        let key = [7, 7, 7, 7];
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&masked_wire_frame(false, OpCode::Binary, b"", key));
+        for _ in 0..5000 {
+            wire.extend_from_slice(&masked_wire_frame(false, OpCode::Continuation, b"x", key));
+        }
+        wire.extend_from_slice(&masked_wire_frame(true, OpCode::Continuation, b"y", key));
+        assert!(
+            wire.len() < 40 * 1024,
+            "the hostile stream itself must stay a few KiB ({} bytes)",
+            wire.len()
+        );
+
+        let mut reader = FrameReader::server_side(&wire[..]);
+        let msg = reader
+            .next_message()
+            .await
+            .expect("5001 fragments is legal")
+            .expect("message");
+        assert_eq!(msg.payload.len(), 5001);
+        assert!(msg.fin);
+        assert_eq!(msg.payload[0], b'x');
+        assert_eq!(msg.payload[5000], b'y');
+        // Every frame was consumed: no leftover wire bytes and no retained
+        // reassembly state.
+        assert_eq!(reader.buffered_len(), 0);
+        assert!(
+            reader.fragment.is_none(),
+            "reassembly state was not released"
+        );
+        assert!(reader.next_message().await.expect("clean eof").is_none());
+    }
+
+    #[tokio::test]
+    async fn text_utf8_is_validated_across_fragment_boundaries() {
+        // "€" is E2 82 AC. Split mid-character it is still one valid message…
+        let key = [3, 1, 4, 1];
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&masked_wire_frame(false, OpCode::Text, &[0xE2], key));
+        wire.extend_from_slice(&masked_wire_frame(
+            false,
+            OpCode::Continuation,
+            &[0x82],
+            key,
+        ));
+        wire.extend_from_slice(&masked_wire_frame(true, OpCode::Continuation, &[0xAC], key));
+        let mut cursor: &[u8] = &wire;
+        let msg = FrameReader::server_side(&mut cursor)
+            .next_message()
+            .await
+            .expect("a split character is not an encoding error")
+            .expect("message");
+        assert_eq!(msg.payload, "€".as_bytes());
+
+        // …but a continuation byte that never completes the sequence is.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&masked_wire_frame(false, OpCode::Text, &[0xE2], key));
+        wire.extend_from_slice(&masked_wire_frame(true, OpCode::Continuation, &[0xFF], key));
+        let mut cursor: &[u8] = &wire;
+        let err = FrameReader::server_side(&mut cursor)
+            .next_message()
+            .await
+            .expect_err("invalid UTF-8 across fragments");
+        assert!(err.to_string().contains("UTF-8"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn close_frames_are_strictly_validated() {
+        // A one-byte payload cannot carry a status code (RFC 6455 §5.5.1).
+        let wire = masked_wire_frame(true, OpCode::Close, &[0x03], [0; 4]);
+        let err = read_bytes(&wire).await.expect_err("1-byte close payload");
+        assert!(err.to_string().contains("2-byte"), "{err}");
+
+        // Codes that must never appear on the wire: undefined (0, 999,
+        // 1016–2999, >4999) and reserved (1004, 1005, 1006, 1015).
+        for code in [0u16, 999, 1004, 1005, 1006, 1015, 2999, 5000, u16::MAX] {
+            let wire = masked_wire_frame(true, OpCode::Close, &code.to_be_bytes(), [0; 4]);
+            let err = read_bytes(&wire)
+                .await
+                .expect_err(&format!("close code {code} must be refused"));
+            assert!(
+                err.to_string().contains("close status code"),
+                "code {code}: {err}"
+            );
+        }
+
+        // Every code a peer may legally send still round-trips unchanged.
+        for code in [
+            1000u16, 1001, 1002, 1003, 1007, 1008, 1009, 1011, 3000, 4999,
+        ] {
+            let wire = masked_wire_frame(true, OpCode::Close, &code.to_be_bytes(), [0; 4]);
+            let frame = read_bytes(&wire).await.expect("a legal close code");
+            assert_eq!(frame.close_code(), Some(code));
+        }
+    }
+
+    #[tokio::test]
+    async fn every_reserved_bit_and_unknown_opcode_is_refused() {
+        for bit in [0x40u8, 0x20, 0x10] {
+            let mut wire = masked_wire_frame(true, OpCode::Binary, b"x", [0; 4]);
+            wire[0] |= bit;
+            let err = read_bytes(&wire).await.expect_err("reserved bit");
+            assert!(err.to_string().contains("reserved"), "{bit:#x}: {err}");
+        }
+        // Reserved opcodes are refused even with an otherwise sound header.
+        for opcode in [0x03u8, 0x07, 0x0B, 0x0F] {
+            let mut wire = masked_wire_frame(true, OpCode::Binary, b"", [0; 4]);
+            wire[0] = (wire[0] & 0xF0) | opcode;
+            let err = read_bytes(&wire).await.expect_err("reserved opcode");
+            assert!(err.to_string().contains("opcode"), "{opcode:#x}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn random_garbage_never_panics_and_never_grows_the_buffer() {
+        // Deterministic xorshift: 2000 byte streams of 1..=64 bytes. Framing
+        // errors, EOF and protocol errors are all fine; a panic, a hang or a
+        // whole-stream buffering is not.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for case in 0..2000 {
+            let len = 1 + (xorshift(&mut state) as usize % 64);
+            let bytes: Vec<u8> = (0..len).map(|_| xorshift(&mut state)).collect();
+            let mut reader = FrameReader::server_side(&bytes[..]);
+            let _ = reader.next_message().await;
+            assert!(
+                reader.buffered_len() <= bytes.len(),
+                "case {case}: buffered {} of {} bytes",
+                reader.buffered_len(),
+                bytes.len()
+            );
+        }
     }
 }

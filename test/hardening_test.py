@@ -141,13 +141,15 @@ def check_auth_lockout():
         if 429 not in codes:
             fail(f"auth lockout: never throttled, codes={codes}")
             return
-        # A correct key from the same IP is also refused while the window lasts —
-        # that is the point of a lockout (attacker and victim share a NAT).
+        # A *valid* key must still work while the window lasts. The lockout is a
+        # response to a failed credential, never a pre-filter: behind a reverse
+        # proxy every client shares one address, so a pre-filter would let anyone
+        # lock every legitimate caller out with ten bad keys.
         status, _ = request(port, "/api/providers")
-        if status != 429:
-            fail(f"auth lockout: valid key still allowed during lockout ({status})")
+        if status != 200:
+            fail(f"auth lockout: a valid key was blocked during the window ({status})")
             return
-        ok(f"auth lockout (401 → 429 after 3 failures; codes={codes[:3]}…)")
+        ok(f"auth lockout (401 → 429 after 3 failures; codes={codes[:3]}…; valid key still 200)")
     finally:
         gw.stop()
         os.unlink(cfg.name)
