@@ -41,6 +41,7 @@ client ──HTTP──▶ axum router ──▶ auth ──▶ routing ──�
 | `src/api/client_keys.rs` | Client key CRUD; the runtime struct holds the key's live rate-limit bucket |
 | `src/api/combos.rs` | Combo (fallback chain) CRUD, written into `[[combos]]` |
 | `src/api/provider_keys.rs` | Provider add/update/delete, key add/enable/delete |
+| `src/api/server.rs` | `[server]` + `[tuning]` read/write; reports which fields need a restart |
 | `ui/` | Sycamore (Rust→WASM) dashboard, a pure client of `/api/*` |
 
 ## Request path (chat completions)
