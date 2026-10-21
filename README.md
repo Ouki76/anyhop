@@ -383,12 +383,15 @@ load generator caps out around 8k rps on its own and would hide the real capacit
 
 | Endpoint | Throughput | p50 | p99 |
 | --- | --- | --- | --- |
-| `GET /healthz` | **149,000 req/s** | 0.38 ms | 1.16 ms |
-| `GET /v1/models` (124 models, cached) | **63,000 req/s** | 0.85 ms | 2.23 ms |
-| `GET /metrics` | **88,000 req/s** | 0.70 ms | 1.65 ms |
+| `GET /healthz` | **170,000 req/s** | 0.34 ms | ~1 ms |
+| `GET /v1/models` (124 models, cached) | **120,000 req/s** | 0.47 ms | ~1.5 ms |
+| `GET /metrics` (with histograms) | **62,000 req/s** | 1.00 ms | ~2 ms |
 
 RSS 17 MB with the gateway and the load generator sharing the same 16 cores — the
 client steals roughly half the machine, so these are a floor, not a ceiling.
+`/v1/models` served a cached body per catalogue epoch; before that cache it measured
+38k req/s, and `/metrics` lost ~25k req/s when the latency histograms were added
+(they are rendered per scrape — that is the price of p50/p95/p99 per route).
 `/v1/models` is dominated by serialising 124 model records; with a 9-model config
 it reaches ~150k req/s.
 
