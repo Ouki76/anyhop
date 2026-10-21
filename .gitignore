@@ -21,5 +21,9 @@ __pycache__/
 # OS
 .DS_Store
 
+# Local scratch (screenshots, handwriting experiments) — never part of the app
+/handwriting/
+/shots/
+
 /ui/dist
 /ui/target

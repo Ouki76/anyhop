@@ -1,0 +1,89 @@
+# anyhop behind nginx (TLS termination + SSE-safe proxying).
+#
+# anyhop itself speaks plain HTTP and must never be exposed directly: API keys,
+# client keys and the admin key travel in clear text without TLS.
+
+# Log format WITHOUT the query string.
+# `?key=` is how the dashboard's EventSource and Prometheus scrapers authenticate,
+# so the default combined log would write the admin key into access.log in plain
+# text. Never use $request_uri / $request here.
+log_format anyhop '$remote_addr - $remote_user [$time_local] "$request_method $uri $server_protocol" '
+                  '$status $body_bytes_sent "$http_referer" "$http_user_agent" ${request_time}s';
+
+upstream anyhop {
+    server 127.0.0.1:8080;
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    server_name llm.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name llm.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/llm.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/llm.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    access_log /var/log/nginx/anyhop.access.log anyhop;
+
+    # Must match [server] max_body_bytes (default 32 MiB) — a gateway 413 is
+    # clearer than an nginx 413, so give nginx the larger limit.
+    client_max_body_size 32m;
+
+    location / {
+        proxy_pass http://anyhop;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Long generations and SSE streams: never time out mid-answer, never buffer.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # Server-Sent Events: the gateway sends a ping every 15s, so the read timeout
+    # can stay low, but buffering must be off for the chunks to arrive live.
+    location = /api/events {
+        proxy_pass http://anyhop;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header Authorization $http_authorization;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        # The admin key travels in ?key= here — keep it out of the logs entirely.
+        access_log off;
+    }
+
+    # Prometheus scrapes with a bearer token (or ?key=). Keep it off the log too.
+    location = /metrics {
+        proxy_pass http://anyhop;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        access_log off;
+        # Restrict to the monitoring network.
+        # allow 10.0.0.0/8;
+        # deny all;
+    }
+}
+
+# Prometheus job:
+#
+#   - job_name: anyhop
+#     metrics_path: /metrics
+#     authorization:
+#       credentials_file: /etc/prometheus/anyhop_admin_key
+#     static_configs:
+#       - targets: ["llm.example.com:443"]
+#     scheme: https

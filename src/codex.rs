@@ -1,7 +1,7 @@
 //! Codex provider: ChatGPT OAuth accounts proxied to the Codex backend
 //! (chatgpt.com/backend-api/codex/responses, OpenAI Responses API).
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -17,7 +17,7 @@ pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CALLBACK_PORT: u16 = 1455;
 pub const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 
-const TOKEN_SAFETY_WINDOW: Duration = Duration::from_secs(300);
+// Token refresh window is configurable via `[tuning] token_refresh_window_secs`.
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -43,10 +43,12 @@ pub use crate::antigravity::AuthError;
 struct AccountState {
     access_token: Option<String>,
     expires_at_ms: u64,
+    /// Live refresh token: OpenAI rotates it on every refresh, so the current
+    /// value may differ from the config's. Persisted via OAuthRecord.
+    refresh_token: Option<String>,
 }
 
 pub struct CodexAccount {
-    pub refresh_token: Option<String>,
     identity: String,
     pub email: Option<String>,
     pub account_id: Option<String>,
@@ -54,6 +56,7 @@ pub struct CodexAccount {
     storage: Option<crate::storage::Storage>,
     client: reqwest::Client,
     state: tokio::sync::Mutex<AccountState>,
+    tuning: std::sync::Arc<crate::config::Tuning>,
 }
 
 impl CodexAccount {
@@ -62,6 +65,7 @@ impl CodexAccount {
         provider: &str,
         storage: Option<&crate::storage::Storage>,
         client: reqwest::Client,
+        tuning: std::sync::Arc<crate::config::Tuning>,
     ) -> Self {
         let refresh_token = if cfg.refresh_token.is_empty() {
             None
@@ -73,31 +77,40 @@ impl CodexAccount {
             .or_else(|| cfg.access_token.clone())
             .unwrap_or_default();
 
-        let cached = cfg
-            .access_token
-            .is_none()
-            .then(|| storage.and_then(|s| s.load_oauth(provider, &identity)))
-            .flatten();
+        // Load the cache when we might refresh (a cached rotated refresh token
+        // may live there even if a static access token is configured).
+        let cached = if cfg.access_token.is_none() || refresh_token.is_some() {
+            storage.and_then(|s| s.load_oauth(provider, &identity))
+        } else {
+            None
+        };
+        // A rotated refresh token persisted earlier wins over the stale config one.
+        let refresh_token = cached
+            .as_ref()
+            .and_then(|c| c.refresh_token.clone())
+            .or(refresh_token);
         let access_token = cfg
             .access_token
             .clone()
             .or_else(|| cached.as_ref().map(|c| c.access_token.clone()))
             .filter(|t| !t.is_empty());
-        let expires_at_ms = if cfg.access_token.is_some() {
+        // A pre-seeded token is treated as non-expiring only when there is no
+        // way to refresh — otherwise let it expire and refresh normally.
+        let expires_at_ms = if cfg.access_token.is_some() && refresh_token.is_none() {
             u64::MAX
         } else {
             cached.as_ref().map(|c| c.expires_at_ms).unwrap_or(0)
         };
 
         Self {
-            refresh_token,
             identity,
             email: cfg.email.clone(),
             account_id: cfg.account_id.clone(),
             provider: provider.to_string(),
             storage: storage.cloned(),
             client,
-            state: tokio::sync::Mutex::new(AccountState { access_token, expires_at_ms }),
+            tuning,
+            state: tokio::sync::Mutex::new(AccountState { access_token, expires_at_ms, refresh_token }),
         }
     }
 
@@ -116,7 +129,7 @@ impl CodexAccount {
         &self.client
     }
 
-    fn persist(&self, access_token: &str, expires_at_ms: u64) {
+    fn persist(&self, access_token: &str, expires_at_ms: u64, refresh_token: Option<&str>) {
         if let Some(s) = &self.storage {
             s.save_oauth(
                 &self.provider,
@@ -125,6 +138,7 @@ impl CodexAccount {
                     access_token: access_token.to_string(),
                     expires_at_ms,
                     project_id: None,
+                    refresh_token: refresh_token.map(str::to_string),
                 },
             );
         }
@@ -133,13 +147,14 @@ impl CodexAccount {
     pub async fn ensure_access_token(&self) -> Result<String, AuthError> {
         let mut st = self.state.lock().await;
         if let Some(t) = &st.access_token {
-            let valid_until =
-                st.expires_at_ms.saturating_sub(TOKEN_SAFETY_WINDOW.as_millis() as u64);
+            let valid_until = st
+                .expires_at_ms
+                .saturating_sub(self.tuning.token_refresh_window().as_millis() as u64);
             if now_ms() < valid_until {
                 return Ok(t.clone());
             }
         }
-        let Some(refresh_token) = &self.refresh_token else {
+        let Some(refresh_token) = st.refresh_token.clone() else {
             return Err(AuthError::Permanent(
                 "static access token rejected and no refresh token configured".into(),
             ));
@@ -180,7 +195,14 @@ impl CodexAccount {
         let expires_in = v.get("expires_in").and_then(|e| e.as_u64()).unwrap_or(3600);
         st.expires_at_ms = now_ms() + expires_in * 1000;
         st.access_token = Some(token.clone());
-        self.persist(&token, st.expires_at_ms);
+        // OpenAI rotates refresh tokens: persist the replacement, otherwise the
+        // old token is invalidated server-side and every later refresh fails.
+        if let Some(rt) = v.get("refresh_token").and_then(|t| t.as_str())
+            && rt != refresh_token
+        {
+            st.refresh_token = Some(rt.to_string());
+        }
+        self.persist(&token, st.expires_at_ms, st.refresh_token.as_deref());
         Ok(token)
     }
 }
@@ -387,13 +409,6 @@ impl SseState {
 fn translate_event(v: &Value, st: &mut SseState) -> Option<Value> {
     let ty = v.get("type").and_then(|t| t.as_str())?;
 
-    if !st.sent_role {
-        st.sent_role = true;
-        let first = st.chunk(json!({"role": "assistant"}), Value::Null);
-        // Fall through after emitting role below via caller; handle inline:
-        return Some(first);
-    }
-
     match ty {
         "response.output_text.delta" => {
             let text = v.get("delta").cloned().unwrap_or(json!(""));
@@ -461,6 +476,17 @@ fn translate_event(v: &Value, st: &mut SseState) -> Option<Value> {
             };
             Some(st.chunk(json!({}), json!(finish)))
         }
+        "response.failed" => {
+            // Surface upstream failures instead of a silent empty stream:
+            // OpenAI-style error frame, then DONE at EOF.
+            let msg = v
+                .pointer("/response/error/message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("upstream response failed");
+            Some(json!({
+                "error": {"message": msg, "type": "upstream_error", "code": "response_failed"}
+            }))
+        }
         _ => None,
     }
 }
@@ -475,6 +501,8 @@ pub fn translate_sse_stream(
         inner: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
         parser: crate::sse::SseParser,
         pending: std::collections::VecDeque<Bytes>,
+        /// Translated chunks queued for emission (role chunk + event chunk).
+        out: std::collections::VecDeque<Bytes>,
         eof: bool,
         sent_done: bool,
         stats: Option<std::sync::Arc<crate::pool::KeyState>>,
@@ -485,6 +513,7 @@ pub fn translate_sse_stream(
         inner: Box::pin(resp.bytes_stream()),
         parser: crate::sse::SseParser::new(),
         pending: std::collections::VecDeque::new(),
+        out: std::collections::VecDeque::new(),
         eof: false,
         sent_done: false,
         stats,
@@ -501,20 +530,41 @@ pub fn translate_sse_stream(
 
     futures::stream::unfold(state, move |mut s| async move {
         loop {
+            if let Some(b) = s.out.pop_front() {
+                return Some((Ok(b), s));
+            }
             if let Some(data) = s.pending.pop_front() {
                 let Ok(v) = serde_json::from_slice::<Value>(&data) else {
                     continue;
                 };
                 let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if let Some(chunk) = translate_event(&v, &mut s.st) {
-                    return Some((Ok(crate::sse::frame(&chunk)), s));
+                // Emit the role chunk for the first event WITHOUT consuming the
+                // event itself — its payload is still translated below.
+                if !s.st.sent_role {
+                    s.st.sent_role = true;
+                    let rc = s.st.chunk(json!({"role": "assistant"}), Value::Null);
+                    s.out.push_back(crate::sse::frame(&rc));
                 }
-                if (ty == "response.completed" || ty == "response.incomplete" || ty == "response.failed")
-                    && let Some(k) = &s.stats {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        k.prompt_tokens.fetch_add(s.st.prompt_tokens, Relaxed);
-                        k.completion_tokens.fetch_add(s.st.completion_tokens, Relaxed);
-                    }
+                // Usage stats for terminal events: translate_event also stashes
+                // them into the final chunk, but stats must be recorded even
+                // though that arm returns a chunk (the old code skipped it).
+                if matches!(ty, "response.completed" | "response.incomplete")
+                    && let Some(u) = v.pointer("/response/usage")
+                    && let Some(k) = &s.stats
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    k.prompt_tokens.fetch_add(
+                        u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                        Relaxed,
+                    );
+                    k.completion_tokens.fetch_add(
+                        u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                        Relaxed,
+                    );
+                }
+                if let Some(chunk) = translate_event(&v, &mut s.st) {
+                    s.out.push_back(crate::sse::frame(&chunk));
+                }
                 if ty == "response.failed" {
                     warn!("codex upstream: response.failed");
                 }
@@ -637,20 +687,11 @@ pub async fn collect_non_stream(resp: reqwest::Response, model: &str) -> Result<
 
 // ---------- OAuth authorization-code flow with PKCE (`anyhop auth codex`) ----------
 
-fn random_verifier() -> String {
-    let raw = std::fs::read("/dev/urandom")
-        .ok()
-        .filter(|b| b.len() >= 48)
-        .map(|b| b[..48].to_vec())
-        .unwrap_or_else(|| {
-            // Fallback: hash of time+pid (PKCE entropy is best-effort here)
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            sha2::Sha256::digest(format!("{nanos:x}{}", std::process::id()).as_bytes()).to_vec()
-        });
-    URL_SAFE_NO_PAD.encode(raw)
+fn random_verifier() -> anyhow::Result<String> {
+    // PKCE needs a CSPRNG; a time+pid fallback would be predictable.
+    let mut raw = [0u8; 48];
+    getrandom::fill(&mut raw).map_err(|e| anyhow::anyhow!("CSPRNG unavailable: {e}"))?;
+    Ok(URL_SAFE_NO_PAD.encode(raw))
 }
 
 use sha2::Digest;
@@ -673,13 +714,20 @@ pub struct AuthOutcome {
 
 /// Start the Codex OAuth flow (non-blocking): returns the URL to open.
 pub async fn start_auth(proxy: Option<&str>) -> anyhow::Result<PendingAuth> {
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+    start_auth_with(proxy, &crate::config::Tuning::default()).await
+}
+
+pub async fn start_auth_with(
+    proxy: Option<&str>,
+    tuning: &crate::config::Tuning,
+) -> anyhow::Result<PendingAuth> {
+    let mut builder = reqwest::Client::builder().timeout(tuning.oauth_http_timeout());
     if let Some(p) = proxy {
         builder = builder.proxy(reqwest::Proxy::all(p)?);
     }
     let http = builder.build()?;
 
-    let verifier = random_verifier();
+    let verifier = random_verifier()?;
     let challenge = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
     let state = format!("{:x}", now_ms());
     let url = format!(
@@ -748,7 +796,8 @@ pub async fn complete_auth(p: PendingAuth) -> anyhow::Result<AuthOutcome> {
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
-        anyhow::bail!("token exchange failed ({status}): {}", &body[..body.len().min(300)]);
+        let snippet: String = body.chars().take(300).collect();
+        anyhow::bail!("token exchange failed ({status}): {snippet}");
     }
     let v: Value = serde_json::from_str(&body)?;
     let refresh_token = v
@@ -765,14 +814,14 @@ pub async fn complete_auth(p: PendingAuth) -> anyhow::Result<AuthOutcome> {
 pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
     let pending = start_auth(proxy.as_deref()).await?;
     if let Some(p) = &proxy {
-        println!("Использую прокси: {p}");
+        println!("Using proxy: {p}");
     }
-    println!("\nОткройте эту ссылку и войдите в ChatGPT-аккаунт:\n\n{}\n", pending.url);
+    println!("\nOpen this link and sign in to your ChatGPT account:\n\n{}\n", pending.url);
     let _ = std::process::Command::new("xdg-open").arg(&pending.url).spawn();
-    println!("Ожидаю callback на localhost:{CALLBACK_PORT} ...");
+    println!("Waiting for the callback on localhost:{CALLBACK_PORT} ...");
     let out = complete_auth(pending).await?;
 
-    println!("\nГотово! Добавьте в anyhop.toml:\n");
+    println!("\nDone! Add this to anyhop.toml:\n");
     println!("[[providers]]");
     println!("name = \"codex\"");
     println!("type = \"codex\"");

@@ -2,17 +2,19 @@
 listen = "127.0.0.1:8080"
 max_retries = 4
 attempt_timeout_secs = 120
-# Глобальный прокси для всех апстримов (переопределяется per-provider/per-account):
+# Global proxy for all upstreams (overridden per provider/per account):
 # proxy = "socks5://user:pass@127.0.0.1:1080"
-# Входящая авторизация: клиенты обязаны слать Authorization: Bearer <api_key>
+# Inbound auth: clients must send Authorization: Bearer <api_key>
 # api_key = "sk-anyhop-change-me"
-# Отдельный ключ для /api/* и дашборда (по умолчанию = api_key):
+# Separate key for /api/* and the dashboard (defaults to api_key):
 # admin_key = "admin-secret"
-# Макс. размер тела запроса (байт):
+# Max request body size (bytes):
 # max_body_bytes = 33554432
-# Глубина историй (0 = минимум в памяти, без персистентности):
+# History depth (0 = in-memory minimum, no persistence):
 # events_history = 100
 # requests_history = 200
+# Periodic model-list polling of all providers (seconds, 0 = disabled):
+# models_refresh_secs = 300
 
 # OpenAI-compatible provider (OpenRouter, DeepSeek, Groq, CatRouter, ...)
 [[providers]]
@@ -22,8 +24,8 @@ base_url = "https://openrouter.ai/v1"
 strategy = "round_robin" # round_robin | least_used | fill_first
 keys = ["sk-or-xxx", "sk-or-yyy"]
 models = ["openai/gpt-4o-mini", "deepseek/deepseek-chat"]
-# max_concurrent = 5      # лимит одновременных запросов на ключ (0 = без лимита)
-# drain_below_pct = 10    # проактивный кулдаун ключа, когда осталось <10% лимита
+# max_concurrent = 5      # max concurrent requests per key (0 = unlimited)
+# drain_below_pct = 10    # proactively cool a key down when <10% of the limit remains
 # [providers.headers]
 # HTTP-Referer = "https://your-site.example"
 
@@ -32,25 +34,65 @@ models = ["openai/gpt-4o-mini", "deepseek/deepseek-chat"]
 # name = "gemini"
 # type = "gemini"
 # base_url = "https://generativelanguage.googleapis.com/v1beta"
-# strategy = "fill_first" # дожимаем дневную квоту ключа, потом следующий
+# strategy = "fill_first" # exhaust the key's daily quota, then the next one
 # keys = ["AIza...", "AIza..."]
 # models = ["gemini-2.5-flash"]
-# proxy = "socks5://127.0.0.1:1080"  # опционально: прокси для всего провайдера
+# proxy = "socks5://127.0.0.1:1080"  # optional: proxy for the whole provider
 
-# Antigravity (Google OAuth-аккаунты). Добавить: anyhop auth antigravity [--proxy ...]
+# Antigravity (Google OAuth accounts). Add one: anyhop auth antigravity [--proxy ...]
 # [[providers]]
 # name = "antigravity"
 # type = "antigravity"
 # strategy = "fill_first"
-# proxy = "socks5://127.0.0.1:1080"  # дефолтный прокси для всех аккаунтов
+# proxy = "socks5://127.0.0.1:1080"  # default proxy for all accounts
 #
 # [[providers.accounts]]
 # email = "user@gmail.com"
 # refresh_token = "1//..."
-# project_id = "..."           # опционально, резолвится автоматически
-# proxy = "http://1.2.3.4:3128"  # опционально: свой прокси для этого аккаунта
+# project_id = "..."           # optional, resolved automatically
+# proxy = "http://1.2.3.4:3128"  # optional: dedicated proxy for this account
 
-# Combos — виртуальные модели с fallback-цепочкой между провайдерами:
+# Combos — virtual models with a fallback chain across providers:
 # [[combos]]
 # name = "flash"
 # chain = ["antigravity/gemini-3-flash", "gemini/gemini-2.5-flash", "openrouter/deepseek-chat"]
+
+# Models removed from /v1/models and rejected on calls
+# (both "provider/model" and the bare model name are accepted):
+# disabled_models = ["openrouter/deepseek-chat", "flash"]
+
+# Client API keys with per-model access control (models = [] means all models):
+# [[client_keys]]
+# name = "Cursor IDE"
+# key = "sk-hop-cursor-12345"
+# models = ["openrouter/openai/gpt-4o-mini"]
+#
+# [[client_keys]]
+# name = "OpenWebUI (all models)"
+# key = "sk-hop-webui-67890"
+# models = []
+# rpm = 120                # sustained requests per minute for this key (omit = unlimited)
+# burst = 20               # optional spike allowance (default: same as rpm)
+
+# ---------------------------------------------------------------------------
+# Tuning: every timing/limit that used to be a hardcoded constant.
+# All fields are optional; the values below are the defaults.
+# ---------------------------------------------------------------------------
+[tuning]
+max_cooldown_secs = 3600          # hard cap on a benched key
+base_backoff_secs = 5             # 5xx/network backoff base (doubles per failure)
+rate_limit_cooldown_secs = 60     # 429 without Retry-After
+drain_fallback_secs = 60          # unparseable reset window
+models_cache_ttl_secs = 600       # fetched model list freshness
+connect_timeout_secs = 10         # upstream connect timeout
+meta_timeout_secs = 10            # model listing / quota probes
+sticky_ttl_secs = 1800            # conversation → key stickiness
+sticky_max_entries = 10000        # sticky map size before eviction
+session_prefix_bytes = 4096       # body bytes hashed into the session id
+event_channel_capacity = 256      # SSE broadcast buffer
+persist_interval_secs = 30        # events/request history flush
+oauth_http_timeout_secs = 30      # OAuth token refresh calls
+token_refresh_window_secs = 300   # refresh this early (0 = on expiry)
+ui_refresh_secs = 3               # dashboard live-view poll
+sse_keepalive_secs = 15           # SSE ping interval
+quota_cache_ttl_secs = 60         # per-account quota snapshot reuse

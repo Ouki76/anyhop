@@ -1,0 +1,59 @@
+[Unit]
+Description=anyhop — OpenAI-compatible LLM gateway with key rotation
+Documentation=file:///usr/share/doc/anyhop/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=anyhop
+Group=anyhop
+ExecStart=/usr/local/bin/anyhop
+Environment=ANYHOP_CONFIG=/etc/anyhop/anyhop.toml
+Environment=RUST_LOG=info
+# State (redb) is relative to the working directory.
+WorkingDirectory=/var/lib/anyhop
+Restart=on-failure
+RestartSec=2s
+
+# Config reload without a restart: systemctl reload anyhop
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Many concurrent upstream connections (one per in-flight request + keep-alive).
+LimitNOFILE=65536
+
+# ----- sandboxing -----
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Only the state directory is writable (config stays read-only).
+ReadWritePaths=/var/lib/anyhop
+# Secrets stay 0600 even if the process creates new files.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+
+# Setup:
+#   useradd --system --home-dir /var/lib/anyhop --shell /usr/sbin/nologin anyhop
+#   install -d -o anyhop -g anyhop -m 750 /var/lib/anyhop
+#   install -d -m 750 /etc/anyhop
+#   install -o root -g anyhop -m 640 anyhop.toml /etc/anyhop/anyhop.toml
+#   install -m 755 target/release/anyhop /usr/local/bin/anyhop
+#   install -m 644 packaging/anyhop.service /etc/systemd/system/anyhop.service
+#   systemctl daemon-reload && systemctl enable --now anyhop

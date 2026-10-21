@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Fast gate: it must compile and the unit tests must pass before anything else runs.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked --all-targets
+      - name: Unit tests
+        run: cargo test --locked
+      # Benches are code too: keep them compiling so the numbers in the README stay real.
+      - name: Build benchmarks
+        run: cargo build --locked --benches
+      # The no-dashboard build must keep compiling: it is the "minimal image" path
+      # and is easy to break by referencing a dashboard-only symbol.
+      - name: Build without the dashboard feature
+        run: cargo build --locked --no-default-features
+
+  # End-to-end: real HTTP against mock providers, including access control and the UI.
+  integration:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --locked
+      # run_all.sh skips the CDP/browser part when chromium is absent; the API
+      # assertions still run, which is what this job is for.
+      - name: Integration suite
+        run: ./test/run_all.sh ./target/release/anyhop
+
+  # The dashboard is a Rust→WASM app and is not covered by `cargo build` at the root.
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ui
+      - uses: taiki-e/install-action@trunk
+      - name: Build dashboard (WASM)
+        run: cd ui && trunk build --release
+      # The CSP allows the inline scripts by hash; a build that changes them must
+      # still produce a working app. Fail the job if the bundle is missing.
+      - name: Check bundle
+        run: test -s ui/dist/index.html && test -n "$(ls ui/dist/*_bg.wasm)"
+
+  # Advisory: these are not gated locally, so they run without blocking the merge
+  # until the existing warnings are cleaned up.
+  lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked -- -D warnings
+      - run: cargo fmt --check

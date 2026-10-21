@@ -41,7 +41,7 @@ class H(BaseHTTPRequestHandler):
         want_tool = "call tool" in last_text
         content = []
         if want_tool:
-            content.append({"type": "thinking", "thinking": "надо вызвать погоду"})
+            content.append({"type": "thinking", "thinking": "need to call the weather tool"})
             content.append({"type": "tool_use", "id": "toolu_01", "name": "get_weather",
                             "input": {"city": "Moscow"}})
         else:
@@ -59,7 +59,7 @@ class H(BaseHTTPRequestHandler):
                 ev("content_block_start", {"type": "content_block_start", "index": 0,
                    "content_block": {"type": "thinking", "thinking": ""}})
                 ev("content_block_delta", {"type": "content_block_delta", "index": 0,
-                   "delta": {"type": "thinking_delta", "thinking": "надо вызвать"}})
+                   "delta": {"type": "thinking_delta", "thinking": "need to call a tool"}})
                 ev("content_block_stop", {"type": "content_block_stop", "index": 0})
                 ev("content_block_start", {"type": "content_block_start", "index": 1,
                    "content_block": {"type": "tool_use", "id": "toolu_01", "name": "get_weather"}})

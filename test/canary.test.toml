@@ -1,0 +1,29 @@
+# Config for exercising test/canary.py against the mock providers (no real keys).
+[server]
+listen = "127.0.0.1:19999"
+state_file = ""
+api_key = "canary-key"
+max_retries = 2
+attempt_timeout_secs = 10
+
+[[providers]]
+name = "mock"
+type = "openai_compat"
+base_url = "http://127.0.0.1:9100/v1"
+keys = ["good-key-1"]
+models = ["test-model"]
+
+[[providers]]
+name = "gemini"
+type = "gemini"
+base_url = "http://127.0.0.1:9101/v1beta"
+keys = ["gkey-good"]
+models = ["test-gemini"]
+
+# A kind without an embeddings API: the canary must report chat/stream only.
+[[providers]]
+name = "claude"
+type = "anthropic"
+base_url = "http://127.0.0.1:9103"
+keys = ["cl-good"]
+models = ["claude-test"]

@@ -39,7 +39,7 @@ fn content_blocks(content: Option<&Value>) -> Result<Vec<Value>, String> {
                     Some("text") => {
                         let mut b =
                             json!({"type": "text", "text": p.get("text").cloned().unwrap_or(json!(""))});
-                        // Prompt caching: прокидываем cache_control breakpoints как есть.
+                        // Prompt caching: forward cache_control breakpoints as-is.
                         if let Some(cc) = p.get("cache_control") {
                             b["cache_control"] = cc.clone();
                         }
@@ -74,6 +74,35 @@ fn content_blocks(content: Option<&Value>) -> Result<Vec<Value>, String> {
     }
 }
 
+/// OpenAI content may be a plain string or an array of text parts.
+/// (Same helper as gemini.rs — array-form system/assistant/tool messages used
+/// to be silently dropped or JSON-dumped into the text.)
+fn content_text(content: Option<&Value>) -> Option<String> {
+    match content {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Array(parts)) => {
+            let t: String = parts
+                .iter()
+                .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect();
+            if t.is_empty() { None } else { Some(t) }
+        }
+        _ => None,
+    }
+}
+
+/// Anthropic requires max_tokens. Default must fit every model's output cap:
+/// claude-3-haiku caps at 4096, 3.5/3.7 at 8192, 4.x allows far more — but a
+/// default that exceeds the cap is a hard 400, so stay conservative.
+fn default_max_tokens(model: &str) -> u64 {
+    if model.contains("claude-3-haiku") || model.contains("haiku-3") {
+        4096
+    } else {
+        8192
+    }
+}
+
 pub fn translate_request(body: &Value) -> Result<Value, String> {
     let messages = body
         .get("messages")
@@ -87,8 +116,8 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         match role {
             "system" | "developer" => {
-                if let Some(c) = msg.get("content").and_then(|c| c.as_str()) {
-                    system_texts.push(c.to_string());
+                if let Some(c) = content_text(msg.get("content")) {
+                    system_texts.push(c);
                 }
             }
             "user" => out_msgs.push(json!({
@@ -97,7 +126,7 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
             })),
             "assistant" => {
                 let mut blocks = Vec::new();
-                if let Some(t) = msg.get("content").and_then(|c| c.as_str())
+                if let Some(t) = content_text(msg.get("content"))
                     && !t.is_empty()
                 {
                     blocks.push(json!({"type": "text", "text": t}));
@@ -123,11 +152,7 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
                 out_msgs.push(json!({"role": "assistant", "content": blocks}));
             }
             "tool" => {
-                let result = match msg.get("content") {
-                    Some(Value::String(s)) => s.clone(),
-                    Some(v) => v.to_string(),
-                    None => String::new(),
-                };
+                let result = content_text(msg.get("content")).unwrap_or_default();
                 out_msgs.push(json!({
                     "role": "user",
                     "content": [{
@@ -159,14 +184,16 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
         merged.push(m);
     }
 
+    let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
     let mut req = json!({
         "model": body.get("model").cloned().unwrap_or(json!("")),
-        // Anthropic requires max_tokens.
+        // Anthropic requires max_tokens; the default must fit the model's
+        // output cap (32000 is rejected outright by claude-3.5/3.7/haiku-3).
         "max_tokens": body
             .get("max_completion_tokens")
             .or_else(|| body.get("max_tokens"))
             .cloned()
-            .unwrap_or(json!(32000)),
+            .unwrap_or_else(|| json!(default_max_tokens(model_name))),
         "messages": merged,
     });
     if !system_texts.is_empty() {
@@ -202,6 +229,17 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
         .or_else(|| body.pointer("/thinking/budget_tokens").and_then(|b| b.as_i64()));
     match budget {
         Some(b) if b > 0 => {
+            // Anthropic 400s when max_tokens <= budget_tokens — grow max_tokens
+            // to fit the budget (clients rarely set both).
+            let cur = req["max_tokens"].as_i64().unwrap_or(0);
+            if cur <= b {
+                req["max_tokens"] = json!(b + 1);
+            }
+            // ...and rejects temperature/top_p combined with thinking — drop them.
+            if let Some(o) = req.as_object_mut() {
+                o.remove("temperature");
+                o.remove("top_p");
+            }
             req["thinking"] = json!({"type": "enabled", "budget_tokens": b});
         }
         Some(_) => {
@@ -255,6 +293,8 @@ fn map_stop(r: Option<&str>) -> &'static str {
     match r {
         Some("max_tokens") => "length",
         Some("tool_use") => "tool_calls",
+        // Safety refusal — let safety-aware clients distinguish it from a normal stop.
+        Some("refusal") => "content_filter",
         _ => "stop",
     }
 }
@@ -345,21 +385,29 @@ struct StreamState {
 
 impl StreamState {
     fn chunk(&self, delta: Value, finish: Value) -> Value {
-        let mut ch = json!({
+        json!({
             "id": self.id,
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-        });
-        if self.prompt_tokens > 0 || self.completion_tokens > 0 {
-            ch["usage"] = json!({
+        })
+    }
+
+    /// OpenAI streams emit usage exactly once: a final chunk with empty choices.
+    fn usage_chunk(&self) -> Value {
+        json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [],
+            "usage": {
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
                 "total_tokens": self.prompt_tokens + self.completion_tokens,
-            });
-        }
-        ch
+            },
+        })
     }
 }
 
@@ -456,6 +504,8 @@ pub fn translate_sse_stream(
         inner: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
         parser: crate::sse::SseParser,
         pending: std::collections::VecDeque<Bytes>,
+        /// Translated frames queued for emission (chunk, usage chunk, DONE).
+        out: std::collections::VecDeque<Bytes>,
         eof: bool,
         sent_done: bool,
         stats: Option<std::sync::Arc<crate::pool::KeyState>>,
@@ -466,6 +516,7 @@ pub fn translate_sse_stream(
         inner: Box::pin(resp.bytes_stream()),
         parser: crate::sse::SseParser::new(),
         pending: std::collections::VecDeque::new(),
+        out: std::collections::VecDeque::new(),
         eof: false,
         sent_done: false,
         stats,
@@ -482,23 +533,28 @@ pub fn translate_sse_stream(
 
     futures::stream::unfold(state, move |mut s| async move {
         loop {
+            if let Some(b) = s.out.pop_front() {
+                return Some((Ok(b), s));
+            }
             if let Some(data) = s.pending.pop_front() {
                 let Ok(v) = serde_json::from_slice::<Value>(&data) else {
                     continue;
                 };
                 let is_stop = v.get("type").and_then(|t| t.as_str()) == Some("message_stop");
                 if let Some(chunk) = translate_event(&v, &mut s.st) {
-                    return Some((Ok(crate::sse::frame(&chunk)), s));
+                    s.out.push_back(crate::sse::frame(&chunk));
                 }
                 if is_stop {
                     if let Some(k) = &s.stats {
                         add_usage(k, s.st.prompt_tokens, s.st.completion_tokens);
                     }
-                    if s.sent_done {
-                        continue;
+                    if s.st.prompt_tokens > 0 || s.st.completion_tokens > 0 {
+                        s.out.push_back(crate::sse::frame(&s.st.usage_chunk()));
                     }
-                    s.sent_done = true;
-                    return Some((Ok(Bytes::from_static(crate::sse::DONE_FRAME)), s));
+                    if !s.sent_done {
+                        s.sent_done = true;
+                        s.out.push_back(Bytes::from_static(crate::sse::DONE_FRAME));
+                    }
                 }
                 continue;
             }

@@ -276,6 +276,12 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
         }
     }
     if let Some(tc) = body.get("tool_choice") {
+        // Forced choice {"type":"function","function":{"name":X}} must pin
+        // allowedFunctionNames=[X] — bare ANY would let the model call others.
+        let forced = tc
+            .pointer("/function/name")
+            .and_then(|n| n.as_str())
+            .filter(|_| tc.is_object());
         let mode = match tc {
             Value::String(s) => match s.as_str() {
                 "none" => Some("NONE"),
@@ -283,11 +289,15 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
                 "auto" => Some("AUTO"),
                 _ => None,
             },
-            Value::Object(_) => Some("ANY"), // forced specific function
+            Value::Object(_) => Some("ANY"),
             _ => None,
         };
         if let Some(m) = mode {
-            req["toolConfig"] = json!({"functionCallingConfig": {"mode": m}});
+            let mut cfg = json!({"mode": m});
+            if let Some(n) = forced {
+                cfg["allowedFunctionNames"] = json!([n]);
+            }
+            req["toolConfig"] = json!({"functionCallingConfig": cfg});
         }
     }
 
@@ -340,11 +350,13 @@ fn extract_parts(candidate: Option<&Value>) -> (String, String, Vec<Value>) {
                 }
             }
             if let Some(fc) = part.get("functionCall") {
+                // Gemini usually omits ids; a time-only fallback gives every
+                // parallel call in this response the SAME id — include the index.
                 let id = fc
                     .get("id")
                     .and_then(|i| i.as_str())
                     .map(str::to_string)
-                    .unwrap_or_else(|| format!("call_{:x}", now_secs()));
+                    .unwrap_or_else(|| format!("call_{:x}_{}", now_secs(), tool_calls.len()));
                 let mut function = json!({
                     "name": fc.get("name").cloned().unwrap_or(json!("")),
                     "arguments": fc.get("args").cloned().unwrap_or(json!({})).to_string(),
@@ -373,11 +385,16 @@ fn extract_parts(candidate: Option<&Value>) -> (String, String, Vec<Value>) {
 pub fn translate_response(model: &str, v: &Value) -> Value {
     let candidate = v.pointer("/candidates/0");
     let (content, reasoning, tool_calls) = extract_parts(candidate);
-    let finish = candidate
+    let mut finish = candidate
         .and_then(|c| c.get("finishReason"))
         .and_then(|r| r.as_str())
         .map(map_finish)
         .unwrap_or("stop");
+    // Gemini says STOP even when the candidate carries function calls;
+    // OpenAI clients dispatch on finish_reason == "tool_calls".
+    if finish == "stop" && !tool_calls.is_empty() {
+        finish = "tool_calls";
+    }
 
     let mut msg = json!({"role": "assistant"});
     if tool_calls.is_empty() {
@@ -430,7 +447,11 @@ fn translate_chunk(v: &Value, st: &mut SseState) -> Value {
     let finish = candidate
         .and_then(|c| c.get("finishReason"))
         .and_then(|r| r.as_str())
-        .map(|r| json!(map_finish(r)))
+        .map(|r| {
+            let f = map_finish(r);
+            // Gemini says STOP even with function calls in the candidate.
+            if f == "stop" && !tool_calls.is_empty() { json!("tool_calls") } else { json!(f) }
+        })
         .unwrap_or(Value::Null);
 
     let mut chunk = json!({

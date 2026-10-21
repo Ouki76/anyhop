@@ -3,6 +3,12 @@ fn main() {
     // so the crate builds before the first `trunk build`.
     let dist = std::path::Path::new("ui/dist");
     if !dist.join("index.html").exists() {
+        // Say it out loud: a silent placeholder means `/dashboard` serves
+        // "ui not built" in production and nobody notices until a user asks.
+        println!(
+            "cargo:warning=ui/dist is missing — the dashboard will serve a placeholder. \
+             Run `cd ui && trunk build --release` (or use --no-default-features)."
+        );
         std::fs::create_dir_all(dist).unwrap();
         std::fs::write(
             dist.join("index.html"),

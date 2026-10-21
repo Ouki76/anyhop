@@ -1,0 +1,14 @@
+# Build context hygiene: keep the image build fast and reproducible.
+.git
+.github
+target
+ui/target
+ui/dist
+handwriting
+shots
+*.redb
+*.log
+anyhop.toml
+
+# Tests are not needed inside the image (they run in CI).
+test

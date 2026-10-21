@@ -15,6 +15,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# Surgical config edits that preserve comments/formatting (toml::Value round-trip
+# would reformat the whole file).
+toml_edit = "0.22"
 bytes = "1"
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -22,6 +25,7 @@ anyhow = "1"
 redb = "2"
 sha2 = "0.10"
 hex = "0.4"
+getrandom = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 arc-swap = "1.9.2"
@@ -36,12 +40,18 @@ mimalloc = { version = "0.1", optional = true }
 default = ["dashboard"]
 alloc-mimalloc = ["dep:mimalloc"]
 dashboard = ["dep:rust-embed", "dep:mime_guess"]
-rust-embed = ["dep:rust-embed"]
-mime_guess = ["dep:mime_guess"]
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
 strip = true
 opt-level = 3
-# unwind: паника хендлера рвёт только его соединение, не процесс
+# unwind: a panicking handler only kills its own connection, not the process
+
+[[bench]]
+name = "hot_paths"
+harness = false
+
+[[bench]]
+name = "load"
+harness = false

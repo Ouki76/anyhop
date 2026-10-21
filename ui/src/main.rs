@@ -1,176 +1,25 @@
+mod tabs;
+mod types;
+mod util;
+
 use gloo_net::eventsource::futures::EventSource;
-use gloo_net::http::Request;
-use serde::Deserialize;
 use sycamore::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use futures::StreamExt;
-use wasm_bindgen::JsCast;
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-struct KeyDto {
-    id: String,
-    masked: String,
-    status: String,
-    cooldown_remaining_secs: u64,
-    in_flight: u32,
-    requests: u64,
-    failures: u64,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-struct ProviderDto {
-    name: String,
-    kind: String,
-    strategy: String,
-    base_url: String,
-    keys: Vec<KeyDto>,
-    #[serde(default)]
-    models: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-struct QuotaModelDto {
-    id: String,
-    pct: Option<u64>,
-    low: bool,
-    reset: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-struct QuotaDto {
-    provider: String,
-    account: String,
-    models: Vec<QuotaModelDto>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-struct EventDto {
-    ts: u64,
-    provider: String,
-    key: String,
-    kind: String,
-    detail: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Overview,
-    Providers,
-    Quotas,
-    Events,
-    Requests,
-    Config,
-}
-
-const TABS: &[(Tab, &str)] = &[
-    (Tab::Overview, "Overview"),
-    (Tab::Providers, "Providers"),
-    (Tab::Quotas, "Quotas"),
-    (Tab::Events, "Events"),
-    (Tab::Requests, "Requests"),
-    (Tab::Config, "Config"),
-];
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-struct RequestDto {
-    ts: u64,
-    provider: String,
-    model: String,
-    key: String,
-    status: String,
-    latency_ms: u64,
-    stream: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-struct AuthStateDto {
-    kind: String,
-    status: String,
-    url: String,
-    message: String,
-}
-
-fn fmt_time(ts: u64) -> String {
-    let s = ts % 86400;
-    format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
-}
-
-fn fmt_num(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-fn stored_key() -> Option<String> {
-    web_sys::window()?
-        .local_storage()
-        .ok()??
-        .get_item("anyhop_admin_key")
-        .ok()??
-        .into()
-}
-
-/// 401 от API → нужен admin key.
-static NEED_AUTH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-async fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str) -> Option<T> {
-    let mut req = Request::get(url);
-    if let Some(k) = stored_key() {
-        req = req.header("Authorization", &format!("Bearer {k}"));
-    }
-    let resp = req.send().await.ok()?;
-    if resp.status() == 401 {
-        NEED_AUTH.store(true, std::sync::atomic::Ordering::Relaxed);
-        return None;
-    }
-    resp.json::<T>().await.ok()
-}
-
-async fn post_json<B: serde::Serialize>(url: &str, body: &B) {
-    if let Ok(req) = Request::post(url).json(body) {
-        if let Some(k) = stored_key() {
-            req.headers().set("Authorization", &format!("Bearer {k}"));
-        }
-        let _ = req.send().await;
-    }
-}
-
-thread_local! {
-    /// Состояние свёрнутых секций переживает пересоздание компонентов при поллинге.
-    static COLLAPSE_STATE: std::cell::RefCell<std::collections::HashMap<String, bool>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-fn collapse_get(key: &str) -> bool {
-    COLLAPSE_STATE.with(|c| c.borrow().get(key).copied().unwrap_or(false))
-}
-
-fn collapse_set(key: &str, v: bool) {
-    COLLAPSE_STATE.with(|c| {
-        c.borrow_mut().insert(key.to_string(), v);
-    });
-}
+use tabs::*;
+use types::*;
+use util::*;
 
 fn main() {
     console_error_panic_hook::set_once();
     sycamore::render(App);
 }
 
-/// Записи в сигналы из внешних источников (SSE, таймеры, hashchange) нельзя
-/// делать синхронно: прилетевшее событие может попасть внутрь чужого эффекта,
-/// и sycamore упадёт с BorrowMutError. Откладываем в микротаску.
-fn defer(f: impl FnOnce() + 'static) {
-    // Именно макротаска: spawn_local поллит фьючу синхронно до первого await,
-    // что ничего не откладывает и ловит BorrowMutError.
-    gloo_timers::callback::Timeout::new(0, f).forget();
-}
-
+/// Writing to signals from external sources (SSE, timers, hashchange) must not
+/// happen synchronously: an incoming event may land inside someone else's effect
+/// and sycamore panics with BorrowMutError. Defer to a macrotask.
 fn tab_from_hash() -> Tab {
     let hash = web_sys::window()
         .and_then(|w| w.location().hash().ok())
@@ -180,9 +29,12 @@ fn tab_from_hash() -> Tab {
         Tab::Providers
     } else {
         match h {
+            "models" => Tab::Models,
+            "keys" | "api-keys" => Tab::ApiKeys,
             "quotas" => Tab::Quotas,
             "events" => Tab::Events,
             "requests" => Tab::Requests,
+            "settings" => Tab::Settings,
             "config" => Tab::Config,
             _ => Tab::Overview,
         }
@@ -200,24 +52,6 @@ fn provider_from_hash() -> Option<String> {
         .map(str::to_string)
 }
 
-fn current_theme() -> String {
-    web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.document_element())
-        .and_then(|e| e.get_attribute("data-theme"))
-        .unwrap_or_else(|| "light".into())
-}
-
-fn set_theme(t: &str) {
-    if let Some(w) = web_sys::window() {
-        if let Some(e) = w.document().and_then(|d| d.document_element()) {
-            let _ = e.set_attribute("data-theme", t);
-        }
-        if let Ok(Some(s)) = w.local_storage() {
-            let _ = s.set_item("theme", t);
-        }
-    }
-}
 
 #[component]
 fn AuthBanner() -> View {
@@ -229,14 +63,13 @@ fn AuthBanner() -> View {
                 style="max-width: 280px; margin: 0 10px;")
             button(class="btn btn-primary", on:click=move |_| {
                 let k = key.get_clone();
-                if !k.is_empty() {
-                    if let Some(w) = web_sys::window() {
+                if !k.is_empty()
+                    && let Some(w) = web_sys::window() {
                         if let Ok(Some(s)) = w.local_storage() {
                             let _ = s.set_item("anyhop_admin_key", &k);
                         }
                         let _ = w.location().reload();
                     }
-                }
             }) { "Save" }
         }
     }
@@ -260,23 +93,68 @@ fn ThemeToggle() -> View {
 #[component]
 fn App() -> View {
     let tab = create_signal(tab_from_hash());
+    // Mobile menu: the sidebar collapses into a toggle below 720px.
+    let nav_open = create_signal(false);
     let need_auth = create_signal(stored_key().is_none()
         && NEED_AUTH.load(std::sync::atomic::Ordering::Relaxed));
-    // Выбранный провайдер (detail-страница) — в root scope, чтобы переживал
-    // перемонтирование вкладок; hashchange-листенер один на всё приложение.
+    // Selected provider (detail page) lives in the root scope so it survives
+    // tab remounts; a single hashchange listener for the whole app.
     let selected_provider = create_signal(provider_from_hash());
+    let providers = create_signal(Vec::<ProviderDto>::new());
+    let quotas = create_signal(Vec::<QuotaDto>::new());
+    let events = create_signal(Vec::<EventDto>::new());
+    let client_keys = create_signal(Vec::<ClientKeyDto>::new());
+    let models = create_signal(Vec::<ModelItemDto>::new());
+    let loaded = create_signal(false);
+
+    // Single hashchange listener for the whole app: back/forward navigation
+    // switches both the tab and the provider detail page.
     if let Some(w) = web_sys::window() {
         let cb = wasm_bindgen::closure::Closure::wrap(Box::new(move || {
-            let sp = selected_provider;
-            defer(move || sp.set(provider_from_hash()));
+            defer(move || {
+                let t = tab_from_hash();
+                if tab.get() != t {
+                    tab.set(t);
+                }
+                selected_provider.set(provider_from_hash());
+            });
         }) as Box<dyn Fn()>);
         let _ = w.add_event_listener_with_callback("hashchange", cb.as_ref().unchecked_ref());
         cb.forget();
     }
-    let providers = create_signal(Vec::<ProviderDto>::new());
-    let quotas = create_signal(Vec::<QuotaDto>::new());
-    let events = create_signal(Vec::<EventDto>::new());
-    let loaded = create_signal(false);
+
+    spawn_local({
+        async move {
+            loop {
+                if let Some(data) = fetch_json::<Vec<ModelItemDto>>("/api/models").await {
+                    if !models.is_alive() {
+                        break;
+                    }
+                    // Skip no-op updates: a set() re-renders every dependent view.
+                    if models.get_clone() != data {
+                        models.set(data);
+                    }
+                }
+                gloo_timers::future::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    });
+
+    spawn_local({
+        async move {
+            loop {
+                if let Some(data) = fetch_json::<Vec<ClientKeyDto>>("/api/client-keys").await {
+                    if !client_keys.is_alive() {
+                        break;
+                    }
+                    if client_keys.get_clone() != data {
+                        client_keys.set(data);
+                    }
+                }
+                gloo_timers::future::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    });
 
     spawn_local({
         async move {
@@ -285,7 +163,11 @@ fn App() -> View {
                     if !providers.is_alive() {
                         break;
                     }
-                    providers.set(data);
+                    // Skip no-op updates — a set() would rebuild the open detail
+                    // page and wipe any in-progress form state every 3 seconds.
+                    if providers.get_clone() != data {
+                        providers.set(data);
+                    }
                     loaded.set(true);
                 }
                 let na = NEED_AUTH.load(std::sync::atomic::Ordering::Relaxed);
@@ -304,7 +186,9 @@ fn App() -> View {
                     if !quotas.is_alive() {
                         break;
                     }
-                    quotas.set(data);
+                    if quotas.get_clone() != data {
+                        quotas.set(data);
+                    }
                 }
                 gloo_timers::future::sleep(std::time::Duration::from_secs(60)).await;
             }
@@ -314,10 +198,35 @@ fn App() -> View {
     spawn_local({
         async move {
             loop {
-                match EventSource::new("/api/events") {
+                // Stop retrying once the root scope is gone.
+                if !events.is_alive() {
+                    break;
+                }
+                // EventSource cannot send an Authorization header, so the admin
+                // key has to travel as `?key=` (the server accepts it for GET
+                // only). Without it, `/api/events` returns 401 whenever admin_key
+                // or api_key is configured, and the Events tab stays empty
+                // forever. Recomputed each attempt so a key entered in the auth
+                // modal takes effect on the next reconnect.
+                let es_url = match stored_key() {
+                    Some(k) => format!("/api/events?key={}", js_sys::encode_uri_component(&k)),
+                    None => "/api/events".to_string(),
+                };
+                match EventSource::new(&es_url) {
                     Ok(mut es) => match es.subscribe("message") {
                         Ok(mut stream) => {
+                            // The server replays its whole recent-buffer on every
+                            // connect, and this loop reconnects after any drop.
+                            // Without a reset each reconnect duplicated the entire
+                            // list (200 entries of the same events). Clearing once
+                            // per connection keeps the replay authoritative.
+                            if events.is_alive() {
+                                events.set(Vec::new());
+                            }
                             while let Some(item) = stream.next().await {
+                                if !events.is_alive() {
+                                    break;
+                                }
                                 match item {
                                     Ok((_ty, msg)) => {
                                         if let Some(data) = msg.data().as_string()
@@ -357,681 +266,87 @@ fn App() -> View {
 
     view! {
         div(class="topbar") {}
-        div(class="wrap") {
-            div(class="top") {
-                div {
+        div(class="layout") {
+            aside(class="side") {
+                div(class="side-top") {
                     div(class="logo") {
                         div(class="logo-mark") { i {} i {} i {} i {} }
                         span(class="logo-text") { "anyhop" }
                     }
-                    div(class="tagline") { "LLM Gateway · Rotation · Failover" }
-                }
-                ThemeToggle()
-            }
-
-            (if need_auth.get() {
-                view! { AuthBanner() }
-            } else {
-                view! {}
-            })
-
-            nav(class="tabs") {
-                Indexed(
-                    list=create_signal(TABS.to_vec()),
-                    view=move |(t, label)| {
-                        let cur = tab;
-                        view! {
-                            button(
-                                class=if cur.get() == t { "tab active" } else { "tab" },
-                                on:click=move |_| {
-                                    cur.set(t);
-                                    let name = match t {
-                                        Tab::Overview => "overview",
-                                        Tab::Providers => "providers",
-                                        Tab::Quotas => "quotas",
-                                        Tab::Events => "events",
-                                        Tab::Requests => "requests",
-                                        Tab::Config => "config",
-                                    };
-                                    if let Some(w) = web_sys::window() {
-                                        let _ = w.location().set_hash(name);
-                                    }
-                                },
-                            ) { (label) }
-                        }
-                    },
-                )
-            }
-
-            div(class="tab-content") {
-                (match tab.get() {
-                    Tab::Overview => view! { OverviewTab(providers=providers, events=events) },
-                    Tab::Providers => view! { ProvidersTab(providers=providers, selected=selected_provider) },
-                    Tab::Quotas => view! { QuotasTab(quotas=quotas) },
-                    Tab::Events => view! { EventsTab(events=events) },
-                    Tab::Requests => view! { RequestsTab() },
-                    Tab::Config => view! { ConfigTab() },
-                })
-            }
-
-            div(class="footer") {
-                span { "anyhop v" (env!("CARGO_PKG_VERSION")) }
-                span(class="pix") { i {} i {} i {} i {} i {} }
-                span { "self-hosted · zero deps" }
-            }
-        }
-    }
-}
-
-// ---------- Обзор ----------
-
-#[component(inline_props)]
-fn OverviewTab(providers: Signal<Vec<ProviderDto>>, events: Signal<Vec<EventDto>>) -> View {
-    let n_providers = create_memo(move || providers.get_clone().len());
-    let total_requests = create_memo(move || {
-        providers
-            .get_clone()
-            .iter()
-            .flat_map(|p| p.keys.iter())
-            .map(|k| k.requests)
-            .sum::<u64>()
-    });
-    let total_tokens = create_memo(move || {
-        providers
-            .get_clone()
-            .iter()
-            .flat_map(|p| p.keys.iter())
-            .map(|k| k.prompt_tokens + k.completion_tokens)
-            .sum::<u64>()
-    });
-    let in_flight = create_memo(move || {
-        providers
-            .get_clone()
-            .iter()
-            .flat_map(|p| p.keys.iter())
-            .map(|k| k.in_flight as u64)
-            .sum::<u64>()
-    });
-
-    view! {
-        div(class="stats") {
-            div(class="stat") {
-                div(class="num") { (n_providers.get_clone()) }
-                div(class="lbl") { "Providers" }
-            }
-            div(class="stat") {
-                div(class="num") { (fmt_num(in_flight.get_clone())) }
-                div(class="lbl") { "In flight" }
-            }
-            div(class="stat") {
-                div(class="num") { (fmt_num(total_requests.get_clone())) }
-                div(class="lbl") { "Total requests" }
-            }
-            div(class="stat") {
-                div(class="num") { (fmt_num(total_tokens.get_clone())) }
-                div(class="lbl") { "Tokens processed" }
-            }
-        }
-        div(class="section-title") { "Recent events" }
-        div(class="card") {
-            EventList(events=events, limit=5)
-        }
-    }
-}
-
-// ---------- Провайдеры ----------
-
-/// Каталог известных типов провайдеров (включая несконфигурированные).
-const KNOWN_TYPES: &[(&str, &str, &str)] = &[
-    ("antigravity", "Antigravity", "Google OAuth accounts · Gemini/Claude"),
-    ("codex", "Codex", "ChatGPT OAuth accounts"),
-    ("gemini", "Gemini API", "any compatible endpoint"),
-    ("anthropic", "Anthropic API", "any compatible endpoint"),
-    ("openai_compat", "OpenAI-compatible", "any Chat Completions endpoint"),
-];
-
-#[component(inline_props)]
-fn ProvidersTab(providers: Signal<Vec<ProviderDto>>, selected: Signal<Option<String>>) -> View {
-    let go = move |name: Option<String>| {
-        selected.set(name.clone());
-        if let Some(w) = web_sys::window() {
-            let h = match &name {
-                Some(n) => format!("providers/{n}"),
-                None => "providers".into(),
-            };
-            let _ = w.location().set_hash(&h);
-        }
-    };
-
-    view! {
-        (match selected.get_clone() {
-            Some(name) => view! { ProviderDetail(name=name, providers=providers) },
-            None => view! { ProviderCatalog(providers=providers, go=go) },
-        })
-    }
-}
-
-#[component(inline_props)]
-fn ProviderCatalog(providers: Signal<Vec<ProviderDto>>, go: impl Fn(Option<String>) + Copy + 'static) -> View {
-    view! {
-        div(class="provider-grid") {
-            (move || build_tiles(providers.get_clone(), go))
-        }
-    }
-}
-
-fn build_tiles(configured: Vec<ProviderDto>, go: impl Fn(Option<String>) + Copy + 'static) -> Vec<View> {
-    KNOWN_TYPES
-        .iter()
-        .map(|(kind, title, desc)| {
-            let instances: Vec<ProviderDto> = configured
-                .iter()
-                .filter(|p| p.kind == *kind)
-                .cloned()
-                .collect();
-            let kind_s = kind.to_string();
-            if instances.is_empty() {
-                view! {
-                    div(class="provider-tile empty-tile") {
-                        div(class="tile-title") { (*title) }
-                        div(class="tile-desc") { (*desc) }
-                        div(class="tile-hint") { "not configured" }
-                        (if kind_s == "antigravity" || kind_s == "codex" {
-                            view! { div(class="tile-hint dim") { "add account via Config tab" } }
-                        } else {
-                            view! { div(class="tile-hint dim") { "add via Config tab" } }
-                        })
+                    // Only rendered as a button on narrow screens (CSS hides it
+                    // above 720px, where the full nav is always visible).
+                    button(
+                        class=if nav_open.get_clone() { "nav-burger open" } else { "nav-burger" },
+                        on:click=move |_| nav_open.set(!nav_open.get_clone()),
+                    ) {
+                        span {}
+                        span {}
+                        span {}
                     }
                 }
-            } else {
-                let inner: Vec<View> = instances
-                    .into_iter()
-                    .map(|p| {
-                        let total = p.keys.len();
-                        let active = p.keys.iter().filter(|k| k.status == "active").count();
-                        let name = p.name.clone();
-                        let name2 = p.name.clone();
-                        let health = if total > 0 && active == 0 {
-                            "pdot pdot-err"
-                        } else if active < total {
-                            "pdot pdot-warn"
-                        } else {
-                            "pdot pdot-ok"
-                        };
-                        view! {
-                            div(class="provider-tile", on:click=move |_| go(Some(name.clone()))) {
-                                div(class="tile-head") {
-                                    span(class=health) {}
-                                    span(class="tile-title") { (name2) }
-                                }
-                                div(class="tile-desc") { (*desc) }
-                                div(class="tile-meta") { (format!("{} keys · {} active", total, active)) }
-                            }
-                        }
-                    })
-                    .collect();
-                view! { (inner) }
-            }
-        })
-        .collect()
-}
 
-#[component(inline_props)]
-fn ModelsCard(provider: String, models: Vec<String>) -> View {
-    let key = format!("models:{provider}");
-    let open = create_signal(collapse_get(&key));
-    let n = models.len();
-    view! {
-        div(class=create_memo(move || if open.get() { "card open" } else { "card" })) {
-            div(class="card-head clickable", on:click=move |_| {
-                let nv = !open.get();
-                open.set(nv);
-                collapse_set(&key, nv);
-            }) {
-                b { "Models" }
-                span(class="badge") { (n) }
-                span(class="quota-caret") { (if open.get() { "−" } else { "+" }) }
-            }
-            (if open.get() {
-                let chips: Vec<View> = models
-                    .clone()
-                    .into_iter()
-                    .map(|m| view! { span(class="model-chip") { (m) } })
-                    .collect();
-                view! { div(class="model-cloud") { (chips) } }
-            } else {
-                view! {}
-            })
-        }
-    }
-}
-
-#[component(inline_props)]
-fn ProviderDetail(name: String, providers: Signal<Vec<ProviderDto>>) -> View {
-    view! {
-        a(class="back-link", href="#providers") { "all providers" }
-        (match providers.get_clone().into_iter().find(|p| p.name == name) {
-            Some(p) => {
-                let models = p.models.clone();
-                let pname = p.name.clone();
-                view! {
-                    ProviderCard(p=p)
-                    ModelsCard(provider=pname, models=models)
-                }
-            }
-            None => {
-                let msg = format!("provider '{name}' not found in config — add it via Config tab");
-                view! {
-                    div(class="card") { div(class="empty") {
-                        div(class="pix") { i {} i {} i {} i {} i {} i {} i {} i {} i {} }
-                        (msg)
-                    } }
-                }
-            }
-        })
-    }
-}
-
-#[component(inline_props)]
-fn ProviderCard(p: ProviderDto) -> View {
-    let pname_rows = p.name.clone();
-    let pname_footer = p.name.clone();
-    let pkind_footer = p.kind.clone();
-    let oauth = p.kind == "antigravity" || p.kind == "codex";
-
-    let health = {
-        let total = p.keys.len();
-        let dead = p.keys.iter().filter(|k| k.status == "dead").count();
-        let cool = p.keys.iter().filter(|k| k.status == "cooldown").count();
-        if total > 0 && dead == total {
-            "pdot pdot-err"
-        } else if dead + cool > 0 {
-            "pdot pdot-warn"
-        } else {
-            "pdot pdot-ok"
-        }
-    };
-
-    let footer = if oauth {
-        view! { OAuthAddButton(kind=pkind_footer) }
-    } else {
-        view! { AddKeyForm(provider=pname_footer) }
-    };
-
-    view! {
-        div(class="card") {
-            div(class="card-head") {
-                span(class=health) {}
-                b { (p.name) }
-                span(class="badge accent") { (p.kind) }
-                span(class="badge") { (p.strategy) }
-                span(class="badge raw") { (p.base_url) }
-            }
-            div(class="key-list") {
-                Indexed(
-                    list=create_signal(p.keys),
-                    view=move |k: KeyDto| {
-                        let chip = format!("chip chip-{}", k.status);
-                        let status = k.status.clone();
-                        let prov = pname_rows.clone();
-                        let stats = format!(
-                            "{} req · {} fail · {} in / {} out",
-                            fmt_num(k.requests), fmt_num(k.failures),
-                            fmt_num(k.prompt_tokens), fmt_num(k.completion_tokens)
-                        );
-                        let cooldown_v = if k.cooldown_remaining_secs > 0 {
-                            view! { span(class="key-cooldown") { (format!("cooldown {}s", k.cooldown_remaining_secs)) } }
-                        } else { view! {} };
-                        let inflight_v = if k.in_flight > 0 {
-                            view! { span(class="key-inflight") { (format!("▶ {}", k.in_flight)) } }
-                        } else { view! {} };
-                        view! {
-                            div(class="key-row") {
-                                span(class=chip) { (k.status) }
-                                span(class="mono key-id") { (k.masked) }
-                                (inflight_v)
-                                span(class="key-stats") { (stats) }
-                                (cooldown_v)
-                                KeyActionButton(provider=prov, id=k.id.clone(), status=status)
-                            }
-                        }
-                    },
-                )
-            }
-            (footer)
-        }
-    }
-}
-
-#[component(inline_props)]
-fn AddKeyForm(provider: String) -> View {
-    let new_key = create_signal(String::new());
-    view! {
-        div(class="addkey") {
-            input(class="input", r#type="text", placeholder="add a key…",
-                  bind:value=new_key)
-            button(class="btn btn-primary", on:click=move |_| {
-                let secret = new_key.get_clone();
-                if secret.len() >= 4 {
-                    new_key.set(String::new());
-                    let provider = provider.clone();
-                    spawn_local(async move {
-                        let body = serde_json::json!({"provider": provider, "secret": secret});
-                        post_json("/api/keys/add", &body).await;
-                    });
-                }
-            }) { "Add" }
-        }
-    }
-}
-
-#[component(inline_props)]
-fn OAuthAddButton(kind: String) -> View {
-    let auth = create_signal(Option::<AuthStateDto>::None);
-    let label = format!("Add {} account", kind);
-    view! {
-        div(class="addkey") {
-            button(class="btn btn-primary", on:click=move |_| {
-                let kind = kind.clone();
-                spawn_local(async move {
-                    let body = serde_json::json!({"kind": kind});
-                    let Ok(req) = Request::post("/api/auth/start").json(&body) else { return };
-                    let Ok(resp) = req.send().await else { return };
-                    let Ok(v) = resp.json::<serde_json::Value>().await else { return };
-                    let Some(url) = v.get("url").and_then(|u| u.as_str()).map(str::to_string) else { return };
-                    let url2 = url.clone();
-                    defer(move || auth.set(Some(AuthStateDto {
-                        kind: kind.clone(),
-                        status: "waiting".into(),
-                        url: url2,
-                        message: "waiting for browser callback".into(),
-                    })));
-                    if let Some(w) = web_sys::window() {
-                        let _ = w.open_with_url_and_target(&url, "_blank");
-                    }
-                    loop {
-                        gloo_timers::future::sleep(std::time::Duration::from_secs(2)).await;
-                        if let Some(s) = fetch_json::<AuthStateDto>("/api/auth/status").await {
-                            let terminal = s.status != "waiting";
-                            auth.set(Some(s));
-                            if terminal { break; }
-                        }
-                    }
-                });
-            }) { (label) }
-        }
-        (match auth.get_clone() {
-            Some(a) => {
-                let cls = format!("auth-banner auth-{}", a.status);
-                let msg = if a.status == "waiting" {
-                    "Authorization opened in a new tab — complete the sign-in".to_string()
-                } else {
-                    a.message
-                };
-                view! { div(class=cls) { (msg) } }
-            }
-            None => view! {},
-        })
-    }
-}
-
-#[component(inline_props)]
-fn KeyActionButton(provider: String, id: String, status: String) -> View {
-    let dead = status == "dead";
-    let label = if dead { "enable" } else { "disable" };
-    let class = if dead { "btn" } else { "btn btn-danger" };
-    let url = if dead { "/api/keys/enable" } else { "/api/keys/disable" };
-    view! {
-        button(class=class, on:click=move |_| {
-            let body = serde_json::json!({"provider": provider.clone(), "id": id.clone()});
-            spawn_local(async move {
-                post_json(url, &body).await;
-            });
-        }) { (label) }
-    }
-}
-
-// ---------- Квоты ----------
-
-async fn fetch_text(url: &str) -> Option<String> {
-    Request::get(url).send().await.ok()?.text().await.ok()
-}
-
-async fn put_json<B: serde::Serialize>(url: &str, body: &B) -> Option<String> {
-    let req = Request::put(url).json(body).ok()?;
-    if let Some(k) = stored_key() {
-        req.headers().set("Authorization", &format!("Bearer {k}"));
-    }
-    let resp = req.send().await.ok()?;
-    let ok = resp.status() == 200;
-    let text = resp.text().await.ok()?;
-    Some(if ok { "saved + reloaded".into() } else { text })
-}
-
-#[component]
-fn RequestsTab() -> View {
-    let items = create_signal(Vec::<RequestDto>::new());
-    spawn_local(async move {
-        loop {
-            if !items.is_alive() {
-                break;
-            }
-            if let Some(data) = fetch_json::<Vec<RequestDto>>("/api/requests").await {
-                items.set(data);
-            }
-            gloo_timers::future::sleep(std::time::Duration::from_secs(2)).await;
-        }
-    });
-
-    view! {
-        div(class="card") {
-            (if items.get_clone().is_empty() {
-                view! { div(class="empty") {
-                    div(class="pix") { i {} i {} i {} i {} i {} i {} i {} i {} i {} }
-                    "No requests yet"
-                } }
-            } else {
-                view! {
-                    div(class="table-scroll") {
-                        table {
-                            tr {
-                                th { "Time" } th { "Provider" } th { "Model" } th { "Key" }
-                                th { "Status" } th { "Latency" } th { "" }
-                            }
-                            Indexed(
-                                list=create_signal(items.get_clone()),
-                                view=|r: RequestDto| {
-                                    let chip = if r.status == "200" { "chip chip-active" }
-                                        else if r.status == "429" { "chip chip-cooldown" }
-                                        else { "chip chip-dead" };
-                                    view! {
-                                        tr {
-                                            td(class="mono") { (fmt_time(r.ts)) }
-                                            td { (r.provider) }
-                                            td(class="mono") { (r.model) }
-                                            td(class="mono") { (r.key) }
-                                            td { span(class=chip) { (r.status) } }
-                                            td(class="num") { (format!("{}ms", r.latency_ms)) }
-                                            td { (if r.stream { "stream" } else { "" }) }
-                                        }
-                                    }
-                                },
-                            )
-                        }
-                    }
-                }
-            })
-        }
-    }
-}
-
-#[component]
-fn ConfigTab() -> View {
-    let toml = create_signal(String::new());
-    let status = create_signal(String::new());
-    let loaded = create_signal(false);
-
-    spawn_local({
-        let toml = toml;
-        let loaded = loaded;
-        async move {
-            if let Some(t) = fetch_text("/api/config").await {
-                toml.set(t);
-                loaded.set(true);
-            }
-        }
-    });
-
-    view! {
-        div(class="section-title") { "Config" }
-        div(class="card") {
-            (if loaded.get() {
-                view! {
-                    textarea(class="config-editor", bind:value=toml)
-                }
-            } else {
-                view! { div(class="loading") { "Loading…" } }
-            })
-            div(class="config-actions") {
-                button(class="btn btn-primary", on:click=move |_| {
-                    let body = serde_json::json!({"toml": toml.get_clone()});
-                    spawn_local(async move {
-                        let msg = put_json("/api/config", &body).await
-                            .unwrap_or_else(|| "request failed".into());
-                        status.set(msg);
-                    });
-                }) { "Save & reload" }
-                button(class="btn", on:click=move |_| {
-                    spawn_local(async move {
-                        let _ = Request::post("/api/reload").send().await;
-                    });
-                }) { "Reload from disk" }
-                span(class="config-status") { (status.get_clone()) }
-            }
-        }
-    }
-}
-
-#[component(inline_props)]
-fn QuotasTab(quotas: Signal<Vec<QuotaDto>>) -> View {
-    view! {
-        (if quotas.get_clone().is_empty() {
-            view! { div(class="card") { div(class="empty") {
-                div(class="pix") { i {} i {} i {} i {} i {} i {} i {} i {} i {} }
-                "Quotas appear for OAuth providers (antigravity)"
-            } } }
-        } else {
-            view! {
-                div(class="quota-grid") {
-                    Keyed(
-                        list=quotas,
-                        view=|q: QuotaDto| view! { QuotaCard(q=q) },
-                        key=|q: &QuotaDto| format!("{}:{}", q.provider, q.account),
-                    )
-                }
-            }
-        })
-    }
-}
-
-#[component(inline_props)]
-fn QuotaCard(q: QuotaDto) -> View {
-    let open = create_signal(false);
-    // Сводка для свёрнутого состояния: худшая квота по аккаунту.
-    let worst = q.models.iter().filter_map(|m| m.pct).min();
-    let worst_txt = match worst {
-        Some(p) => format!("min {}%", p),
-        None => String::new(),
-    };
-    let worst_low = worst.is_some_and(|p| p < 10);
-
-    view! {
-        div(class=create_memo(move || if open.get() { "quota-card open" } else { "quota-card" })) {
-            div(class="quota-card-head", on:click=move |_| open.set(!open.get())) {
-                b { (q.provider) }
-                span(class="badge raw") { (q.account) }
-                span(class=if worst_low { "quota-worst low" } else { "quota-worst" }) { (worst_txt) }
-                span(class="quota-caret") { (if open.get() { "−" } else { "+" }) }
-            }
-            div(class="quota-body") {
-                Indexed(
-                    list=create_signal(q.models),
-                    view=|m: QuotaModelDto| {
-                        let id = m.id.clone();
-                        let title = m.id.clone();
-                        let pct = m.pct;
-                        let cls = if m.low { "quota-fill low" } else { "quota-fill" };
-                        let width = pct.map(|p| format!("width:{}%", p)).unwrap_or_default();
-                        let reset = if m.reset.is_empty() {
-                            String::new()
-                        } else {
-                            m.reset.get(..10).unwrap_or(&m.reset).to_string()
-                        };
-                        view! {
-                            div(class="quota-row") {
-                                span(class="quota-name", title=title) { (id) }
-                                (match pct {
-                                    Some(p) => view! {
-                                        div(class="quota-bar") { div(class=cls, style=width) {} }
-                                        span(class="quota-pct") { (format!("{}%", p)) }
-                                    },
-                                    None => view! {
-                                        div(class="quota-bar empty") {}
-                                        span(class="quota-pct") { "—" }
-                                    },
-                                })
-                                span(class="quota-reset") { (reset) }
-                            }
-                        }
-                    },
-                )
-            }
-        }
-    }
-}
-
-// ---------- События ----------
-
-#[component(inline_props)]
-fn EventsTab(events: Signal<Vec<EventDto>>) -> View {
-    view! {
-        div(class="card") {
-            EventList(events=events, limit=200)
-        }
-    }
-}
-
-#[component(inline_props)]
-fn EventList(events: Signal<Vec<EventDto>>, limit: usize) -> View {
-    let limited = create_memo(move || {
-        events.get_clone().into_iter().take(limit).collect::<Vec<_>>()
-    });
-    view! {
-        (if limited.get_clone().is_empty() {
-            view! { div(class="empty") {
-                div(class="pix") { i {} i {} i {} i {} i {} i {} i {} i {} i {} }
-                "No events yet — all quiet"
-            } }
-        } else {
-            view! {
-                div(class="events") {
-                    Indexed(
-                        list=create_signal(limited.get_clone()),
-                        view=|e: EventDto| {
-                            let kind_cls = format!("ev-kind ev-{}", e.kind);
-                            let kind_txt = e.kind.clone();
+                nav(class=if nav_open.get_clone() { "side-nav open" } else { "side-nav" }) {
+                    (NAV.iter().map(|(group, items)| {
+                        let items_v: Vec<View> = items.iter().map(|(t, label)| {
+                            let t = *t;
+                            let label = *label;
                             view! {
-                                div(class="ev") {
-                                    span(class="ev-ts") { (fmt_time(e.ts)) }
-                                    span(class=kind_cls) { (kind_txt) }
-                                    b { (e.provider) }
-                                    span(class="ev-detail") { (e.key) " — " (e.detail) }
-                                }
+                                button(
+                                    class=if tab.get() == t { "nav-item active" } else { "nav-item" },
+                                    on:click=move |_| {
+                                        tab.set(t);
+                                        nav_open.set(false);
+                                        if let Some(w) = web_sys::window() {
+                                            let _ = w.location().set_hash(t.hash());
+                                        }
+                                    },
+                                ) { (label) }
                             }
-                        },
-                    )
+                        }).collect();
+                        view! {
+                            div(class="nav-group") {
+                                div(class="nav-label") { (*group) }
+                                (items_v)
+                            }
+                        }
+                    }).collect::<Vec<_>>())
+                }
+
+                div(class="side-foot") {
+                    ThemeToggle()
+                    div(class="side-endpoint") {
+                        (web_sys::window()
+                            .and_then(|w| w.location().host().ok())
+                            .map(|h| format!("{h}/v1"))
+                            .unwrap_or_default())
+                    }
+                    div(class="side-meta") {
+                        span { "anyhop v" (env!("CARGO_PKG_VERSION")) }
+                    }
                 }
             }
-        })
+
+            main(class="main") {
+                (if need_auth.get() {
+                    view! { AuthBanner() }
+                } else {
+                    view! {}
+                })
+
+                div(class="tab-content") {
+                    (match tab.get() {
+                        Tab::Overview => view! { OverviewTab(providers=providers, events=events, client_keys=client_keys, models=models, quotas=quotas) },
+                        Tab::Providers => view! { ProvidersTab(providers=providers, selected=selected_provider) },
+                        Tab::Models => view! { ModelsTab(models=models) },
+                        Tab::ApiKeys => view! { ApiKeysTab(client_keys=client_keys, models=models) },
+                        Tab::Quotas => view! { QuotasTab(quotas=quotas) },
+                        Tab::Events => view! { EventsTab(events=events) },
+                        Tab::Requests => view! { RequestsTab() },
+                        Tab::Settings => view! { SettingsTab() },
+                        Tab::Config => view! { ConfigTab() },
+                    })
+                }
+            }
+        }
     }
 }

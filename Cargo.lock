@@ -21,6 +21,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures",
+ "getrandom 0.4.3",
  "hex",
  "memchr",
  "mimalloc",
@@ -35,6 +36,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
 ]

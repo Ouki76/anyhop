@@ -23,6 +23,7 @@ Never repeat surrounding code. No explanations. No markdown fences.";
 
 pub async fn fim_completions(
     State(state): State<Arc<AppState>>,
+    key_perm: Option<axum::extract::Extension<crate::proxy::KeyPermissions>>,
     body: Bytes,
 ) -> Response {
     let req: Value = match serde_json::from_slice(&body) {
@@ -45,6 +46,18 @@ pub async fn fim_completions(
             "missing 'model' or 'prompt'",
             "invalid_request_error",
         );
+    }
+
+    {
+        let dm = state.disabled_models.read().unwrap_or_else(|e| e.into_inner());
+        let bare = model.strip_prefix("combo/").unwrap_or(model);
+        if dm.contains(model) || dm.contains(bare) {
+            return crate::proxy::error_response(
+                StatusCode::NOT_FOUND,
+                format!("model '{model}' is disabled"),
+                "model_not_found",
+            );
+        }
     }
 
     let max_tokens = req
@@ -77,19 +90,58 @@ pub async fn fim_completions(
         );
     };
 
+    let key_models = key_perm.as_ref().and_then(|e| e.0.allowed_models.as_ref());
+
     // FIM is single-shot: one provider target, full key retry loop.
     let (provider, upstream_model) = match &resolved {
-        Resolved::One(p, m) => (*p, m.clone()),
-        Resolved::Chain(chain) => match chain.first() {
-            Some((p, m)) => (*p, m.clone()),
-            None => {
+        Resolved::One(p, m) => {
+            let canonical = format!("{}/{}", p.name, m);
+            if crate::proxy::model_disabled(&state.disabled_models.read().unwrap_or_else(|e| e.into_inner()), model, &canonical, m) {
                 return crate::proxy::error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "empty combo chain",
-                    "provider_unavailable",
+                    StatusCode::NOT_FOUND,
+                    format!("model '{model}' is disabled"),
+                    "model_not_found",
                 );
             }
-        },
+            if let Some(allowed) = key_models
+                && !crate::proxy::model_allowed(allowed, model, &canonical, m)
+            {
+                return crate::proxy::error_response(
+                    StatusCode::FORBIDDEN,
+                    format!("model '{model}' is not allowed for this API key"),
+                    "model_not_allowed",
+                );
+            }
+            (*p, m.clone())
+        }
+        Resolved::Chain(chain) => {
+            if let Some(allowed) = key_models
+                && !crate::proxy::combo_allowed(allowed, model)
+            {
+                return crate::proxy::error_response(
+                    StatusCode::FORBIDDEN,
+                    format!("model '{model}' is not allowed for this API key"),
+                    "model_not_allowed",
+                );
+            }
+            let active = {
+                // one read guard for the whole scan, not per entry
+                let disabled = state.disabled_models.read().unwrap_or_else(|e| e.into_inner());
+                chain.iter().find(|(p, m)| {
+                    !disabled.contains(&format!("{}/{}", p.name, m)) && !disabled.contains(m.as_str())
+                })
+            };
+            match active {
+                Some((p, m)) => (*p, m.clone()),
+                None => {
+                    return crate::proxy::error_response(
+                        StatusCode::NOT_FOUND,
+                        format!("all targets in combo '{model}' are disabled"),
+                        "model_not_found",
+                    );
+                }
+            }
+        }
     };
 
     let resp = crate::proxy::run_target_pub(&state, provider, &upstream_model, &synthetic, false).await;
@@ -147,7 +199,8 @@ fn trim_prefix_overlap(text: &str, prefix: &str) -> String {
         return text.to_string();
     }
     let max = pre.len().min(text.len());
-    for k in (12..=max).rev() {
+    // skip offsets that split a multi-byte char — slicing there panics
+    for k in (12..=max).rev().filter(|&k| pre.is_char_boundary(pre.len() - k)) {
         if text.starts_with(&pre[pre.len() - k..]) {
             return text[k..].trim_start_matches('\n').to_string();
         }
@@ -162,7 +215,10 @@ fn trim_suffix_overlap(text: &str, suffix: &str) -> String {
         return text.to_string();
     }
     let max = suf.len().min(text.len());
-    for k in (1..=max).rev() {
+    // >= 4 chars: a 1-2 char "echo" ("}", ");") is usually the completion's
+    // own closing brace — trimming it would corrupt the completion.
+    // Also skip offsets that split a multi-byte char (slicing there panics).
+    for k in (4..=max).rev().filter(|&k| suf.is_char_boundary(k)) {
         if text.ends_with(&suf[..k]) {
             return text[..text.len() - k].trim_end_matches('\n').to_string();
         }
@@ -183,4 +239,49 @@ fn strip_fences(s: &str) -> String {
         return rest.trim_end_matches('\n').to_string();
     }
     s.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_overlap_multibyte_match() {
+        // deep scan crosses the interior of コメント — would panic on byte slicing
+        let prompt = "fn f() {\n    // コメント\n    let x = 1;";
+        let text = "    let x = 1;\n    // extra\n}";
+        assert_eq!(trim_prefix_overlap(text, prompt), "    // extra\n}");
+    }
+
+    #[test]
+    fn prefix_overlap_multibyte_no_panic() {
+        let prompt = "fn f() {\n    // 日本語のコメント\n    let x";
+        let text = "completely different completion, long enough to force a deep scan";
+        assert_eq!(trim_prefix_overlap(text, prompt), text);
+    }
+
+    #[test]
+    fn suffix_overlap_multibyte_no_panic() {
+        // ； at bytes 2..5: k=4 would slice inside it without the boundary filter
+        let suffix = "xy；z";
+        let text = "no match at all in this completion";
+        assert_eq!(trim_suffix_overlap(text, suffix), text);
+    }
+
+    #[test]
+    fn suffix_overlap_multibyte_trim() {
+        // a 6-byte multibyte echo (>= the 4-char floor) still trims
+        let suffix = "；和\nrest";
+        let text = "let x = 1；和";
+        assert_eq!(trim_suffix_overlap(text, suffix), "let x = 1");
+    }
+
+    #[test]
+    fn suffix_overlap_short_echo_not_trimmed() {
+        // regression: cursor right before an outer '}' — the completion's own
+        // closing brace must NOT be deleted as a "suffix echo"
+        let suffix = "\n}";
+        let text = "foo() {\n  bar();\n}";
+        assert_eq!(trim_suffix_overlap(text, suffix), text);
+    }
 }

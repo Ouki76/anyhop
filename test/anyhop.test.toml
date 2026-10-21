@@ -26,7 +26,7 @@ name = "ag"
 type = "antigravity"
 base_url = "http://127.0.0.1:9102"
 strategy = "fill_first"
-# models намеренно пустой — список подтягивается через fetchAvailableModels
+# models intentionally empty — the list is pulled via fetchAvailableModels
 
 [[providers.accounts]]
 email = "bad@test.dev"
@@ -46,6 +46,14 @@ strategy = "fill_first"
 drain_below_pct = 10
 keys = ["drain-key"]
 models = ["drain-model"]
+
+[[providers]]
+name = "err500"
+type = "openai_compat"
+base_url = "http://127.0.0.1:9100/v1"
+strategy = "fill_first"
+keys = ["bad-500"]
+models = ["err-model"]
 
 [[combos]]
 name = "testcombo"

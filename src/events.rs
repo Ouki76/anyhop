@@ -40,6 +40,9 @@ pub struct RequestRecord {
     pub status: String,
     pub latency_ms: u64,
     pub stream: bool,
+    /// Name of the client key that authorised the request (None = master key).
+    #[serde(default)]
+    pub client_key: Option<String>,
 }
 
 /// Shared event bus: live broadcast + replayable recent buffer with a runtime cap.
@@ -50,9 +53,28 @@ pub struct EventBus {
     cap: Arc<AtomicUsize>,
 }
 
+/// Poison-recovering lock (same policy as `pool::lock`): the guards below cover
+/// a plain buffer with no invariant a panic could corrupt, so one panic must not
+/// take the event feed down for the rest of the process.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl EventBus {
+    /// Config: 0 means "in-memory default (100), no persistence".
+    fn normalize(cap: usize) -> usize {
+        if cap == 0 { 100 } else { cap }
+    }
+
     pub fn new(cap: usize) -> Self {
-        let (tx, _) = tokio::sync::broadcast::channel(256);
+        Self::with_capacity(cap, 256)
+    }
+
+    /// `channel_capacity` is the SSE broadcast buffer: subscribers lagging more
+    /// than this many events behind get `Lagged` (and we resubscribe).
+    pub fn with_capacity(cap: usize, channel_capacity: usize) -> Self {
+        let cap = Self::normalize(cap);
+        let (tx, _) = tokio::sync::broadcast::channel(channel_capacity.max(1));
         Self {
             tx,
             recent: Arc::new(Mutex::new(VecDeque::with_capacity(cap.max(16)))),
@@ -61,13 +83,13 @@ impl EventBus {
     }
 
     pub fn set_cap(&self, cap: usize) {
-        self.cap.store(cap, Ordering::Relaxed);
+        self.cap.store(Self::normalize(cap), Ordering::Relaxed);
     }
 
     pub fn emit(&self, ev: DashEvent) {
         let _ = self.tx.send(ev.clone());
         let cap = self.cap.load(Ordering::Relaxed);
-        let mut buf = self.recent.lock().unwrap();
+        let mut buf = lock(&self.recent);
         while buf.len() >= cap.max(1) {
             buf.pop_front();
         }
@@ -83,13 +105,13 @@ impl EventBus {
     }
 
     pub fn recent(&self) -> Vec<DashEvent> {
-        self.recent.lock().unwrap().iter().cloned().collect()
+        lock(&self.recent).iter().cloned().collect()
     }
 
     /// Restore a persisted buffer (called once at startup).
     pub fn restore(&self, events: Vec<DashEvent>) {
         let cap = self.cap.load(Ordering::Relaxed);
-        let mut buf = self.recent.lock().unwrap();
+        let mut buf = lock(&self.recent);
         *buf = events.into_iter().collect();
         while buf.len() > cap.max(1) {
             buf.pop_front();

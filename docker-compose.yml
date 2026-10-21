@@ -1,0 +1,45 @@
+# anyhop via Docker Compose.
+#
+#   cp anyhop.example.toml anyhop.toml   # fill in the keys, chmod 600
+#   # inside the container the process must listen on all interfaces, otherwise
+#   # the published port reaches nothing:
+#   sed -i 's|^listen = .*|listen = "0.0.0.0:8080"|' anyhop.toml
+#   docker compose up -d
+#
+# Put a TLS terminator in front (nginx/caddy/traefik) — see packaging/nginx.conf.example.
+
+services:
+  anyhop:
+    build: .
+    image: anyhop:local
+    container_name: anyhop
+    restart: unless-stopped
+    # Bound to loopback on purpose: the gateway speaks plain HTTP and must not be
+    # reachable from the network without TLS in front of it.
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./anyhop.toml:/etc/anyhop/anyhop.toml:ro
+      - anyhop-data:/data
+    environment:
+      RUST_LOG: info
+      # ANYHOP_WORKERS: "4"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          # The gateway idles at ~10 MB and stays under ~20 MB at 4k rps;
+          # the limit is a safety net against a pathological provider stream.
+          memory: 256M
+
+volumes:
+  anyhop-data:

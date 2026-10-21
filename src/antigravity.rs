@@ -8,7 +8,7 @@
 //! - Responses wrap the Gemini payload in a top-level "response" field.
 //! - Project id comes from loadCodeAssist (cloudaicompanionProject).
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::Digest;
 
@@ -41,7 +41,7 @@ const SCOPES: &[&str] = &[
 pub const USER_AGENT: &str = "antigravity/hub/2.9.1 darwin/arm64";
 
 /// Refresh tokens are renewed slightly before expiry.
-const TOKEN_SAFETY_WINDOW: Duration = Duration::from_secs(300);
+// Token refresh window is configurable via `[tuning] token_refresh_window_secs`.
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -72,11 +72,11 @@ struct AccountState {
     /// Unix millis when the access token expires.
     expires_at_ms: u64,
     project_id: Option<String>,
+    /// Live refresh token (may have been rotated since the config was written).
+    refresh_token: Option<String>,
 }
 
 pub struct Account {
-    /// None for dev accounts with only a static access token.
-    pub refresh_token: Option<String>,
     /// Pool identity: refresh token when present, else the static access token.
     identity: String,
     pub email: Option<String>,
@@ -85,6 +85,7 @@ pub struct Account {
     storage: Option<crate::storage::Storage>,
     client: reqwest::Client,
     state: tokio::sync::Mutex<AccountState>,
+    tuning: std::sync::Arc<crate::config::Tuning>,
 }
 
 impl Account {
@@ -93,6 +94,7 @@ impl Account {
         provider: &str,
         storage: Option<&crate::storage::Storage>,
         client: reqwest::Client,
+        tuning: std::sync::Arc<crate::config::Tuning>,
     ) -> Self {
         let refresh_token = if cfg.refresh_token.is_empty() {
             None
@@ -105,20 +107,26 @@ impl Account {
             .unwrap_or_default();
 
         // Pre-seeded token from config, else cached token from previous runs.
-        let cached = cfg
-            .access_token
-            .is_none()
-            .then(|| {
-                storage.and_then(|s| s.load_oauth(provider, &identity))
-            })
-            .flatten();
+        // Load the cache when we might refresh — a rotated refresh token may
+        // live there even if a static access token is configured.
+        let cached = if cfg.access_token.is_none() || refresh_token.is_some() {
+            storage.and_then(|s| s.load_oauth(provider, &identity))
+        } else {
+            None
+        };
+        // A rotated refresh token persisted earlier wins over the stale config one.
+        let refresh_token = cached
+            .as_ref()
+            .and_then(|c| c.refresh_token.clone())
+            .or(refresh_token);
         let access_token = cfg
             .access_token
             .clone()
             .or_else(|| cached.as_ref().map(|c| c.access_token.clone()))
             .filter(|t| !t.is_empty());
-        let expires_at_ms = if cfg.access_token.is_some() {
-            // Pre-seeded tokens never expire (no refresh token to renew them).
+        // Pre-seeded tokens never expire — but only when there's no refresh token
+        // to renew them; with one configured, let the seed expire and refresh.
+        let expires_at_ms = if cfg.access_token.is_some() && refresh_token.is_none() {
             u64::MAX
         } else {
             cached.as_ref().map(|c| c.expires_at_ms).unwrap_or(0)
@@ -129,22 +137,23 @@ impl Account {
             .or_else(|| cached.as_ref().and_then(|c| c.project_id.clone()));
 
         Self {
-            refresh_token,
             identity,
             email: cfg.email.clone(),
             project_id_static: cfg.project_id.clone(),
             provider: provider.to_string(),
             storage: storage.cloned(),
             client,
+            tuning,
             state: tokio::sync::Mutex::new(AccountState {
                 access_token,
                 expires_at_ms,
                 project_id,
+                refresh_token,
             }),
         }
     }
 
-    fn persist(&self, access_token: &str, expires_at_ms: u64, project_id: Option<&str>) {
+    fn persist(&self, access_token: &str, expires_at_ms: u64, project_id: Option<&str>, refresh_token: Option<&str>) {
         if let Some(s) = &self.storage {
             s.save_oauth(
                 &self.provider,
@@ -153,6 +162,7 @@ impl Account {
                     access_token: access_token.to_string(),
                     expires_at_ms,
                     project_id: project_id.map(str::to_string),
+                    refresh_token: refresh_token.map(str::to_string),
                 },
             );
         }
@@ -170,8 +180,8 @@ impl Account {
 
     pub fn label(&self) -> String {
         self.email.clone().unwrap_or_else(|| {
-            // Refresh-токены Google почти все начинаются одинаково («1//0c…»),
-            // поэтому маскируем по хэшу — иначе лейблы разных аккаунтов совпадают.
+            // Google refresh tokens all share the same prefix ("1//0c…"),
+            // so we mask by hash — otherwise different accounts get identical labels.
             let digest = sha2::Sha256::digest(self.identity.as_bytes());
             format!("acct:{}", hex::encode(&digest[..4]))
         })
@@ -181,13 +191,15 @@ impl Account {
     pub async fn ensure_access_token(&self) -> Result<String, AuthError> {
         let mut st = self.state.lock().await;
         if let Some(t) = &st.access_token {
-            let valid_until = st.expires_at_ms.saturating_sub(TOKEN_SAFETY_WINDOW.as_millis() as u64);
+            let valid_until = st
+                .expires_at_ms
+                .saturating_sub(self.tuning.token_refresh_window().as_millis() as u64);
             if now_ms() < valid_until {
                 return Ok(t.clone());
             }
         }
 
-        let Some(refresh_token) = &self.refresh_token else {
+        let Some(refresh_token) = st.refresh_token.clone() else {
             return Err(AuthError::Permanent(
                 "static access token rejected and no refresh token configured".into(),
             ));
@@ -230,8 +242,14 @@ impl Account {
         let expires_in = v.get("expires_in").and_then(|e| e.as_u64()).unwrap_or(3600);
         st.expires_at_ms = now_ms() + expires_in * 1000;
         st.access_token = Some(token.clone());
+        // If the issuer rotated the refresh token, keep and persist the replacement.
+        if let Some(rt) = v.get("refresh_token").and_then(|t| t.as_str())
+            && rt != refresh_token
+        {
+            st.refresh_token = Some(rt.to_string());
+        }
         let project = st.project_id.clone();
-        self.persist(&token, st.expires_at_ms, project.as_deref());
+        self.persist(&token, st.expires_at_ms, project.as_deref(), st.refresh_token.as_deref());
         Ok(token)
     }
 
@@ -287,7 +305,9 @@ impl Account {
             })?;
         st.project_id = Some(project.clone());
         if let Some(t) = &st.access_token {
-            self.persist(t, st.expires_at_ms, Some(&project));
+            let t = t.clone();
+            let rt = st.refresh_token.clone();
+            self.persist(&t, st.expires_at_ms, Some(&project), rt.as_deref());
         }
         Ok(project)
     }
@@ -320,9 +340,16 @@ pub async fn fetch_available_models(
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         let snippet: String = body.chars().take(300).collect();
-        return Err(AuthError::Transient(format!(
-            "fetchAvailableModels {status}: {snippet}"
-        )));
+        // 401/403 mean the token itself is bad — retrying won't help
+        return if matches!(status.as_u16(), 401 | 403) {
+            Err(AuthError::Permanent(format!(
+                "fetchAvailableModels {status}: {snippet}"
+            )))
+        } else {
+            Err(AuthError::Transient(format!(
+                "fetchAvailableModels {status}: {snippet}"
+            )))
+        };
     }
     let v: Value = serde_json::from_str(&body)
         .map_err(|e| AuthError::Transient(format!("fetchAvailableModels: bad JSON: {e}")))?;
@@ -428,7 +455,10 @@ pub fn parse_quota_reset_ms(body: &str) -> Option<u64> {
         if let Some(rd) = d.get("retryDelay").and_then(|s| s.as_str())
             && let Some(secs) = rd.strip_suffix('s').and_then(|s| s.parse::<f64>().ok())
         {
-            until = Some(now_ms() + (secs * 1000.0) as u64);
+            // take the LATER reset like the timestamp branch below — a shorter
+            // retryDelay must not shrink a known later quota reset
+            let candidate = now_ms() + (secs * 1000.0) as u64;
+            until = Some(until.map_or(candidate, |u: u64| u.max(candidate)));
         }
         if let Some(ts) = d.get("quotaResetTimeStamp").and_then(|s| s.as_str())
             && let Some(ms) = parse_rfc3339_ms(ts)
@@ -536,7 +566,8 @@ pub async fn exchange_code(http: &reqwest::Client, code: &str) -> anyhow::Result
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
-        anyhow::bail!("token exchange failed ({status}): {}", &body[..body.len().min(300)]);
+        let snippet: String = body.chars().take(300).collect();
+        anyhow::bail!("token exchange failed ({status}): {snippet}");
     }
     let v: Value = serde_json::from_str(&body)?;
     let access_token = v
@@ -582,9 +613,16 @@ pub struct AuthOutcome {
 
 /// Start the OAuth flow (non-blocking): returns the URL to open.
 pub async fn start_auth(proxy: Option<&str>) -> anyhow::Result<PendingAuth> {
+    start_auth_with(proxy, &crate::config::Tuning::default()).await
+}
+
+pub async fn start_auth_with(
+    proxy: Option<&str>,
+    tuning: &crate::config::Tuning,
+) -> anyhow::Result<PendingAuth> {
     let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(30));
+        .timeout(tuning.oauth_http_timeout());
     if let Some(p) = proxy {
         builder = builder.proxy(reqwest::Proxy::all(p)?);
     }
@@ -653,6 +691,7 @@ pub async fn complete_auth(p: PendingAuth) -> anyhow::Result<AuthOutcome> {
         "antigravity",
         None,
         p.http.clone(),
+        std::sync::Arc::new(crate::config::Tuning::default()),
     );
     let project_id = match account.ensure_project_id(&tokens.access_token).await {
         Ok(p) => Some(p),
@@ -672,16 +711,16 @@ pub async fn complete_auth(p: PendingAuth) -> anyhow::Result<AuthOutcome> {
 /// CLI OAuth flow: prints a TOML snippet on success.
 pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
     let pending = start_auth(proxy.as_deref()).await?;
-    if proxy.is_some() {
-        println!("Использую прокси: {}", proxy.unwrap());
+    if let Some(p) = &proxy {
+        println!("Using proxy: {p}");
     }
-    println!("\nОткройте эту ссылку в браузере и войдите в Google-аккаунт:\n\n{}\n", pending.url);
+    println!("\nOpen this link in a browser and sign in to your Google account:\n\n{}\n", pending.url);
     let _ = std::process::Command::new("xdg-open").arg(&pending.url).spawn();
-    println!("Ожидаю callback на localhost:{CALLBACK_PORT} ...");
-    println!("Обмениваю код на токены после входа...");
+    println!("Waiting for the callback on localhost:{CALLBACK_PORT} ...");
+    println!("Exchanging the authorization code for tokens...");
     let out = complete_auth(pending).await?;
 
-    println!("\nГотово! Добавьте аккаунт в anyhop.toml:\n");
+    println!("\nDone! Add the account to anyhop.toml:\n");
     println!("[[providers]]");
     println!("name = \"antigravity\"");
     println!("type = \"antigravity\"");
@@ -699,15 +738,25 @@ pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
 }
 
 pub fn percent_decode(s: &str) -> String {
+    // Byte-based: slicing &s[i+1..i+3] panics when a multi-byte char follows '%'
+    // (the callback query is attacker-controllable on localhost).
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
         {
-            out.push(v);
+            out.push(h << 4 | l);
             i += 3;
             continue;
         }

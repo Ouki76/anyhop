@@ -22,7 +22,19 @@ class H(BaseHTTPRequestHandler):
             self.wfile.write(b'{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}')
             return
 
-        # Сохраняем последний запрос для проверок тестом
+        if self.path.endswith(":batchEmbedContents"):
+            reqs = body.get("requests", [])
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "embeddings": [
+                    {"values": [0.5 * (i + 1), 0.25, 0.125]} for i, _ in enumerate(reqs)
+                ]
+            }).encode())
+            return
+
+        # Save the last request for test assertions
         with open("/tmp/gemini-last-request.json", "w") as f:
             json.dump(body, f)
 
@@ -40,13 +52,13 @@ class H(BaseHTTPRequestHandler):
         )
         reply = f"[sys:{sys_txt}] echo:{last_text} (key:{key[-4:]})"
 
-        # Режим tool call: юзер просит "call tool"
+        # Tool call mode: the user asks to "call tool"
         if "call tool" in last_text:
             if ":streamGenerateContent" in self.path:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
-                thought = {"candidates": [{"content": {"role": "model", "parts": [{"text": "думаю...", "thought": True}]}}]}
+                thought = {"candidates": [{"content": {"role": "model", "parts": [{"text": "thinking...", "thought": True}]}}]}
                 self.wfile.write(f"data: {json.dumps(thought)}\n\n".encode())
                 call = {"candidates": [{"content": {"role": "model", "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Moscow"}}, "thoughtSignature": "sig-abc-123"}]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 4, "totalTokenCount": 9}}
                 self.wfile.write(f"data: {json.dumps(call)}\n\n".encode())
@@ -58,7 +70,7 @@ class H(BaseHTTPRequestHandler):
             resp = {
                 "candidates": [{
                     "content": {"role": "model", "parts": [
-                        {"text": "думаю о погоде", "thought": True},
+                        {"text": "thinking about the weather", "thought": True},
                         {"functionCall": {"name": "get_weather", "args": {"city": "Moscow"}}, "thoughtSignature": "sig-abc-123"},
                     ]},
                     "finishReason": "STOP",
