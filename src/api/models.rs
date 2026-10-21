@@ -4,10 +4,11 @@ use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use super::persist::persist_disabled_models;
+use super::{ApiResult, ok_json};
 use crate::proxy::AppState;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -93,7 +94,7 @@ fn clear_model(dm: &mut HashSet<String>, model: &str) {
     }
 }
 
-pub async fn models_list(State(state): State<Arc<AppState>>) -> Response {
+pub async fn models_list(State(state): State<Arc<AppState>>) -> ApiResult {
     let router = state.router.load();
     let disabled = dm_read(&state).clone();
     let mut list = Vec::new();
@@ -121,10 +122,10 @@ pub async fn models_list(State(state): State<Arc<AppState>>) -> Response {
         });
     }
 
-    Json(list).into_response()
+    ok_json(list)
 }
 
-pub async fn models_refresh(State(state): State<Arc<AppState>>) -> Response {
+pub async fn models_refresh(State(state): State<Arc<AppState>>) -> ApiResult {
     refresh_all_providers(&state).await;
     state.invalidate_catalog();
     state.events.emit_simple(
@@ -147,7 +148,7 @@ pub async fn refresh_all_providers(state: &Arc<AppState>) {
 pub async fn model_enable(
     State(state): State<Arc<AppState>>,
     Json(a): Json<ModelAction>,
-) -> Response {
+) -> ApiResult {
     let model = normalize(&a).to_string();
     clear_model(&mut dm_write(&state), &model);
     save_disabled(&state).await;
@@ -159,13 +160,13 @@ pub async fn model_enable(
         format!("model '{model}' enabled"),
     );
 
-    Json(serde_json::json!({ "model": model, "enabled": true })).into_response()
+    ok_json(serde_json::json!({ "model": model, "enabled": true }))
 }
 
 pub async fn model_disable(
     State(state): State<Arc<AppState>>,
     Json(a): Json<ModelAction>,
-) -> Response {
+) -> ApiResult {
     let model = normalize(&a).to_string();
     dm_write(&state).insert(model.clone());
     save_disabled(&state).await;
@@ -177,13 +178,13 @@ pub async fn model_disable(
         format!("model '{model}' disabled"),
     );
 
-    Json(serde_json::json!({ "model": model, "enabled": false })).into_response()
+    ok_json(serde_json::json!({ "model": model, "enabled": false }))
 }
 
 pub async fn model_toggle(
     State(state): State<Arc<AppState>>,
     Json(a): Json<ModelAction>,
-) -> Response {
+) -> ApiResult {
     let model = normalize(&a).to_string();
     let new_enabled = {
         let mut dm = dm_write(&state);
@@ -210,19 +211,19 @@ pub async fn model_toggle(
         ),
     );
 
-    Json(serde_json::json!({ "model": model, "enabled": new_enabled })).into_response()
+    ok_json(serde_json::json!({ "model": model, "enabled": new_enabled }))
 }
 
-pub async fn models_enable_all(State(state): State<Arc<AppState>>) -> Response {
+pub async fn models_enable_all(State(state): State<Arc<AppState>>) -> ApiResult {
     dm_write(&state).clear();
     save_disabled(&state).await;
     state
         .events
         .emit_simple("models", "", "backoff", "all models enabled".into());
-    StatusCode::OK.into_response()
+    Ok(StatusCode::OK.into_response())
 }
 
-pub async fn models_disable_all(State(state): State<Arc<AppState>>) -> Response {
+pub async fn models_disable_all(State(state): State<Arc<AppState>>) -> ApiResult {
     let router = state.router.load();
     let mut all_ids = Vec::new();
     for p in &router.providers {
@@ -245,5 +246,5 @@ pub async fn models_disable_all(State(state): State<Arc<AppState>>) -> Response 
     state
         .events
         .emit_simple("models", "", "dead", "all models disabled".into());
-    StatusCode::OK.into_response()
+    Ok(StatusCode::OK.into_response())
 }

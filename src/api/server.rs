@@ -12,11 +12,10 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use super::persist::write_validated;
+use super::{ApiError, ApiResult, ok_json};
 use crate::proxy::AppState;
 
 #[derive(Serialize)]
@@ -111,21 +110,21 @@ const RESTART_ONLY: &[&str] = &[
     "log_format",
 ];
 
-pub async fn get_server(State(state): State<Arc<AppState>>) -> Response {
+pub async fn get_server(State(state): State<Arc<AppState>>) -> ApiResult {
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+            return Err(ApiError::not_found(format!("cannot read config: {e}")));
         }
     };
     let cfg: crate::config::Config = match toml::from_str(&raw) {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response();
+            return Err(ApiError::bad_request(format!("config parse error: {e}")));
         }
     };
     let s = &cfg.server;
-    Json(ServerDto {
+    ok_json(ServerDto {
         listen: s.listen.clone(),
         max_retries: s.max_retries,
         attempt_timeout_secs: s.attempt_timeout_secs,
@@ -147,80 +146,65 @@ pub async fn get_server(State(state): State<Arc<AppState>>) -> Response {
         auth_fail_window_secs: s.auth_fail_window_secs,
         tuning: cfg.tuning.clone(),
     })
-    .into_response()
 }
 
 pub async fn update_server(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ServerUpdate>,
-) -> Response {
+) -> ApiResult {
     // Ranges, not just types: a 1s timeout or a 1MB body limit would be accepted by
     // serde but break the gateway in ways that are hard to diagnose later.
     if let Some(n) = body.max_retries
         && !(1..=32).contains(&n)
     {
-        return (
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::bad_request(
             "max_retries must be between 1 and 32",
-        )
-            .into_response();
+        ));
     }
     if let Some(t) = body.attempt_timeout_secs
         && !(1..=3600).contains(&t)
     {
-        return (
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::bad_request(
             "attempt_timeout_secs must be between 1 and 3600",
-        )
-            .into_response();
+        ));
     }
     if let Some(b) = body.max_body_bytes
         && !(1024..=256 * 1024 * 1024).contains(&b)
     {
-        return (
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::bad_request(
             "max_body_bytes must be between 1024 and 268435456",
-        )
-            .into_response();
+        ));
     }
     if let Some(h) = body.events_history
         && h > 100_000
     {
-        return (StatusCode::BAD_REQUEST, "events_history must be <= 100000").into_response();
+        return Err(ApiError::bad_request("events_history must be <= 100000"));
     }
     if let Some(h) = body.requests_history
         && h > 100_000
     {
-        return (
-            StatusCode::BAD_REQUEST,
-            "requests_history must be <= 100000",
-        )
-            .into_response();
+        return Err(ApiError::bad_request("requests_history must be <= 100000"));
     }
     if let Some(r) = body.models_refresh_secs
         && r > 86_400
     {
-        return (
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::bad_request(
             "models_refresh_secs must be <= 86400",
-        )
-            .into_response();
+        ));
     }
     if let Some(l) = body.listen.as_deref()
         && (l.trim().is_empty() || !l.contains(':'))
     {
-        return (StatusCode::BAD_REQUEST, "listen must look like host:port").into_response();
+        return Err(ApiError::bad_request("listen must look like host:port"));
     }
     for (name, secret) in [("api_key", &body.api_key), ("admin_key", &body.admin_key)] {
         if let Some(s) = secret
             && !s.is_empty()
             && s.trim().len() < 8
         {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("{name} must be at least 8 characters (or empty to disable auth)"),
-            )
-                .into_response();
+            return Err(ApiError::bad_request(format!(
+                "{name} must be at least 8 characters (or empty to disable auth)"
+            )));
         }
     }
 
@@ -228,13 +212,13 @@ pub async fn update_server(
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+            return Err(ApiError::not_found(format!("cannot read config: {e}")));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response();
+            return Err(ApiError::bad_request(format!("config parse error: {e}")));
         }
     };
     // Current values: the dashboard posts every field, so "changed" must mean
@@ -242,7 +226,7 @@ pub async fn update_server(
     let current: crate::config::Config = match toml::from_str(&raw) {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response();
+            return Err(ApiError::bad_request(format!("config parse error: {e}")));
         }
     };
     let cur = &current.server;
@@ -252,7 +236,7 @@ pub async fn update_server(
         doc["server"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
     let Some(server) = doc["server"].as_table_mut() else {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "'server' is not a table").into_response();
+        return Err(ApiError::unprocessable("'server' is not a table"));
     };
 
     let mut changed: Vec<&'static str> = Vec::new();
@@ -314,8 +298,7 @@ pub async fn update_server(
         let v = v.trim();
         if v != cur.log_format {
             if !matches!(v, "text" | "json") {
-                return (StatusCode::BAD_REQUEST, "log_format must be text or json")
-                    .into_response();
+                return Err(ApiError::bad_request("log_format must be text or json"));
             }
             server["log_format"] = toml_edit::value(v);
             changed.push("log_format");
@@ -325,11 +308,9 @@ pub async fn update_server(
         && v != cur.client_key_max_concurrent
     {
         if v > 10_000 {
-            return (
-                StatusCode::BAD_REQUEST,
+            return Err(ApiError::bad_request(
                 "client_key_max_concurrent must be <= 10000",
-            )
-                .into_response();
+            ));
         }
         server["client_key_max_concurrent"] = toml_edit::value(v as i64);
         changed.push("client_key_max_concurrent");
@@ -338,7 +319,7 @@ pub async fn update_server(
         && v != cur.auth_fail_burst
     {
         if !(1..=10_000).contains(&v) {
-            return (StatusCode::BAD_REQUEST, "auth_fail_burst must be 1..10000").into_response();
+            return Err(ApiError::bad_request("auth_fail_burst must be 1..10000"));
         }
         server["auth_fail_burst"] = toml_edit::value(v as i64);
         changed.push("auth_fail_burst");
@@ -347,11 +328,9 @@ pub async fn update_server(
         && v != cur.auth_fail_window_secs
     {
         if !(1..=3600).contains(&v) {
-            return (
-                StatusCode::BAD_REQUEST,
+            return Err(ApiError::bad_request(
                 "auth_fail_window_secs must be 1..3600",
-            )
-                .into_response();
+            ));
         }
         server["auth_fail_window_secs"] = toml_edit::value(v as i64);
         changed.push("auth_fail_window_secs");
@@ -387,11 +366,9 @@ pub async fn update_server(
                 server.remove("public_url");
                 changed.push("public_url");
             } else if !v.starts_with("http://") && !v.starts_with("https://") {
-                return (
-                    StatusCode::BAD_REQUEST,
+                return Err(ApiError::bad_request(
                     "public_url must start with http:// or https://",
-                )
-                    .into_response();
+                ));
             } else {
                 server["public_url"] = toml_edit::value(v);
                 changed.push("public_url");
@@ -491,12 +468,12 @@ pub async fn update_server(
     }
 
     if changed.is_empty() {
-        return Json(serde_json::json!({"changed": [], "restart_required": []})).into_response();
+        return ok_json(serde_json::json!({"changed": [], "restart_required": []}));
     }
     // The file is validated as a whole by write_validated(), which also runs the
     // Tuning range checks — an out-of-range number never reaches the disk.
     if let Err(resp) = write_validated(&state, &doc).await {
-        return *resp;
+        return Ok(*resp);
     }
     state.events.emit_simple(
         "config",
@@ -509,7 +486,7 @@ pub async fn update_server(
         .copied()
         .filter(|c| RESTART_ONLY.contains(c))
         .collect();
-    Json(serde_json::json!({"changed": changed, "restart_required": restart})).into_response()
+    ok_json(serde_json::json!({"changed": changed, "restart_required": restart}))
 }
 
 #[cfg(test)]

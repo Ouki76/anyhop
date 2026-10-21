@@ -3,10 +3,11 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
 use serde::Deserialize;
 
 use super::persist::write_validated;
+use super::{ApiError, ApiResult, ok_json};
 use crate::config::ProviderKind;
 use crate::proxy::AppState;
 
@@ -24,17 +25,15 @@ pub struct AddProvider {
 pub async fn provider_add(
     State(state): State<Arc<AppState>>,
     Json(body): Json<AddProvider>,
-) -> Response {
+) -> ApiResult {
     let default_base = match body.kind.as_str() {
         "gemini" => Some("https://generativelanguage.googleapis.com/v1beta"),
         "anthropic" => Some("https://api.anthropic.com"),
         "openai_compat" => None,
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
+            return Err(ApiError::bad_request(
                 "kind must be gemini|anthropic|openai_compat",
-            )
-                .into_response();
+            ));
         }
     };
     if let Some(n) = body
@@ -42,9 +41,9 @@ pub async fn provider_add(
         .as_deref()
         .map(str::trim)
         .filter(|n| !n.is_empty())
-        && let Err((code, msg)) = super::validate_name("provider", n)
+        && let Err((_, msg)) = super::validate_name("provider", n)
     {
-        return (code, msg).into_response();
+        return Err(ApiError::bad_request(msg));
     }
     if let Some(u) = body
         .base_url
@@ -53,16 +52,14 @@ pub async fn provider_add(
         .filter(|s| !s.is_empty())
         && (!u.starts_with("http://") && !u.starts_with("https://") || u.len() > 2048)
     {
-        return (
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::bad_request(
             "base_url must be an http(s) URL of at most 2048 characters",
-        )
-            .into_response();
+        ));
     }
     if let Some(k) = body.key.as_deref()
-        && let Err((code, msg)) = super::validate_secret_len("key", k)
+        && let Err((_, msg)) = super::validate_secret_len("key", k)
     {
-        return (code, msg).into_response();
+        return Err(ApiError::bad_request(msg));
     }
     let base_url = body
         .base_url
@@ -72,11 +69,9 @@ pub async fn provider_add(
     let base_url = match base_url.or(default_base) {
         Some(b) => b.to_string(),
         None => {
-            return (
-                StatusCode::BAD_REQUEST,
+            return Err(ApiError::bad_request(
                 "base_url is required for openai_compat",
-            )
-                .into_response();
+            ));
         }
     };
     let key = body.key.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -87,24 +82,22 @@ pub async fn provider_add(
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+            return Err(ApiError::not_found(format!("cannot read config: {e}")));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response();
+            return Err(ApiError::bad_request(format!("config parse error: {e}")));
         }
     };
     if !doc.contains_key("providers") {
         doc["providers"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
     }
     let Some(arr) = doc["providers"].as_array_of_tables_mut() else {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
+        return Err(ApiError::unprocessable(
             "'providers' is not an array of tables in the config file",
-        )
-            .into_response();
+        ));
     };
 
     // Unique name: kind, kind-2, kind-3…
@@ -138,24 +131,18 @@ pub async fn provider_add(
     arr.push(t);
 
     if let Err(e) = crate::config::write_atomic(&state.config_path, &doc.to_string()) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("cannot write config: {e}"),
-        )
-            .into_response();
+        return Err(ApiError::internal(format!("cannot write config: {e}")));
     }
     match crate::reload_config(&state) {
         Ok(_) => {
             state
                 .events
                 .emit_simple("config", "", "backoff", format!("provider '{name}' added"));
-            Json(serde_json::json!({"name": name})).into_response()
+            ok_json(serde_json::json!({"name": name}))
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            format!("saved but reload failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => Err(ApiError::bad_request(format!(
+            "saved but reload failed: {e}"
+        ))),
     }
 }
 
@@ -183,78 +170,68 @@ pub struct UpdateProvider {
 pub async fn provider_update(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateProvider>,
-) -> Response {
+) -> ApiResult {
     let name = body.name.trim();
     if name.is_empty() {
-        return (StatusCode::BAD_REQUEST, "name is required").into_response();
+        return Err(ApiError::bad_request("name is required"));
     }
     if let Some(s) = &body.strategy
         && !matches!(s.as_str(), "round_robin" | "least_used" | "fill_first")
     {
-        return (
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::bad_request(
             "strategy must be round_robin | least_used | fill_first",
-        )
-            .into_response();
+        ));
     }
     if let Some(pct) = body.drain_below_pct
         && pct > 100
     {
-        return (StatusCode::BAD_REQUEST, "drain_below_pct must be <= 100").into_response();
+        return Err(ApiError::bad_request("drain_below_pct must be <= 100"));
     }
     if let Some(t) = body.timeout_secs
         && !(1..=3600).contains(&t)
     {
-        return (
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::bad_request(
             "timeout_secs must be between 1 and 3600",
-        )
-            .into_response();
+        ));
     }
     if let Some(r) = body.max_retries
         && !(1..=32).contains(&r)
     {
-        return (
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::bad_request(
             "max_retries must be between 1 and 32",
-        )
-            .into_response();
+        ));
     }
 
     let _guard = state.config_lock.lock().await;
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+            return Err(ApiError::not_found(format!("cannot read config: {e}")));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response();
+            return Err(ApiError::bad_request(format!("config parse error: {e}")));
         }
     };
     let Some(arr) = doc
         .get_mut("providers")
         .and_then(|i| i.as_array_of_tables_mut())
     else {
-        return (StatusCode::NOT_FOUND, "no providers in the config").into_response();
+        return Err(ApiError::not_found("no providers in the config"));
     };
     let Some(p) = arr
         .iter_mut()
         .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))
     else {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("provider '{name}' not found"),
-        )
-            .into_response();
+        return Err(ApiError::not_found(format!("provider '{name}' not found")));
     };
 
     if let Some(b) = body.base_url.as_deref() {
         let b = b.trim();
         if b.is_empty() {
-            return (StatusCode::BAD_REQUEST, "base_url must not be empty").into_response();
+            return Err(ApiError::bad_request("base_url must not be empty"));
         }
         p["base_url"] = toml_edit::value(b);
     }
@@ -286,7 +263,7 @@ pub async fn provider_update(
     }
 
     if let Err(resp) = write_validated(&state, &doc).await {
-        return *resp;
+        return Ok(*resp);
     }
     state.events.emit_simple(
         "config",
@@ -294,7 +271,7 @@ pub async fn provider_update(
         "backoff",
         format!("provider '{name}' updated"),
     );
-    StatusCode::OK.into_response()
+    Ok(StatusCode::OK.into_response())
 }
 
 #[derive(Deserialize)]
@@ -306,40 +283,36 @@ pub struct DeleteProvider {
 pub async fn provider_delete(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DeleteProvider>,
-) -> Response {
+) -> ApiResult {
     let name = body.name.trim();
     if name.is_empty() {
-        return (StatusCode::BAD_REQUEST, "name is required").into_response();
+        return Err(ApiError::bad_request("name is required"));
     }
 
     let _guard = state.config_lock.lock().await;
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+            return Err(ApiError::not_found(format!("cannot read config: {e}")));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response();
+            return Err(ApiError::bad_request(format!("config parse error: {e}")));
         }
     };
     let Some(arr) = doc
         .get_mut("providers")
         .and_then(|i| i.as_array_of_tables_mut())
     else {
-        return (StatusCode::NOT_FOUND, "no providers in the config").into_response();
+        return Err(ApiError::not_found("no providers in the config"));
     };
     let Some(idx) = arr
         .iter()
         .position(|p| p.get("name").and_then(|v| v.as_str()) == Some(name))
     else {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("provider '{name}' not found"),
-        )
-            .into_response();
+        return Err(ApiError::not_found(format!("provider '{name}' not found")));
     };
     arr.remove(idx);
 
@@ -376,7 +349,7 @@ pub async fn provider_delete(
     }
 
     if let Err(resp) = write_validated(&state, &doc).await {
-        return *resp;
+        return Ok(*resp);
     }
     let detail = if dropped.is_empty() {
         format!("provider '{name}' deleted")
@@ -387,7 +360,7 @@ pub async fn provider_delete(
         )
     };
     state.events.emit_simple("config", "", "backoff", detail);
-    StatusCode::OK.into_response()
+    Ok(StatusCode::OK.into_response())
 }
 
 // ---------- key management ----------
@@ -404,23 +377,26 @@ pub struct AddKey {
     secret: String,
 }
 
-fn set_key(state: &AppState, action: &KeyAction, enabled: bool) -> Response {
+fn set_key(state: &AppState, action: &KeyAction, enabled: bool) -> ApiResult {
     let router = state.router.load();
     let Some(p) = router.providers.iter().find(|p| p.name == action.provider) else {
-        return (StatusCode::NOT_FOUND, "unknown provider").into_response();
+        return Err(ApiError::not_found("unknown provider"));
     };
     if p.pool.set_enabled(&action.id, enabled) {
-        StatusCode::OK.into_response()
+        Ok(StatusCode::OK.into_response())
     } else {
-        (StatusCode::NOT_FOUND, "unknown key").into_response()
+        Err(ApiError::not_found("unknown key"))
     }
 }
 
-pub async fn key_enable(State(state): State<Arc<AppState>>, Json(a): Json<KeyAction>) -> Response {
+pub async fn key_enable(State(state): State<Arc<AppState>>, Json(a): Json<KeyAction>) -> ApiResult {
     set_key(&state, &a, true)
 }
 
-pub async fn key_disable(State(state): State<Arc<AppState>>, Json(a): Json<KeyAction>) -> Response {
+pub async fn key_disable(
+    State(state): State<Arc<AppState>>,
+    Json(a): Json<KeyAction>,
+) -> ApiResult {
     set_key(&state, &a, false)
 }
 
@@ -429,30 +405,26 @@ pub async fn key_disable(State(state): State<Arc<AppState>>, Json(a): Json<KeyAc
 /// Removes it from the live pool, from the TOML `keys` array (or the OAuth
 /// `accounts` entry) and from the runtime-key list in the state file, then
 /// reloads so the next request cannot pick it up.
-pub async fn key_delete(State(state): State<Arc<AppState>>, Json(a): Json<KeyAction>) -> Response {
+pub async fn key_delete(State(state): State<Arc<AppState>>, Json(a): Json<KeyAction>) -> ApiResult {
     let router = state.router.load();
     let Some(p) = router.providers.iter().find(|p| p.name == a.provider) else {
-        return (StatusCode::NOT_FOUND, "unknown provider").into_response();
+        return Err(ApiError::not_found("unknown provider"));
     };
     let Some(key) = p.pool.snapshot().into_iter().find(|k| k.id == a.id) else {
-        return (StatusCode::NOT_FOUND, "unknown key").into_response();
+        return Err(ApiError::not_found("unknown key"));
     };
     // The snapshot only exposes a hash; resolve the secret through the pool.
     let Some(secret) = p.pool.secret_by_id(&a.id) else {
-        return (StatusCode::NOT_FOUND, "unknown key").into_response();
+        return Err(ApiError::not_found("unknown key"));
     };
     let is_oauth = matches!(p.kind, ProviderKind::Antigravity | ProviderKind::Codex);
     // Removing the last credential would leave the provider unusable (and the
     // config invalid); deleting the provider is the honest operation there.
     if p.pool.len() <= 1 {
-        return (
-            StatusCode::CONFLICT,
-            format!(
-                "'{}' has only one credential left — delete the provider instead of its last key",
-                p.name
-            ),
-        )
-            .into_response();
+        return Err(ApiError::conflict(format!(
+            "'{}' has only one credential left — delete the provider instead of its last key",
+            p.name
+        )));
     }
     let provider_name = p.name.clone();
     let kind = p.kind;
@@ -465,27 +437,26 @@ pub async fn key_delete(State(state): State<Arc<AppState>>, Json(a): Json<KeyAct
         let raw = match std::fs::read_to_string(&state.config_path) {
             Ok(r) => r,
             Err(e) => {
-                return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+                return Err(ApiError::not_found(format!("cannot read config: {e}")));
             }
         };
         let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
             Ok(d) => d,
             Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("config parse error: {e}"))
-                    .into_response();
+                return Err(ApiError::bad_request(format!("config parse error: {e}")));
             }
         };
         let Some(arr) = doc
             .get_mut("providers")
             .and_then(|i| i.as_array_of_tables_mut())
         else {
-            return (StatusCode::NOT_FOUND, "no providers in the config").into_response();
+            return Err(ApiError::not_found("no providers in the config"));
         };
         let Some(pt) = arr
             .iter_mut()
             .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(provider_name.as_str()))
         else {
-            return (StatusCode::NOT_FOUND, "unknown provider").into_response();
+            return Err(ApiError::not_found("unknown provider"));
         };
         let mut removed = false;
         if let Some(accounts) = pt
@@ -513,10 +484,10 @@ pub async fn key_delete(State(state): State<Arc<AppState>>, Json(a): Json<KeyAct
             *accounts = keep;
         }
         if !removed {
-            return (StatusCode::CONFLICT, "account not found in the config file").into_response();
+            return Err(ApiError::conflict("account not found in the config file"));
         }
         if let Err(resp) = write_validated(&state, &doc).await {
-            return *resp;
+            return Ok(*resp);
         }
         state.events.emit_simple(
             "config",
@@ -524,20 +495,20 @@ pub async fn key_delete(State(state): State<Arc<AppState>>, Json(a): Json<KeyAct
             "backoff",
             format!("account removed from provider '{provider_name}'"),
         );
-        return StatusCode::OK.into_response();
+        return Ok(StatusCode::OK.into_response());
     }
 
     let _guard = state.config_lock.lock().await;
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+            return Err(ApiError::not_found(format!("cannot read config: {e}")));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response();
+            return Err(ApiError::bad_request(format!("config parse error: {e}")));
         }
     };
     // Rebuild the provider's `keys` array as the complete remaining set: the file
@@ -579,7 +550,7 @@ pub async fn key_delete(State(state): State<Arc<AppState>>, Json(a): Json<KeyAct
     }
 
     if let Err(resp) = write_validated(&state, &doc).await {
-        return *resp;
+        return Ok(*resp);
     }
     // The runtime list is now redundant (its keys are in the file).
     if let Some(s) = &state.storage {
@@ -592,31 +563,29 @@ pub async fn key_delete(State(state): State<Arc<AppState>>, Json(a): Json<KeyAct
         "backoff",
         format!("key removed from provider '{provider_name}'"),
     );
-    StatusCode::OK.into_response()
+    Ok(StatusCode::OK.into_response())
 }
 
-pub async fn key_add(State(state): State<Arc<AppState>>, Json(a): Json<AddKey>) -> Response {
+pub async fn key_add(State(state): State<Arc<AppState>>, Json(a): Json<AddKey>) -> ApiResult {
     let secret = a.secret.trim();
     if secret.len() < 4 {
-        return (StatusCode::BAD_REQUEST, "key too short").into_response();
+        return Err(ApiError::bad_request("key too short"));
     }
-    if let Err((code, msg)) = super::validate_secret_len("key", secret) {
-        return (code, msg).into_response();
+    if let Err((_, msg)) = super::validate_secret_len("key", secret) {
+        return Err(ApiError::bad_request(msg));
     }
     let router = state.router.load();
     let Some(p) = router.providers.iter().find(|p| p.name == a.provider) else {
-        return (StatusCode::NOT_FOUND, "unknown provider").into_response();
+        return Err(ApiError::not_found("unknown provider"));
     };
     if matches!(p.kind, ProviderKind::Antigravity | ProviderKind::Codex) {
-        return (
-            StatusCode::BAD_REQUEST,
+        return Err(ApiError::bad_request(
             "OAuth accounts are added via `anyhop auth …`",
-        )
-            .into_response();
+        ));
     }
     if p.pool.contains(secret) {
         // A duplicate secret would be double-counted in rotation and stats.
-        return (StatusCode::CONFLICT, "key already exists").into_response();
+        return Err(ApiError::conflict("key already exists"));
     }
     let provider_name = p.name.clone();
     drop(router);
@@ -629,38 +598,38 @@ pub async fn key_add(State(state): State<Arc<AppState>>, Json(a): Json<AddKey>) 
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+            return Err(ApiError::not_found(format!("cannot read config: {e}")));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response();
+            return Err(ApiError::bad_request(format!("config parse error: {e}")));
         }
     };
     let Some(arr) = doc
         .get_mut("providers")
         .and_then(|i| i.as_array_of_tables_mut())
     else {
-        return (StatusCode::NOT_FOUND, "no providers in the config").into_response();
+        return Err(ApiError::not_found("no providers in the config"));
     };
     let Some(pt) = arr
         .iter_mut()
         .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(provider_name.as_str()))
     else {
-        return (StatusCode::NOT_FOUND, "unknown provider").into_response();
+        return Err(ApiError::not_found("unknown provider"));
     };
     if !pt.contains_key("keys") {
         pt["keys"] = toml_edit::value(toml_edit::Array::new());
     }
     let Some(keys) = pt.get_mut("keys").and_then(|i| i.as_array_mut()) else {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "'keys' is not an array").into_response();
+        return Err(ApiError::unprocessable("'keys' is not an array"));
     };
     if !keys.iter().any(|v| v.as_str() == Some(secret)) {
         keys.push(secret);
     }
     if let Err(resp) = write_validated(&state, &doc).await {
-        return *resp;
+        return Ok(*resp);
     }
     state.events.emit_simple(
         "config",
@@ -668,5 +637,5 @@ pub async fn key_add(State(state): State<Arc<AppState>>, Json(a): Json<AddKey>) 
         "backoff",
         format!("key added to provider '{provider_name}'"),
     );
-    StatusCode::OK.into_response()
+    Ok(StatusCode::OK.into_response())
 }

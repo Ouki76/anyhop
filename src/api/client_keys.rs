@@ -4,10 +4,11 @@ use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use super::persist::persist_client_keys;
+use super::{ApiError, ApiResult, ok_json};
 use crate::proxy::AppState;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -117,42 +118,41 @@ fn to_dto(rt: &crate::proxy::ClientKeyRuntime) -> ClientKeyDto {
     }
 }
 
-pub async fn client_keys_list(State(state): State<Arc<AppState>>) -> Response {
+pub async fn client_keys_list(State(state): State<Arc<AppState>>) -> ApiResult {
     let map = ck_read(&state);
     let mut list: Vec<ClientKeyDto> = map.values().map(|r| to_dto(r)).collect();
     list.sort_by_key(|a| std::cmp::Reverse(a.created_at));
-    Json(list).into_response()
+    ok_json(list)
 }
 
 pub async fn client_key_add(
     State(state): State<Arc<AppState>>,
     Json(body): Json<AddClientKey>,
-) -> Response {
+) -> ApiResult {
     let key_str = match body.key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => s.to_string(),
         None => match generate_client_key() {
             Some(k) => k,
             None => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "cannot generate a key")
-                    .into_response();
+                return Err(ApiError::internal("cannot generate a key"));
             }
         },
     };
 
-    if let Err((code, msg)) = super::validate_secret_len("client key", &key_str) {
-        return (code, msg).into_response();
+    if let Err((_, msg)) = super::validate_secret_len("client key", &key_str) {
+        return Err(ApiError::bad_request(msg));
     }
     if let Some(n) = body
         .name
         .as_deref()
         .map(str::trim)
         .filter(|n| !n.is_empty())
-        && let Err((code, msg)) = super::validate_name("client key", n)
+        && let Err((_, msg)) = super::validate_name("client key", n)
     {
-        return (code, msg).into_response();
+        return Err(ApiError::bad_request(msg));
     }
     if key_str.len() < 4 {
-        return (StatusCode::BAD_REQUEST, "key must be at least 4 characters").into_response();
+        return Err(ApiError::bad_request("key must be at least 4 characters"));
     }
 
     let now = std::time::SystemTime::now()
@@ -183,7 +183,7 @@ pub async fn client_key_add(
     {
         let mut map = ck_write(&state);
         if map.contains_key(&key_str) {
-            return (StatusCode::CONFLICT, "API key already exists").into_response();
+            return Err(ApiError::conflict("API key already exists"));
         }
         map.insert(key_str.clone(), runtime.clone());
     }
@@ -199,16 +199,16 @@ pub async fn client_key_add(
         ),
     );
 
-    Json(to_dto(&runtime)).into_response()
+    ok_json(to_dto(&runtime))
 }
 
 pub async fn client_key_delete(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DeleteClientKey>,
-) -> Response {
+) -> ApiResult {
     let removed = ck_write(&state).remove(&body.key);
     let Some(k) = removed else {
-        return (StatusCode::NOT_FOUND, "API key not found").into_response();
+        return Err(ApiError::not_found("API key not found"));
     };
     save_keys(&state).await;
 
@@ -221,17 +221,17 @@ pub async fn client_key_delete(
             k.cfg.name.as_deref().unwrap_or(&k.cfg.key)
         ),
     );
-    StatusCode::OK.into_response()
+    Ok(StatusCode::OK.into_response())
 }
 
 pub async fn client_key_update(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateClientKey>,
-) -> Response {
+) -> ApiResult {
     let updated = {
         let mut map = ck_write(&state);
         let Some(prev) = map.get(&body.key).cloned() else {
-            return (StatusCode::NOT_FOUND, "API key not found").into_response();
+            return Err(ApiError::not_found("API key not found"));
         };
         let mut cfg = prev.cfg.clone();
         if let Some(name) = body.name
@@ -253,5 +253,5 @@ pub async fn client_key_update(
     };
 
     save_keys(&state).await;
-    Json(to_dto(&updated)).into_response()
+    ok_json(to_dto(&updated))
 }

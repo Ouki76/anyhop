@@ -18,6 +18,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use super::persist::write_validated;
+use super::{ApiError, ApiResult, ok_json};
 use crate::proxy::AppState;
 
 #[derive(Serialize, Deserialize)]
@@ -71,7 +72,7 @@ fn clean_chain(chain: &[String]) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-pub async fn combos(State(state): State<Arc<AppState>>) -> Response {
+pub async fn combos(State(state): State<Arc<AppState>>) -> ApiResult {
     let router = state.router.load();
     let list: Vec<ComboDto> = router
         .combos
@@ -81,7 +82,7 @@ pub async fn combos(State(state): State<Arc<AppState>>) -> Response {
             chain: c.chain.clone(),
         })
         .collect();
-    Json(list).into_response()
+    ok_json(list)
 }
 
 fn toml_combo(name: &str, chain: &[String]) -> toml_edit::Table {
@@ -98,48 +99,42 @@ fn toml_combo(name: &str, chain: &[String]) -> toml_edit::Table {
 pub async fn combo_add(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ComboBody>,
-) -> Response {
+) -> ApiResult {
     let name = match clean_name(&body.name) {
         Ok(n) => n,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => return Err(ApiError::bad_request(e)),
     };
     let chain = match clean_chain(&body.chain) {
         Ok(c) => c,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => return Err(ApiError::bad_request(e)),
     };
 
     let _guard = state.config_lock.lock().await;
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+            return Err(ApiError::not_found(format!("cannot read config: {e}")));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response();
+            return Err(ApiError::bad_request(format!("config parse error: {e}")));
         }
     };
     if !doc.contains_key("combos") {
         doc["combos"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
     }
     let Some(arr) = doc["combos"].as_array_of_tables_mut() else {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
+        return Err(ApiError::unprocessable(
             "'combos' is not an array of tables in the config file",
-        )
-            .into_response();
+        ));
     };
     if arr
         .iter()
         .any(|c| c.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
     {
-        return (
-            StatusCode::CONFLICT,
-            format!("combo '{name}' already exists"),
-        )
-            .into_response();
+        return Err(ApiError::conflict(format!("combo '{name}' already exists")));
     }
     arr.push(toml_combo(&name, &chain));
     finish(
@@ -154,40 +149,40 @@ pub async fn combo_add(
 pub async fn combo_update(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ComboBody>,
-) -> Response {
+) -> ApiResult {
     let name = match clean_name(&body.name) {
         Ok(n) => n,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => return Err(ApiError::bad_request(e)),
     };
     let chain = match clean_chain(&body.chain) {
         Ok(c) => c,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => return Err(ApiError::bad_request(e)),
     };
 
     let _guard = state.config_lock.lock().await;
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+            return Err(ApiError::not_found(format!("cannot read config: {e}")));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response();
+            return Err(ApiError::bad_request(format!("config parse error: {e}")));
         }
     };
     let Some(arr) = doc
         .get_mut("combos")
         .and_then(|i| i.as_array_of_tables_mut())
     else {
-        return (StatusCode::NOT_FOUND, "no combos in the config").into_response();
+        return Err(ApiError::not_found("no combos in the config"));
     };
     let Some(existing) = arr
         .iter_mut()
         .find(|c| c.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
     else {
-        return (StatusCode::NOT_FOUND, format!("combo '{name}' not found")).into_response();
+        return Err(ApiError::not_found(format!("combo '{name}' not found")));
     };
     let mut arr_val = toml_edit::Array::new();
     for c in &chain {
@@ -206,36 +201,36 @@ pub async fn combo_update(
 pub async fn combo_delete(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ComboBody>,
-) -> Response {
+) -> ApiResult {
     let name = match clean_name(&body.name) {
         Ok(n) => n,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => return Err(ApiError::bad_request(e)),
     };
 
     let _guard = state.config_lock.lock().await;
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+            return Err(ApiError::not_found(format!("cannot read config: {e}")));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response();
+            return Err(ApiError::bad_request(format!("config parse error: {e}")));
         }
     };
     let Some(arr) = doc
         .get_mut("combos")
         .and_then(|i| i.as_array_of_tables_mut())
     else {
-        return (StatusCode::NOT_FOUND, "no combos in the config").into_response();
+        return Err(ApiError::not_found("no combos in the config"));
     };
     let Some(idx) = arr
         .iter()
         .position(|c| c.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
     else {
-        return (StatusCode::NOT_FOUND, format!("combo '{name}' not found")).into_response();
+        return Err(ApiError::not_found(format!("combo '{name}' not found")));
     };
     arr.remove(idx);
     finish(
@@ -248,17 +243,20 @@ pub async fn combo_delete(
 }
 
 /// Validate the edited document, write it, reload, and pass through `ok`.
+///
+/// `write_validated` still reports its rejection as a ready-made `Response`, so
+/// that one is passed through unchanged (`Ok(resp)`) rather than rebuilt.
 async fn finish(
     state: &Arc<AppState>,
     doc: toml_edit::DocumentMut,
     event: String,
     ok: Response,
-) -> Response {
+) -> ApiResult {
     if let Err(resp) = write_validated(state, &doc).await {
-        return *resp;
+        return Ok(*resp);
     }
     state.events.emit_simple("config", "", "backoff", event);
-    ok
+    Ok(ok)
 }
 
 #[cfg(test)]

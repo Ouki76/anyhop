@@ -24,6 +24,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
+use super::{ApiError, ApiResult, ok_json};
 use crate::proxy::AppState;
 
 #[derive(Clone, serde::Serialize)]
@@ -149,10 +150,10 @@ where
 pub async fn auth_start(
     State(state): State<Arc<AppState>>,
     Json(body): Json<AuthStart>,
-) -> Response {
+) -> ApiResult {
     let is_ag = body.kind == "antigravity";
     if !is_ag && body.kind != "codex" {
-        return (StatusCode::BAD_REQUEST, "kind must be antigravity|codex").into_response();
+        return Err(ApiError::bad_request("kind must be antigravity|codex"));
     }
     let provider_name = body
         .provider
@@ -161,8 +162,8 @@ pub async fn auth_start(
         .filter(|s| !s.is_empty())
         .unwrap_or(&body.kind)
         .to_string();
-    if let Err((code, msg)) = super::validate_name("provider", &provider_name) {
-        return (code, msg).into_response();
+    if let Err((_, msg)) = super::validate_name("provider", &provider_name) {
+        return Err(ApiError::bad_request(msg));
     }
     // A name that already belongs to a *different* kind would silently corrupt
     // that provider's config, so refuse it up front.
@@ -174,14 +175,10 @@ pub async fn auth_start(
                 | (crate::config::ProviderKind::Codex, false)
         )
     {
-        return (
-            StatusCode::CONFLICT,
-            format!(
-                "provider '{provider_name}' already exists with a different type ({:?})",
-                existing.kind
-            ),
-        )
-            .into_response();
+        return Err(ApiError::conflict(format!(
+            "provider '{provider_name}' already exists with a different type ({:?})",
+            existing.kind
+        )));
     }
     // Same provider already waiting: hand its URL back instead of re-binding the
     // port. A flow for a different provider is stale from the operator's point of
@@ -195,7 +192,7 @@ pub async fn auth_start(
     };
     if let Some((pending_kind, pending_provider, pending_url)) = waiting {
         if pending_kind == body.kind && pending_provider == provider_name {
-            return Json(serde_json::json!({"url": pending_url, "resumed": true})).into_response();
+            return ok_json(serde_json::json!({"url": pending_url, "resumed": true}));
         }
         cancel_flow(&state, &pending_kind).await;
         tracing::info!(
@@ -225,12 +222,12 @@ pub async fn auth_start(
             .await
         {
             Ok(p) => Flow::Antigravity(p),
-            Err(e) => return (StatusCode::CONFLICT, e.to_string()).into_response(),
+            Err(e) => return Err(ApiError::conflict(e.to_string())),
         }
     } else {
         match crate::codex::start_auth_with(None, &state.tuning, redirect_uri.as_deref()).await {
             Ok(p) => Flow::Codex(p),
-            Err(e) => return (StatusCode::CONFLICT, e.to_string()).into_response(),
+            Err(e) => return Err(ApiError::conflict(e.to_string())),
         }
     };
     let url = pending.url().to_string();
@@ -317,8 +314,9 @@ pub async fn auth_start(
     // abort it: aborting drops the pending listener and frees the callback port.
     *state.auth_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
 
-    Json(serde_json::json!({"url": url, "state": state_token, "mode": if headless_now { "public" } else { "loopback" }}))
-        .into_response()
+    ok_json(
+        serde_json::json!({"url": url, "state": state_token, "mode": if headless_now { "public" } else { "loopback" }}),
+    )
 }
 
 /// Stop a pending OAuth flow (if the kind matches) and free the callback port.
@@ -350,7 +348,7 @@ async fn cancel_flow(state: &Arc<AppState>, kind: &str) {
 }
 
 /// POST /api/auth/cancel — stop the pending flow (the user closed the tab).
-pub async fn auth_cancel(State(state): State<Arc<AppState>>) -> Response {
+pub async fn auth_cancel(State(state): State<Arc<AppState>>) -> ApiResult {
     let pending = state
         .auth_state
         .lock()
@@ -359,10 +357,10 @@ pub async fn auth_cancel(State(state): State<Arc<AppState>>) -> Response {
         .filter(|a| a.status == "waiting")
         .map(|a| a.kind.clone());
     let Some(kind) = pending else {
-        return Json(serde_json::json!({"cancelled": false})).into_response();
+        return ok_json(serde_json::json!({"cancelled": false}));
     };
     cancel_flow(&state, &kind).await;
-    Json(serde_json::json!({"cancelled": true, "kind": kind})).into_response()
+    ok_json(serde_json::json!({"cancelled": true, "kind": kind}))
 }
 
 /// Push a code into the pending flow. Shared by the public callback and the
@@ -468,7 +466,7 @@ pub async fn auth_callback(
 pub async fn auth_complete(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
-) -> Response {
+) -> ApiResult {
     let input = body
         .get("url")
         .and_then(|v| v.as_str())
@@ -477,11 +475,7 @@ pub async fn auth_complete(
         .to_string();
     let (code, st) = parse_callback_input(&input);
     let Some(code) = code else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "paste the callback URL or the code",
-        )
-            .into_response();
+        return Err(ApiError::bad_request("paste the callback URL or the code"));
     };
     // Prefer the state from the pasted URL; fall back to the pending flow's own.
     let state_token = st.or_else(|| {
@@ -493,22 +487,20 @@ pub async fn auth_complete(
             .map(|a| a.kind.clone())
     });
     if !deliver_code(&state, &code, state_token.as_deref().unwrap_or("")).await {
-        return (
-            StatusCode::CONFLICT,
+        return Err(ApiError::conflict(
             "no sign-in is waiting — start it again from the panel",
-        )
-            .into_response();
+        ));
     }
-    Json(serde_json::json!({"ok": true})).into_response()
+    ok_json(serde_json::json!({"ok": true}))
 }
 
-pub async fn auth_status(State(state): State<Arc<AppState>>) -> Response {
+pub async fn auth_status(State(state): State<Arc<AppState>>) -> ApiResult {
     let g = state
         .auth_state
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    Json(g).into_response()
+    ok_json(g)
 }
 
 fn html_page(status: StatusCode, title: &str, body: &str) -> Response {
