@@ -73,9 +73,14 @@ fn main() {
     bench("scan::peek_request 1MiB", 2_000, big.len(), || {
         black_box(peek_request(black_box(&big)));
     });
-    bench("scan::peek_request 64KiB, no model", 20_000, no_model.len(), || {
-        black_box(peek_request(black_box(&no_model)));
-    });
+    bench(
+        "scan::peek_request 64KiB, no model",
+        20_000,
+        no_model.len(),
+        || {
+            black_box(peek_request(black_box(&no_model)));
+        },
+    );
     bench("scan::string_field_span 64KiB", 50_000, mid.len(), || {
         black_box(string_field_span(black_box(&mid), b"model"));
     });
@@ -98,15 +103,19 @@ fn main() {
 
     // What the streaming translators actually do: parse a chunk, bulk-extend the
     // frames into their queue.
-    let one_event: Vec<u8> =
-        b"data: {\"c\":[{\"p\":[{\"t\":\"tok\"}]}]}\r\n\r\n".to_vec();
+    let one_event: Vec<u8> = b"data: {\"c\":[{\"p\":[{\"t\":\"tok\"}]}]}\r\n\r\n".to_vec();
 
-    bench("sse::feed + extend into VecDeque", 100_000, chunk.len(), || {
-        let mut p = SseParser::new();
-        let mut pending: VecDeque<Bytes> = VecDeque::new();
-        pending.extend(p.feed(black_box(&chunk)));
-        black_box(pending.len());
-    });
+    bench(
+        "sse::feed + extend into VecDeque",
+        100_000,
+        chunk.len(),
+        || {
+            let mut p = SseParser::new();
+            let mut pending: VecDeque<Bytes> = VecDeque::new();
+            pending.extend(p.feed(black_box(&chunk)));
+            black_box(pending.len());
+        },
+    );
     bench("sse::feed one event per chunk", 200_000, 96, || {
         let mut p = SseParser::new();
         let mut pending: VecDeque<Bytes> = VecDeque::new();
@@ -124,7 +133,10 @@ fn main() {
         None,
     );
     bench("pool::pick round_robin, no cooldowns", 1_000_000, 0, || {
-        black_box(pool.pick(black_box("m"), None).map(|k| k.requests.load(std::sync::atomic::Ordering::Relaxed)));
+        black_box(
+            pool.pick(black_box("m"), None)
+                .map(|k| k.requests.load(std::sync::atomic::Ordering::Relaxed)),
+        );
     });
     bench("pool::pick round_robin + sticky", 1_000_000, 0, || {
         black_box(pool.pick(black_box("m"), Some(42)).is_some());
@@ -136,12 +148,16 @@ fn main() {
     // ---------- dashboard CSP ----------
     #[cfg(feature = "dashboard")]
     {
-        let html = std::fs::read("ui/dist/index.html").unwrap_or_else(|_| {
-            br#"<html><script>boot();</script></html>"#.to_vec()
-        });
-        bench("dashboard::csp_for (per page load)", 20_000, html.len(), || {
-            black_box(anyhop::dashboard::csp_for(black_box(&html)));
-        });
+        let html = std::fs::read("ui/dist/index.html")
+            .unwrap_or_else(|_| br#"<html><script>boot();</script></html>"#.to_vec());
+        bench(
+            "dashboard::csp_for (per page load)",
+            20_000,
+            html.len(),
+            || {
+                black_box(anyhop::dashboard::csp_for(black_box(&html)));
+            },
+        );
     }
 
     println!();

@@ -15,8 +15,8 @@ pub fn build_http_client_with(
         .connect_timeout(tuning.connect_timeout())
         .pool_max_idle_per_host(tuning.sticky_max_entries.min(64));
     if let Some(p) = proxy {
-        let proxy = reqwest::Proxy::all(p)
-            .map_err(|e| anyhow::anyhow!("invalid proxy url '{p}': {e}"))?;
+        let proxy =
+            reqwest::Proxy::all(p).map_err(|e| anyhow::anyhow!("invalid proxy url '{p}': {e}"))?;
         b = b.proxy(proxy);
     }
     Ok(b.build()?)
@@ -127,7 +127,10 @@ impl Provider {
                 let secrets: Vec<String> = if matches!(cfg.kind, ProviderKind::Antigravity) {
                     ag.iter().map(|a| a.pool_secret().to_string()).collect()
                 } else {
-                    codex_accounts.iter().map(|a| a.pool_secret().to_string()).collect()
+                    codex_accounts
+                        .iter()
+                        .map(|a| a.pool_secret().to_string())
+                        .collect()
                 };
                 (secrets, ag)
             }
@@ -136,9 +139,7 @@ impl Provider {
             match cfg.kind {
                 ProviderKind::Antigravity => antigravity::DAILY_ENDPOINT.to_string(),
                 ProviderKind::Anthropic => crate::anthropic::DEFAULT_BASE_URL.to_string(),
-                ProviderKind::Codex => {
-                    "https://chatgpt.com/backend-api/codex".to_string()
-                }
+                ProviderKind::Codex => "https://chatgpt.com/backend-api/codex".to_string(),
                 _ => base_url,
             }
         } else {
@@ -156,10 +157,10 @@ impl Provider {
         // e-mail so the dashboard shows "user@example.com" instead of a token
         // prefix (which also used to leak the first 8 characters of the token).
         for acc in &ag_accounts {
-            pool.set_label(&acc.pool_secret(), &acc.label());
+            pool.set_label(acc.pool_secret(), &acc.label());
         }
         for acc in &codex_accounts {
-            pool.set_label(&acc.pool_secret(), &acc.label());
+            pool.set_label(acc.pool_secret(), &acc.label());
         }
 
         Ok(Self {
@@ -237,9 +238,10 @@ impl Provider {
                     return Err("no account for key".into());
                 };
                 let token = acc.ensure_access_token().await.map_err(|e| e.to_string())?;
-                let list = antigravity::fetch_available_models(acc.client(), &self.base_url, &token)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let list =
+                    antigravity::fetch_available_models(acc.client(), &self.base_url, &token)
+                        .await
+                        .map_err(|e| e.to_string())?;
                 Ok(list.into_iter().map(|m| m.id).collect())
             }
             ProviderKind::OpenaiCompat => {
@@ -273,7 +275,11 @@ impl Provider {
                     }
                 } else if let Some(arr) = val.get("models").and_then(|v| v.as_array()) {
                     for item in arr {
-                        if let Some(id) = item.get("id").or_else(|| item.get("name")).and_then(|v| v.as_str()) {
+                        if let Some(id) = item
+                            .get("id")
+                            .or_else(|| item.get("name"))
+                            .and_then(|v| v.as_str())
+                        {
                             models.push(id.to_string());
                         }
                     }
@@ -305,10 +311,15 @@ impl Provider {
                 let mut models = Vec::new();
                 if let Some(arr) = val.get("models").and_then(|v| v.as_array()) {
                     for item in arr {
-                        if let Some(methods) = item.get("supportedGenerationMethods").and_then(|v| v.as_array())
-                            && !methods.iter().any(|m| m.as_str() == Some("generateContent")) {
-                                continue;
-                            }
+                        if let Some(methods) = item
+                            .get("supportedGenerationMethods")
+                            .and_then(|v| v.as_array())
+                            && !methods
+                                .iter()
+                                .any(|m| m.as_str() == Some("generateContent"))
+                        {
+                            continue;
+                        }
                         if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
                             let clean_id = name.strip_prefix("models/").unwrap_or(name);
                             models.push(clean_id.to_string());
@@ -511,10 +522,7 @@ impl ProviderRouter {
             if p.models.iter().any(|m| m == model) {
                 return true;
             }
-            let guard = p
-                .models_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let guard = p.models_cache.lock().unwrap_or_else(|e| e.into_inner());
             guard
                 .as_ref()
                 .is_some_and(|(_, list)| list.iter().any(|m| m == model))

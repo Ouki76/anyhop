@@ -1,8 +1,8 @@
 use sycamore::prelude::*;
 
+use super::events::EventList;
 use crate::types::*;
 use crate::util::*;
-use super::events::EventList;
 
 #[component(inline_props)]
 pub fn OverviewTab(
@@ -13,7 +13,8 @@ pub fn OverviewTab(
     quotas: Signal<Vec<QuotaDto>>,
 ) -> View {
     let n_keys = create_memo(move || client_keys.get_clone().len());
-    let n_models_enabled = create_memo(move || models.get_clone().iter().filter(|m| m.enabled).count());
+    let n_models_enabled =
+        create_memo(move || models.get_clone().iter().filter(|m| m.enabled).count());
     let n_models_total = create_memo(move || models.get_clone().len());
     let total_requests = create_memo(move || {
         providers

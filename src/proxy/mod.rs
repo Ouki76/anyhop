@@ -57,7 +57,8 @@ pub struct AppState {
     /// Ring buffer of recent upstream attempts for the Requests tab.
     pub request_log: std::sync::Mutex<std::collections::VecDeque<crate::events::RequestRecord>>,
     /// Client API keys: key -> ClientKeyConfig.
-    pub client_keys: std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<ClientKeyRuntime>>>,
+    pub client_keys:
+        std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<ClientKeyRuntime>>>,
     /// Disabled models (client-facing ids: "provider/model" or combo name).
     pub disabled_models: std::sync::RwLock<std::collections::HashSet<String>>,
     /// Serializes read-modify-write cycles on the TOML config file

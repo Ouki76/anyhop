@@ -7,7 +7,10 @@ use crate::types::*;
 use crate::util::*;
 
 #[component(inline_props)]
-pub fn ApiKeysTab(client_keys: Signal<Vec<ClientKeyDto>>, models: Signal<Vec<ModelItemDto>>) -> View {
+pub fn ApiKeysTab(
+    client_keys: Signal<Vec<ClientKeyDto>>,
+    models: Signal<Vec<ModelItemDto>>,
+) -> View {
     let show_create = create_signal(false);
     let name_input = create_signal(String::new());
     let key_input = create_signal(String::new());

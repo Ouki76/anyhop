@@ -27,7 +27,7 @@ pub async fn list_models(
                 continue;
             }
             if let Some(allowed_list) = &allowed
-                && !model_allowed(allowed_list, &id, &id, &m)
+                && !model_allowed(allowed_list, &id, &id, m)
             {
                 continue;
             }

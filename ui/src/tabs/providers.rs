@@ -7,11 +7,19 @@ use crate::types::*;
 use crate::util::*;
 
 const KNOWN_TYPES: &[(&str, &str, &str)] = &[
-    ("antigravity", "Antigravity", "Google OAuth accounts · Gemini/Claude"),
+    (
+        "antigravity",
+        "Antigravity",
+        "Google OAuth accounts · Gemini/Claude",
+    ),
     ("codex", "Codex", "ChatGPT OAuth accounts"),
     ("gemini", "Gemini API", "any compatible endpoint"),
     ("anthropic", "Anthropic API", "any compatible endpoint"),
-    ("openai_compat", "OpenAI-compatible", "any Chat Completions endpoint"),
+    (
+        "openai_compat",
+        "OpenAI-compatible",
+        "any Chat Completions endpoint",
+    ),
 ];
 
 #[component(inline_props)]
@@ -36,7 +44,10 @@ pub fn ProvidersTab(providers: Signal<Vec<ProviderDto>>, selected: Signal<Option
 }
 
 #[component(inline_props)]
-pub fn ProviderCatalog(providers: Signal<Vec<ProviderDto>>, go: impl Fn(Option<String>) + Copy + 'static) -> View {
+pub fn ProviderCatalog(
+    providers: Signal<Vec<ProviderDto>>,
+    go: impl Fn(Option<String>) + Copy + 'static,
+) -> View {
     // Which KNOWN_TYPES entry is being added right now (modal open state).
     let adding: Signal<Option<&'static str>> = create_signal(None);
     view! {
@@ -201,13 +212,19 @@ pub fn AddProviderModal(
                 "kind": kind,
                 "provider": name_for_auth.get_clone(),
             });
-            let Ok(req) = Request::post("/api/auth/start").json(&body) else { return };
+            let Ok(req) = Request::post("/api/auth/start").json(&body) else {
+                return;
+            };
             if let Some(k) = stored_key() {
                 req.headers().set("Authorization", &format!("Bearer {k}"));
             }
             let Ok(resp) = req.send().await else { return };
-            let Ok(v) = resp.json::<serde_json::Value>().await else { return };
-            let Some(url) = v.get("url").and_then(|u| u.as_str()).map(str::to_string) else { return };
+            let Ok(v) = resp.json::<serde_json::Value>().await else {
+                return;
+            };
+            let Some(url) = v.get("url").and_then(|u| u.as_str()).map(str::to_string) else {
+                return;
+            };
             let mode = v
                 .get("mode")
                 .and_then(|m| m.as_str())
@@ -329,7 +346,11 @@ pub fn AddProviderModal(
                     go(Some(n));
                 }
             } else {
-                let msg = format!("error {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+                let msg = format!(
+                    "error {}: {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                );
                 if error.is_alive() {
                     error.set(msg);
                     busy.set(false);
@@ -511,7 +532,11 @@ pub fn ProviderCard(p: ProviderDto) -> View {
     let cool = p.keys.iter().filter(|k| k.status == "cooldown").count();
     let requests: u64 = p.keys.iter().map(|k| k.requests).sum();
     let failures: u64 = p.keys.iter().map(|k| k.failures).sum();
-    let tokens: u64 = p.keys.iter().map(|k| k.prompt_tokens + k.completion_tokens).sum();
+    let tokens: u64 = p
+        .keys
+        .iter()
+        .map(|k| k.prompt_tokens + k.completion_tokens)
+        .sum();
     let in_flight: u64 = p.keys.iter().map(|k| k.in_flight as u64).sum();
 
     let (dot, band_msg) = if total == 0 {
@@ -1003,7 +1028,11 @@ pub fn KeyActionButton(provider: String, id: String, status: String) -> View {
     let dead = status == "dead";
     let label = if dead { "enable" } else { "disable" };
     let class = if dead { "btn" } else { "btn btn-danger" };
-    let url = if dead { "/api/keys/enable" } else { "/api/keys/disable" };
+    let url = if dead {
+        "/api/keys/enable"
+    } else {
+        "/api/keys/disable"
+    };
     view! {
         button(class=class, on:click=move |_| {
             let body = serde_json::json!({"provider": provider.clone(), "id": id.clone()});

@@ -37,7 +37,9 @@ async fn main() {
     };
     let path = env_or("ANYHOP_LOAD_PATH", "/v1/chat/completions");
     let key = env_or("ANYHOP_LOAD_KEY", "test-gw-key");
-    let concurrency: usize = env_or("ANYHOP_LOAD_CONCURRENCY", "64").parse().unwrap_or(64);
+    let concurrency: usize = env_or("ANYHOP_LOAD_CONCURRENCY", "64")
+        .parse()
+        .unwrap_or(64);
     let seconds: u64 = env_or("ANYHOP_LOAD_DURATION", "10").parse().unwrap_or(10);
     let stream = std::env::var("ANYHOP_LOAD_STREAM").as_deref() == Ok("1");
 
@@ -65,7 +67,10 @@ async fn main() {
     match warm {
         Ok(r) if r.status().is_success() => {}
         Ok(r) => {
-            println!("load bench: warm-up returned {} — is the mock set up?", r.status());
+            println!(
+                "load bench: warm-up returned {} — is the mock set up?",
+                r.status()
+            );
             return;
         }
         Err(e) => {

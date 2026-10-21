@@ -167,9 +167,22 @@ pub async fn embeddings(
                 Ok(r) => r,
                 Err(e) => {
                     drop(guard);
-                    provider.pool.report_failure(&key, FailKind::Network, upstream_model);
+                    provider
+                        .pool
+                        .report_failure(&key, FailKind::Network, upstream_model);
                     tracing::warn!(provider = %provider.name, error = %e, "embeddings: request failed");
-                    log_attempt(&state, provider, upstream_model, &key, "network", started, false, client_key);
+                    log_attempt(
+                        &state,
+                        provider,
+                        upstream_model,
+                        &key,
+                        started,
+                        AttemptLog {
+                            status: "network",
+                            stream: false,
+                            client_key,
+                        },
+                    );
                     continue;
                 }
             };
@@ -178,27 +191,34 @@ pub async fn embeddings(
             let status = resp.status();
             if status.is_success() {
                 provider.pool.report_success(&key);
-                log_attempt(&state, provider, upstream_model, &key, status.as_str(), started, false, client_key);
+                log_attempt(
+                    &state,
+                    provider,
+                    upstream_model,
+                    &key,
+                    started,
+                    AttemptLog {
+                        status: status.as_str(),
+                        stream: false,
+                        client_key,
+                    },
+                );
                 return match provider.kind {
-                    ProviderKind::Gemini => {
-                        match resp.json::<Value>().await {
-                            Ok(v) => match gemini_response(&v, &model) {
-                                Some(out) => {
-                                    Json(out).into_response()
-                                }
-                                None => error_response(
-                                    StatusCode::BAD_GATEWAY,
-                                    "upstream returned an unexpected embeddings payload",
-                                    "upstream_error",
-                                ),
-                            },
-                            Err(e) => error_response(
+                    ProviderKind::Gemini => match resp.json::<Value>().await {
+                        Ok(v) => match gemini_response(&v, &model) {
+                            Some(out) => Json(out).into_response(),
+                            None => error_response(
                                 StatusCode::BAD_GATEWAY,
-                                format!("cannot decode upstream response: {e}"),
+                                "upstream returned an unexpected embeddings payload",
                                 "upstream_error",
                             ),
-                        }
-                    }
+                        },
+                        Err(e) => error_response(
+                            StatusCode::BAD_GATEWAY,
+                            format!("cannot decode upstream response: {e}"),
+                            "upstream_error",
+                        ),
+                    },
                     // Pass-through keeps the provider's exact JSON (usage included).
                     _ => {
                         let bytes = resp.bytes().await.unwrap_or_default();
@@ -215,19 +235,36 @@ pub async fn embeddings(
                 .and_then(|s| s.parse::<u64>().ok());
             let text = resp.text().await.unwrap_or_default();
             let snippet: String = text.chars().take(500).collect();
-            log_attempt(&state, provider, upstream_model, &key, status.as_str(), started, false, client_key);
+            log_attempt(
+                &state,
+                provider,
+                upstream_model,
+                &key,
+                started,
+                AttemptLog {
+                    status: status.as_str(),
+                    stream: false,
+                    client_key,
+                },
+            );
 
             match status.as_u16() {
                 429 => {
-                    provider
-                        .pool
-                        .report_failure(&key, FailKind::RateLimited { retry_after_secs }, upstream_model);
+                    provider.pool.report_failure(
+                        &key,
+                        FailKind::RateLimited { retry_after_secs },
+                        upstream_model,
+                    );
                 }
                 401 | 403 => {
-                    provider.pool.report_failure(&key, FailKind::Auth, upstream_model);
+                    provider
+                        .pool
+                        .report_failure(&key, FailKind::Auth, upstream_model);
                 }
                 s if s >= 500 => {
-                    provider.pool.report_failure(&key, FailKind::Server, upstream_model);
+                    provider
+                        .pool
+                        .report_failure(&key, FailKind::Server, upstream_model);
                 }
                 _ => {
                     // A client-side error is the caller's problem: pass it through
@@ -332,16 +369,26 @@ fn gemini_response(v: &Value, model: &str) -> Option<Value> {
     }))
 }
 
+/// One attempted upstream call, as recorded in the Requests tab.
+struct AttemptLog<'a> {
+    status: &'a str,
+    stream: bool,
+    client_key: Option<&'a str>,
+}
+
 fn log_attempt(
     state: &Arc<AppState>,
     provider: &Provider,
     model: &str,
     key: &crate::pool::KeyState,
-    status: &str,
     started: std::time::Instant,
-    stream: bool,
-    client_key: Option<&str>,
+    attempt: AttemptLog<'_>,
 ) {
+    let AttemptLog {
+        status,
+        stream,
+        client_key,
+    } = attempt;
     state.log_request(crate::events::RequestRecord {
         ts: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -365,7 +412,11 @@ mod tests {
     fn supported_kinds() {
         assert!(supports_embeddings(ProviderKind::OpenaiCompat));
         assert!(supports_embeddings(ProviderKind::Gemini));
-        for k in [ProviderKind::Anthropic, ProviderKind::Codex, ProviderKind::Antigravity] {
+        for k in [
+            ProviderKind::Anthropic,
+            ProviderKind::Codex,
+            ProviderKind::Antigravity,
+        ] {
             assert!(!supports_embeddings(k), "{k:?} has no embeddings API");
         }
     }

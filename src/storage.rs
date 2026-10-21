@@ -61,13 +61,28 @@ pub struct StatsRecord {
 
 #[derive(Debug)]
 enum StorageMsg {
-    Health { key: String, rec: HealthRecord },
-    OAuth { key: String, rec: OAuthRecord },
-    Stats { key: String, rec: StatsRecord },
+    Health {
+        key: String,
+        rec: HealthRecord,
+    },
+    OAuth {
+        key: String,
+        rec: OAuthRecord,
+    },
+    Stats {
+        key: String,
+        rec: StatsRecord,
+    },
     /// Runtime-added keys for a provider, as a complete list (idempotent: the
     /// last writer wins, so add and remove cannot interleave into a wrong state).
-    ExtraKeys { provider: String, secrets: Vec<String> },
-    Feed { key: String, data: Vec<u8> },
+    ExtraKeys {
+        provider: String,
+        secrets: Vec<String>,
+    },
+    Feed {
+        key: String,
+        data: Vec<u8>,
+    },
     /// Flush pending writes now and ack — used at shutdown so the final batch
     /// isn't lost when the runtime drops the writer task.
     Flush(tokio::sync::oneshot::Sender<()>),
@@ -307,7 +322,10 @@ fn flush(db: &Arc<Database>, pending: &mut HashMap<String, StorageMsg>) {
     let wtx = match db.begin_write() {
         Ok(w) => w,
         Err(e) => {
-            tracing::warn!("storage: flush failed to begin write tx ({e}), {} msgs kept", pending.len());
+            tracing::warn!(
+                "storage: flush failed to begin write tx ({e}), {} msgs kept",
+                pending.len()
+            );
             return;
         }
     };

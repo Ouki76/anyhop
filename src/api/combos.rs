@@ -111,7 +111,9 @@ pub async fn combo_add(
     let _guard = state.config_lock.lock().await;
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response(),
+        Err(e) => {
+            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+        }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
@@ -133,7 +135,10 @@ pub async fn combo_add(
         .iter()
         .any(|c| c.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
     {
-        return (StatusCode::CONFLICT, format!("combo '{name}' already exists"))
+        return (
+            StatusCode::CONFLICT,
+            format!("combo '{name}' already exists"),
+        )
             .into_response();
     }
     arr.push(toml_combo(&name, &chain));
@@ -162,7 +167,9 @@ pub async fn combo_update(
     let _guard = state.config_lock.lock().await;
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response(),
+        Err(e) => {
+            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+        }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
@@ -208,7 +215,9 @@ pub async fn combo_delete(
     let _guard = state.config_lock.lock().await;
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response(),
+        Err(e) => {
+            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+        }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
@@ -246,7 +255,7 @@ async fn finish(
     ok: Response,
 ) -> Response {
     if let Err(resp) = write_validated(state, &doc).await {
-        return resp;
+        return *resp;
     }
     state.events.emit_simple("config", "", "backoff", event);
     ok
@@ -261,7 +270,10 @@ mod tests {
         assert_eq!(clean_name("  fast ").unwrap(), "fast");
         assert!(clean_name("").is_err());
         assert!(clean_name("   ").is_err());
-        assert!(clean_name("a/b").is_err(), "a slash would be read as provider/model");
+        assert!(
+            clean_name("a/b").is_err(),
+            "a slash would be read as provider/model"
+        );
         assert!(clean_name(&"x".repeat(65)).is_err());
         assert!(clean_name(&"x".repeat(64)).is_ok());
     }

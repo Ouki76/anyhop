@@ -41,7 +41,8 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
     });
 
     let total = create_memo(move || models.get_clone().len());
-    let enabled_count = create_memo(move || models.get_clone().iter().filter(|m| m.enabled).count());
+    let enabled_count =
+        create_memo(move || models.get_clone().iter().filter(|m| m.enabled).count());
 
     let providers = create_memo(move || {
         let mut set = std::collections::BTreeSet::new();
@@ -470,7 +471,11 @@ pub fn ProviderSelect(providers: ReadSignal<Vec<String>>, value: Signal<String>)
     let open = create_signal(false);
     let label = create_memo(move || {
         let v = value.get_clone();
-        if v == "all" { "All providers".to_string() } else { v }
+        if v == "all" {
+            "All providers".to_string()
+        } else {
+            v
+        }
     });
 
     view! {

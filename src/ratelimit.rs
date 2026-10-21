@@ -45,7 +45,9 @@ impl TokenBucket {
         } else {
             // Time until the next whole token is available.
             let missing = 1.0 - self.tokens;
-            Err(Duration::from_secs_f64((missing / self.rate_per_sec).max(0.05)))
+            Err(Duration::from_secs_f64(
+                (missing / self.rate_per_sec).max(0.05),
+            ))
         }
     }
 
@@ -107,8 +109,14 @@ mod tests {
         }
         let retry = b.try_take_at(now).expect_err("burst exhausted");
         // 60 rpm = 1 token/s, so the next token is ~1s away.
-        assert!(retry <= Duration::from_secs(1), "retry_after too large: {retry:?}");
-        assert!(retry >= Duration::from_millis(900), "retry_after too small: {retry:?}");
+        assert!(
+            retry <= Duration::from_secs(1),
+            "retry_after too large: {retry:?}"
+        );
+        assert!(
+            retry >= Duration::from_millis(900),
+            "retry_after too small: {retry:?}"
+        );
     }
 
     #[test]
@@ -175,7 +183,13 @@ mod tests {
         })
         .join();
         // The key state must stay usable, and the limiter must keep working.
-        assert!(limiter.try_take().is_ok(), "recovered lock must still grant the first token");
-        assert!(limiter.try_take().is_err(), "recovered lock must still enforce the limit");
+        assert!(
+            limiter.try_take().is_ok(),
+            "recovered lock must still grant the first token"
+        );
+        assert!(
+            limiter.try_take().is_err(),
+            "recovered lock must still enforce the limit"
+        );
     }
 }

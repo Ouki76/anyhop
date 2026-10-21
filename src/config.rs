@@ -227,7 +227,13 @@ impl Config {
     /// through the same path so a saved config can never fail the next startup.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.providers.is_empty(), "config has no [[providers]]");
-        if let Some(u) = self.server.public_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        if let Some(u) = self
+            .server
+            .public_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
             anyhow::ensure!(
                 u.starts_with("http://") || u.starts_with("https://"),
                 "server.public_url must start with http:// or https://"
@@ -308,11 +314,7 @@ impl Config {
                 "duplicate combo name '{}'",
                 c.name
             );
-            anyhow::ensure!(
-                !c.chain.is_empty(),
-                "combo '{}' has an empty chain",
-                c.name
-            );
+            anyhow::ensure!(!c.chain.is_empty(), "combo '{}' has an empty chain", c.name);
             for entry in &c.chain {
                 if let Some((prefix, rest)) = entry.split_once('/') {
                     anyhow::ensure!(
@@ -346,10 +348,7 @@ impl Config {
                     "client_keys[{i}]: 'burst' set without 'rpm' (add rpm = <requests per minute>)"
                 );
                 if rpm > 0 && burst > 0 {
-                    anyhow::ensure!(
-                        burst >= 1,
-                        "client_keys[{i}]: 'burst' must be at least 1"
-                    );
+                    anyhow::ensure!(burst >= 1, "client_keys[{i}]: 'burst' must be at least 1");
                 }
             }
         }

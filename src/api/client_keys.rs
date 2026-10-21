@@ -76,10 +76,7 @@ fn normalise_limit(rpm: Option<u32>, burst: Option<u32>) -> (Option<u32>, Option
 /// Storage feed + TOML rewrite, in that order: the feed survives a failed file
 /// rewrite, and both mutating handlers used to repeat this block verbatim.
 async fn save_keys(state: &Arc<AppState>) {
-    let all: Vec<_> = ck_read(state)
-        .values()
-        .map(|r| r.cfg.clone())
-        .collect();
+    let all: Vec<_> = ck_read(state).values().map(|r| r.cfg.clone()).collect();
     if let Some(s) = &state.storage {
         s.save_feed("client_keys", &all);
     }
@@ -128,17 +125,13 @@ pub async fn client_key_add(
     State(state): State<Arc<AppState>>,
     Json(body): Json<AddClientKey>,
 ) -> Response {
-    let key_str = match body
-        .key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    let key_str = match body.key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => s.to_string(),
         None => match generate_client_key() {
             Some(k) => k,
             None => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "cannot generate a key").into_response();
+                return (StatusCode::INTERNAL_SERVER_ERROR, "cannot generate a key")
+                    .into_response();
             }
         },
     };
@@ -146,7 +139,11 @@ pub async fn client_key_add(
     if let Err((code, msg)) = super::validate_secret_len("client key", &key_str) {
         return (code, msg).into_response();
     }
-    if let Some(n) = body.name.as_deref().map(str::trim).filter(|n| !n.is_empty())
+    if let Some(n) = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
         && let Err((code, msg)) = super::validate_name("client key", n)
     {
         return (code, msg).into_response();
@@ -192,7 +189,10 @@ pub async fn client_key_add(
         "auth",
         "",
         "backoff",
-        format!("created client API key '{}'", name.as_deref().unwrap_or(&key_str)),
+        format!(
+            "created client API key '{}'",
+            name.as_deref().unwrap_or(&key_str)
+        ),
     );
 
     Json(to_dto(&runtime)).into_response()
@@ -238,8 +238,7 @@ pub async fn client_key_update(
         cfg.models = body.models;
         // `rpm: None` keeps the current limit; `Some(0)` clears it.
         if body.rpm.is_some() || body.burst.is_some() {
-            let (rpm, burst) =
-                normalise_limit(body.rpm.or(cfg.rpm), body.burst.or(cfg.burst));
+            let (rpm, burst) = normalise_limit(body.rpm.or(cfg.rpm), body.burst.or(cfg.burst));
             cfg.rpm = rpm;
             cfg.burst = burst;
         }

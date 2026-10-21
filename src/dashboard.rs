@@ -75,7 +75,11 @@ fn serve_file(path: &str) -> Response {
             )
                 .into_response()
         }
-        None => (StatusCode::NOT_FOUND, "ui not built; run `trunk build` in ui/").into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            "ui not built; run `trunk build` in ui/",
+        )
+            .into_response(),
     }
 }
 
@@ -115,7 +119,9 @@ fn inline_scripts(html: &str) -> Vec<&str> {
     let mut rest = html;
     while let Some(start) = rest.find("<script") {
         let after = &rest[start..];
-        let Some(open_end) = after.find('>') else { break };
+        let Some(open_end) = after.find('>') else {
+            break;
+        };
         let tag = &after[..open_end];
         let body_start = open_end + 1;
         let Some(body_end) = after[body_start..].find("</script>") else {
@@ -182,9 +188,12 @@ mod tests {
         let policy = csp_for(html).unwrap();
         let with_ws = base64::engine::general_purpose::STANDARD
             .encode(sha2::Sha256::digest(b"\n  boot();\n"));
-        let trimmed = base64::engine::general_purpose::STANDARD
-            .encode(sha2::Sha256::digest(b"boot();"));
-        assert!(policy.contains(&with_ws), "must hash the raw body: {policy}");
+        let trimmed =
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(b"boot();"));
+        assert!(
+            policy.contains(&with_ws),
+            "must hash the raw body: {policy}"
+        );
         assert!(!policy.contains(&trimmed), "must not hash the trimmed body");
     }
 

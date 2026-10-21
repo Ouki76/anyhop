@@ -40,7 +40,7 @@ pub(crate) async fn persist_disabled_models(state: &Arc<AppState>) {
 pub(crate) async fn write_validated(
     state: &Arc<AppState>,
     doc: &toml_edit::DocumentMut,
-) -> Result<(), axum::response::Response> {
+) -> Result<(), Box<axum::response::Response>> {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
@@ -48,25 +48,33 @@ pub(crate) async fn write_validated(
     let parsed: crate::config::Config = match toml::from_str(&text) {
         Ok(c) => c,
         Err(e) => {
-            return Err((StatusCode::BAD_REQUEST, format!("invalid config: {e}")).into_response());
+            return Err(Box::new(
+                (StatusCode::BAD_REQUEST, format!("invalid config: {e}")).into_response(),
+            ));
         }
     };
     if let Err(e) = parsed.validate() {
-        return Err((StatusCode::BAD_REQUEST, format!("invalid config: {e}")).into_response());
+        return Err(Box::new(
+            (StatusCode::BAD_REQUEST, format!("invalid config: {e}")).into_response(),
+        ));
     }
     if let Err(e) = crate::config::write_atomic(&state.config_path, &text) {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("cannot write config: {e}"),
-        )
-            .into_response());
+        return Err(Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot write config: {e}"),
+            )
+                .into_response(),
+        ));
     }
     if let Err(e) = crate::reload_config(state) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("config saved but reload failed: {e}"),
-        )
-            .into_response());
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                format!("config saved but reload failed: {e}"),
+            )
+                .into_response(),
+        ));
     }
     Ok(())
 }

@@ -117,10 +117,7 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             }
             for s in ["active", "cooldown", "dead"] {
                 let one = u8::from(k.status == s);
-                let _ = writeln!(
-                    out,
-                    "anyhop_key_status{{{labels},state=\"{s}\"}} {one}"
-                );
+                let _ = writeln!(out, "anyhop_key_status{{{labels},state=\"{s}\"}} {one}");
             }
         }
     }

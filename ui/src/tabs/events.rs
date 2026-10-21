@@ -26,7 +26,11 @@ pub fn EventList(events: Signal<Vec<EventDto>>, limit: usize) -> View {
     // signal inside the `if` below would allocate a fresh one every time the
     // list flips between empty and non-empty.
     let limited = create_memo(move || {
-        events.get_clone().into_iter().take(limit).collect::<Vec<_>>()
+        events
+            .get_clone()
+            .into_iter()
+            .take(limit)
+            .collect::<Vec<_>>()
     });
     let shown = create_signal(Vec::<EventDto>::new());
     create_effect(move || shown.set(limited.get_clone()));

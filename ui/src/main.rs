@@ -2,11 +2,11 @@ mod tabs;
 mod types;
 mod util;
 
+use futures::StreamExt;
 use gloo_net::eventsource::futures::EventSource;
 use sycamore::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use futures::StreamExt;
 
 use tabs::*;
 use types::*;
@@ -52,7 +52,6 @@ fn provider_from_hash() -> Option<String> {
         .map(str::to_string)
 }
 
-
 #[component]
 fn AuthBanner() -> View {
     let key = create_signal(String::new());
@@ -95,8 +94,9 @@ fn App() -> View {
     let tab = create_signal(tab_from_hash());
     // Mobile menu: the sidebar collapses into a toggle below 720px.
     let nav_open = create_signal(false);
-    let need_auth = create_signal(stored_key().is_none()
-        && NEED_AUTH.load(std::sync::atomic::Ordering::Relaxed));
+    let need_auth = create_signal(
+        stored_key().is_none() && NEED_AUTH.load(std::sync::atomic::Ordering::Relaxed),
+    );
     // Selected provider (detail page) lives in the root scope so it survives
     // tab remounts; a single hashchange listener for the whole app.
     let selected_provider = create_signal(provider_from_hash());

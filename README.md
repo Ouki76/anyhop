@@ -336,9 +336,14 @@ load generator caps out around 8k rps on its own and would hide the real capacit
 
 | Endpoint | Throughput | p50 | p99 |
 | --- | --- | --- | --- |
-| `GET /healthz` | **207,000 req/s** | 0.28 ms | 0.75 ms |
-| `GET /v1/models` | **152,000 req/s** | 0.40 ms | 0.94 ms |
-| `GET /metrics` | **82,000 req/s** | 0.77 ms | 1.49 ms |
+| `GET /healthz` | **149,000 req/s** | 0.38 ms | 1.16 ms |
+| `GET /v1/models` (124 models) | **38,000 req/s** | 1.66 ms | 3.24 ms |
+| `GET /metrics` | **88,000 req/s** | 0.70 ms | 1.65 ms |
+
+RSS 17 MB with the gateway and the load generator sharing the same 16 cores — the
+client steals roughly half the machine, so these are a floor, not a ceiling.
+`/v1/models` is dominated by serialising 124 model records; with a 9-model config
+it reaches ~150k req/s.
 
 **Proxying** (`POST /v1/chat/completions` through the mock providers — the Python
 mocks are the bottleneck there, not the gateway):

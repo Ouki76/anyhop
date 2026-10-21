@@ -110,7 +110,11 @@ impl CodexAccount {
             storage: storage.cloned(),
             client,
             tuning,
-            state: tokio::sync::Mutex::new(AccountState { access_token, expires_at_ms, refresh_token }),
+            state: tokio::sync::Mutex::new(AccountState {
+                access_token,
+                expires_at_ms,
+                refresh_token,
+            }),
         }
     }
 
@@ -424,7 +428,11 @@ fn translate_event(v: &Value, st: &mut SseState) -> Option<Value> {
                 return None;
             }
             let idx = st.item_tool.len();
-            let item_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+            let item_id = item
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .to_string();
             st.item_tool.push((item_id, idx));
             Some(st.chunk(
                 json!({"tool_calls": [{
@@ -456,8 +464,7 @@ fn translate_event(v: &Value, st: &mut SseState) -> Option<Value> {
             let resp = v.get("response")?;
             if let Some(u) = resp.get("usage") {
                 st.prompt_tokens = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                st.completion_tokens =
-                    u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                st.completion_tokens = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
             }
             let finish = if ty == "response.incomplete" {
                 "length"
@@ -608,11 +615,15 @@ pub async fn collect_non_stream(resp: reqwest::Response, model: &str) -> Result<
         let bytes = item.map_err(|e| e.to_string())?;
         let text = String::from_utf8_lossy(&bytes);
         for line in text.lines() {
-            let Some(data) = line.strip_prefix("data: ") else { continue };
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
             if data == "[DONE]" {
                 continue;
             }
-            let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue };
+            let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
             if let Some(s) = chunk.get("id").and_then(|i| i.as_str()) {
                 id = s.to_string();
             }
@@ -622,11 +633,15 @@ pub async fn collect_non_stream(resp: reqwest::Response, model: &str) -> Result<
             if let Some(u) = chunk.get("usage") {
                 usage = u.clone();
             }
-            let Some(choice) = chunk.pointer("/choices/0") else { continue };
+            let Some(choice) = chunk.pointer("/choices/0") else {
+                continue;
+            };
             if let Some(f) = choice.get("finish_reason").and_then(|f| f.as_str()) {
                 finish = f.to_string();
             }
-            let Some(delta) = choice.get("delta") else { continue };
+            let Some(delta) = choice.get("delta") else {
+                continue;
+            };
             if let Some(t) = delta.get("content").and_then(|c| c.as_str()) {
                 content.push_str(t);
             }
@@ -668,7 +683,11 @@ pub async fn collect_non_stream(resp: reqwest::Response, model: &str) -> Result<
     if tool_calls.is_empty() {
         msg["content"] = json!(content);
     } else {
-        msg["content"] = if content.is_empty() { Value::Null } else { json!(content) };
+        msg["content"] = if content.is_empty() {
+            Value::Null
+        } else {
+            json!(content)
+        };
         msg["tool_calls"] = json!(tool_calls);
     }
     if !reasoning.is_empty() {
@@ -695,7 +714,6 @@ fn random_verifier() -> anyhow::Result<String> {
 }
 
 use sha2::Digest;
-
 
 /// A started Codex OAuth flow.
 pub struct PendingAuth {
@@ -746,12 +764,21 @@ pub async fn start_auth_with(
         None => Some(
             tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
                 .await
-                .map_err(|e| anyhow::anyhow!(
-                    "cannot bind localhost:{CALLBACK_PORT}: {e} (auth already running?)"
-                ))?,
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "cannot bind localhost:{CALLBACK_PORT}: {e} (auth already running?)"
+                    )
+                })?,
         ),
     };
-    Ok(PendingAuth { url, state, redirect_uri: redirect, verifier, listener, http })
+    Ok(PendingAuth {
+        url,
+        state,
+        redirect_uri: redirect,
+        verifier,
+        listener,
+        http,
+    })
 }
 
 /// Wait for the browser callback and complete the exchange.
@@ -795,7 +822,10 @@ pub async fn wait_for_callback(p: &PendingAuth) -> anyhow::Result<String> {
 
     let ok = code.is_some() && got_state.as_deref() == Some(p.state.as_str());
     let (status, page) = if ok {
-        ("200 OK", "<h1>anyhop: authorized</h1><p>You can close this tab.</p>")
+        (
+            "200 OK",
+            "<h1>anyhop: authorized</h1><p>You can close this tab.</p>",
+        )
     } else {
         ("400 Bad Request", "<h1>anyhop: authorization failed</h1>")
     };
@@ -805,7 +835,10 @@ pub async fn wait_for_callback(p: &PendingAuth) -> anyhow::Result<String> {
     let _ = sock.write_all(html.as_bytes()).await;
 
     let code = code.ok_or_else(|| anyhow::anyhow!("callback without code"))?;
-    anyhow::ensure!(got_state.as_deref() == Some(p.state.as_str()), "state mismatch, retry");
+    anyhow::ensure!(
+        got_state.as_deref() == Some(p.state.as_str()),
+        "state mismatch, retry"
+    );
     Ok(code)
 }
 
@@ -841,7 +874,11 @@ async fn finish(p: PendingAuth, code: &str) -> anyhow::Result<AuthOutcome> {
         .to_string();
     let id_token = v.get("id_token").and_then(|t| t.as_str()).unwrap_or("");
     let (email, account_id) = parse_id_token(id_token);
-    Ok(AuthOutcome { refresh_token, email, account_id })
+    Ok(AuthOutcome {
+        refresh_token,
+        email,
+        account_id,
+    })
 }
 
 /// CLI OAuth flow: prints a TOML snippet on success.
@@ -850,8 +887,13 @@ pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
     if let Some(p) = &proxy {
         println!("Using proxy: {p}");
     }
-    println!("\nOpen this link and sign in to your ChatGPT account:\n\n{}\n", pending.url);
-    let _ = std::process::Command::new("xdg-open").arg(&pending.url).spawn();
+    println!(
+        "\nOpen this link and sign in to your ChatGPT account:\n\n{}\n",
+        pending.url
+    );
+    let _ = std::process::Command::new("xdg-open")
+        .arg(&pending.url)
+        .spawn();
     println!("Waiting for the callback on localhost:{CALLBACK_PORT} ...");
     let out = complete_auth(pending).await?;
 

@@ -27,11 +27,17 @@ pub struct ModelAction {
 // strings with no invariant a panic could corrupt, so a poisoned lock must not
 // make every model toggle fail for the rest of the process.
 fn dm_read(state: &AppState) -> RwLockReadGuard<'_, HashSet<String>> {
-    state.disabled_models.read().unwrap_or_else(|e| e.into_inner())
+    state
+        .disabled_models
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 fn dm_write(state: &AppState) -> RwLockWriteGuard<'_, HashSet<String>> {
-    state.disabled_models.write().unwrap_or_else(|e| e.into_inner())
+    state
+        .disabled_models
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Persist the disabled set: storage feed first (fast, survives restarts even if
@@ -47,7 +53,10 @@ async fn save_disabled(state: &Arc<AppState>) {
 /// `combo/flash` and `flash` name the same model; also drop the bare half of a
 /// `provider/model` id so both spellings agree.
 fn normalize(a: &ModelAction) -> &str {
-    a.model.trim().strip_prefix("combo/").unwrap_or(a.model.trim())
+    a.model
+        .trim()
+        .strip_prefix("combo/")
+        .unwrap_or(a.model.trim())
 }
 
 /// Is `model` disabled under either spelling?
@@ -116,7 +125,12 @@ pub async fn models_list(State(state): State<Arc<AppState>>) -> Response {
 
 pub async fn models_refresh(State(state): State<Arc<AppState>>) -> Response {
     refresh_all_providers(&state).await;
-    state.events.emit_simple("models", "", "backoff", "refreshed models from all providers".into());
+    state.events.emit_simple(
+        "models",
+        "",
+        "backoff",
+        "refreshed models from all providers".into(),
+    );
     models_list(State(state)).await
 }
 
@@ -186,7 +200,10 @@ pub async fn model_toggle(
         "models",
         &model,
         kind,
-        format!("model '{model}' {}", if new_enabled { "enabled" } else { "disabled" }),
+        format!(
+            "model '{model}' {}",
+            if new_enabled { "enabled" } else { "disabled" }
+        ),
     );
 
     Json(serde_json::json!({ "model": model, "enabled": new_enabled })).into_response()
@@ -195,7 +212,9 @@ pub async fn model_toggle(
 pub async fn models_enable_all(State(state): State<Arc<AppState>>) -> Response {
     dm_write(&state).clear();
     save_disabled(&state).await;
-    state.events.emit_simple("models", "", "backoff", "all models enabled".into());
+    state
+        .events
+        .emit_simple("models", "", "backoff", "all models enabled".into());
     StatusCode::OK.into_response()
 }
 
@@ -219,6 +238,8 @@ pub async fn models_disable_all(State(state): State<Arc<AppState>>) -> Response 
     }
     save_disabled(&state).await;
 
-    state.events.emit_simple("models", "", "dead", "all models disabled".into());
+    state
+        .events
+        .emit_simple("models", "", "dead", "all models disabled".into());
     StatusCode::OK.into_response()
 }

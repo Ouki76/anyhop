@@ -35,9 +35,7 @@ fn map_finish(r: &str) -> &'static str {
     match r {
         "STOP" => "stop",
         "MAX_TOKENS" => "length",
-        "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "SPII" => {
-            "content_filter"
-        }
+        "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "SPII" => "content_filter",
         _ => "stop",
     }
 }
@@ -69,7 +67,9 @@ fn content_parts(content: Option<&Value>) -> Result<Vec<Value>, String> {
             let mut parts = Vec::new();
             for p in arr {
                 match p.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => parts.push(json!({"text": p.get("text").cloned().unwrap_or(json!(""))})),
+                    Some("text") => {
+                        parts.push(json!({"text": p.get("text").cloned().unwrap_or(json!(""))}))
+                    }
                     Some("image_url") => {
                         let url = p
                             .pointer("/image_url/url")
@@ -79,9 +79,9 @@ fn content_parts(content: Option<&Value>) -> Result<Vec<Value>, String> {
                             .strip_prefix("data:")
                             .and_then(|d| d.split_once(";base64,"))
                         {
-                            Some((mime, b64)) => parts.push(
-                                json!({"inline_data": {"mime_type": mime, "data": b64}}),
-                            ),
+                            Some((mime, b64)) => {
+                                parts.push(json!({"inline_data": {"mime_type": mime, "data": b64}}))
+                            }
                             None => {
                                 return Err(
                                     "only base64 data: URLs are supported for images".into()
@@ -162,7 +162,10 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
                 contents.push(json!({"role": "model", "parts": parts}));
             }
             "tool" => {
-                let tcid = msg.get("tool_call_id").and_then(|i| i.as_str()).unwrap_or("");
+                let tcid = msg
+                    .get("tool_call_id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("");
                 let name = msg
                     .get("name")
                     .and_then(|n| n.as_str())
@@ -187,7 +190,11 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
     // Gemini requires strictly alternating user/model turns — merge consecutive same-role entries.
     let mut merged: Vec<Value> = Vec::new();
     for c in contents {
-        let role = c.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
+        let role = c
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
         if let Some(last) = merged.last_mut()
             && last.get("role").and_then(|r| r.as_str()) == Some(role.as_str())
         {
@@ -313,8 +320,12 @@ pub fn usage_pair(v: &Value) -> (u64, u64) {
         None => return (0, 0),
     };
     (
-        um.get("promptTokenCount").and_then(|x| x.as_u64()).unwrap_or(0),
-        um.get("candidatesTokenCount").and_then(|x| x.as_u64()).unwrap_or(0),
+        um.get("promptTokenCount")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        um.get("candidatesTokenCount")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
     )
 }
 
@@ -400,7 +411,11 @@ pub fn translate_response(model: &str, v: &Value) -> Value {
     if tool_calls.is_empty() {
         msg["content"] = json!(content);
     } else {
-        msg["content"] = if content.is_empty() { Value::Null } else { json!(content) };
+        msg["content"] = if content.is_empty() {
+            Value::Null
+        } else {
+            json!(content)
+        };
         msg["tool_calls"] = json!(tool_calls);
     }
     if !reasoning.is_empty() {
@@ -450,7 +465,11 @@ fn translate_chunk(v: &Value, st: &mut SseState) -> Value {
         .map(|r| {
             let f = map_finish(r);
             // Gemini says STOP even with function calls in the candidate.
-            if f == "stop" && !tool_calls.is_empty() { json!("tool_calls") } else { json!(f) }
+            if f == "stop" && !tool_calls.is_empty() {
+                json!("tool_calls")
+            } else {
+                json!(f)
+            }
         })
         .unwrap_or(Value::Null);
 
@@ -476,9 +495,7 @@ pub fn translate_sse_stream(
     stats: Option<std::sync::Arc<crate::pool::KeyState>>,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
     struct State {
-        inner: std::pin::Pin<
-            Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>,
-        >,
+        inner: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
         parser: crate::sse::SseParser,
         pending: std::collections::VecDeque<Bytes>,
         eof: bool,
@@ -508,12 +525,18 @@ pub fn translate_sse_stream(
                 let Ok(v) = serde_json::from_slice::<Value>(&data) else {
                     continue;
                 };
-                let v = if envelope { crate::antigravity::unwrap_response(v) } else { v };
+                let v = if envelope {
+                    crate::antigravity::unwrap_response(v)
+                } else {
+                    v
+                };
                 if let Some(k) = &s.stats {
                     let (p, c) = usage_pair(&v);
                     if p > 0 || c > 0 {
-                        k.prompt_tokens.fetch_add(p, std::sync::atomic::Ordering::Relaxed);
-                        k.completion_tokens.fetch_add(c, std::sync::atomic::Ordering::Relaxed);
+                        k.prompt_tokens
+                            .fetch_add(p, std::sync::atomic::Ordering::Relaxed);
+                        k.completion_tokens
+                            .fetch_add(c, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 let chunk = translate_chunk(&v, &mut s.st);

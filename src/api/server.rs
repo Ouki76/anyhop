@@ -64,6 +64,7 @@ pub struct ServerUpdate {
 
 #[derive(Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct TuningUpdate {
     max_cooldown_secs: Option<u64>,
     base_backoff_secs: Option<u64>,
@@ -84,30 +85,6 @@ pub struct TuningUpdate {
     quota_cache_ttl_secs: Option<u64>,
 }
 
-impl Default for TuningUpdate {
-    fn default() -> Self {
-        Self {
-            max_cooldown_secs: None,
-            base_backoff_secs: None,
-            rate_limit_cooldown_secs: None,
-            drain_fallback_secs: None,
-            models_cache_ttl_secs: None,
-            connect_timeout_secs: None,
-            meta_timeout_secs: None,
-            sticky_ttl_secs: None,
-            sticky_max_entries: None,
-            session_prefix_bytes: None,
-            event_channel_capacity: None,
-            persist_interval_secs: None,
-            oauth_http_timeout_secs: None,
-            token_refresh_window_secs: None,
-            ui_refresh_secs: None,
-            sse_keepalive_secs: None,
-            quota_cache_ttl_secs: None,
-        }
-    }
-}
-
 /// Fields that only take effect after a restart, because they are baked into the
 /// router/listener/allocator path at startup.
 const RESTART_ONLY: &[&str] = &["listen", "max_body_bytes", "dashboard", "state_file"];
@@ -115,11 +92,15 @@ const RESTART_ONLY: &[&str] = &["listen", "max_body_bytes", "dashboard", "state_
 pub async fn get_server(State(state): State<Arc<AppState>>) -> Response {
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response(),
+        Err(e) => {
+            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+        }
     };
     let cfg: crate::config::Config = match toml::from_str(&raw) {
         Ok(c) => c,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response(),
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("config parse error: {e}")).into_response();
+        }
     };
     let s = &cfg.server;
     Json(ServerDto {
@@ -150,7 +131,11 @@ pub async fn update_server(
     if let Some(n) = body.max_retries
         && !(1..=32).contains(&n)
     {
-        return (StatusCode::BAD_REQUEST, "max_retries must be between 1 and 32").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "max_retries must be between 1 and 32",
+        )
+            .into_response();
     }
     if let Some(t) = body.attempt_timeout_secs
         && !(1..=3600).contains(&t)
@@ -178,7 +163,11 @@ pub async fn update_server(
     if let Some(h) = body.requests_history
         && h > 100_000
     {
-        return (StatusCode::BAD_REQUEST, "requests_history must be <= 100000").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "requests_history must be <= 100000",
+        )
+            .into_response();
     }
     if let Some(r) = body.models_refresh_secs
         && r > 86_400
@@ -210,7 +199,9 @@ pub async fn update_server(
     let _guard = state.config_lock.lock().await;
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response(),
+        Err(e) => {
+            return (StatusCode::NOT_FOUND, format!("cannot read config: {e}")).into_response();
+        }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
@@ -335,12 +326,20 @@ pub async fn update_server(
         if v.is_empty() || current_set {
             if v.is_empty() && current_set {
                 server.remove(name);
-                changed.push(if name == "api_key" { "api_key" } else { "admin_key" });
+                changed.push(if name == "api_key" {
+                    "api_key"
+                } else {
+                    "admin_key"
+                });
             }
             continue;
         }
         server[name] = toml_edit::value(v);
-        changed.push(if name == "api_key" { "api_key" } else { "admin_key" });
+        changed.push(if name == "api_key" {
+            "api_key"
+        } else {
+            "admin_key"
+        });
     }
 
     // `[tuning]`: every field is optional and only written when it really differs.
@@ -399,7 +398,7 @@ pub async fn update_server(
     // The file is validated as a whole by write_validated(), which also runs the
     // Tuning range checks — an out-of-range number never reaches the disk.
     if let Err(resp) = write_validated(&state, &doc).await {
-        return resp;
+        return *resp;
     }
     state.events.emit_simple(
         "config",

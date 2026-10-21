@@ -16,7 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # Style is a gate, not a suggestion: an unformatted or un-linted tree fails CI.
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build
         run: cargo build --locked --all-targets
       - name: Unit tests
@@ -62,17 +69,3 @@ jobs:
       # still produce a working app. Fail the job if the bundle is missing.
       - name: Check bundle
         run: test -s ui/dist/index.html && test -n "$(ls ui/dist/*_bg.wasm)"
-
-  # Advisory: these are not gated locally, so they run without blocking the merge
-  # until the existing warnings are cleaned up.
-  lint:
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked -- -D warnings
-      - run: cargo fmt --check

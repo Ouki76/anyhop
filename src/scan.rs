@@ -248,7 +248,8 @@ mod tests {
     #[test]
     fn model_as_text_inside_a_message_is_ignored() {
         // The literal text `"model":"fake"` inside a string value must not match.
-        let body = br#"{"messages":[{"role":"user","content":"{\"model\":\"fake\"}"}],"model":"real"}"#;
+        let body =
+            br#"{"messages":[{"role":"user","content":"{\"model\":\"fake\"}"}],"model":"real"}"#;
         assert_eq!(peek_request(body).unwrap().0, "real");
     }
 
@@ -273,7 +274,13 @@ mod tests {
 
     #[test]
     fn unbalanced_body_does_not_panic() {
-        for body in [&b"}"[..], &b"{"[..], &b"\"model\":"[..], &b""[..], &b"{\"model\":\"m\""[..]] {
+        for body in [
+            &b"}"[..],
+            &b"{"[..],
+            &b"\"model\":"[..],
+            &b""[..],
+            &b"{\"model\":\"m\""[..],
+        ] {
             let _ = peek_request(body);
             let _ = string_field_span(body, b"model");
         }

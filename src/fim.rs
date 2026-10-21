@@ -13,8 +13,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
-use crate::proxy::AppState;
 use crate::providers::Resolved;
+use crate::proxy::AppState;
 
 const FIM_SYSTEM: &str = "You are a code completion engine. \
 The user gives you a code file with a <FILL_HERE> marker. \
@@ -49,7 +49,10 @@ pub async fn fim_completions(
     }
 
     {
-        let dm = state.disabled_models.read().unwrap_or_else(|e| e.into_inner());
+        let dm = state
+            .disabled_models
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let bare = model.strip_prefix("combo/").unwrap_or(model);
         if dm.contains(model) || dm.contains(bare) {
             return crate::proxy::error_response(
@@ -96,7 +99,15 @@ pub async fn fim_completions(
     let (provider, upstream_model) = match &resolved {
         Resolved::One(p, m) => {
             let canonical = format!("{}/{}", p.name, m);
-            if crate::proxy::model_disabled(&state.disabled_models.read().unwrap_or_else(|e| e.into_inner()), model, &canonical, m) {
+            if crate::proxy::model_disabled(
+                &state
+                    .disabled_models
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner()),
+                model,
+                &canonical,
+                m,
+            ) {
                 return crate::proxy::error_response(
                     StatusCode::NOT_FOUND,
                     format!("model '{model}' is disabled"),
@@ -126,9 +137,13 @@ pub async fn fim_completions(
             }
             let active = {
                 // one read guard for the whole scan, not per entry
-                let disabled = state.disabled_models.read().unwrap_or_else(|e| e.into_inner());
+                let disabled = state
+                    .disabled_models
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
                 chain.iter().find(|(p, m)| {
-                    !disabled.contains(&format!("{}/{}", p.name, m)) && !disabled.contains(m.as_str())
+                    !disabled.contains(&format!("{}/{}", p.name, m))
+                        && !disabled.contains(m.as_str())
                 })
             };
             match active {
@@ -144,7 +159,8 @@ pub async fn fim_completions(
         }
     };
 
-    let resp = crate::proxy::run_target_pub(&state, provider, &upstream_model, &synthetic, false).await;
+    let resp =
+        crate::proxy::run_target_pub(&state, provider, &upstream_model, &synthetic, false).await;
     let Some(resp) = resp else {
         return crate::proxy::error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -200,7 +216,10 @@ fn trim_prefix_overlap(text: &str, prefix: &str) -> String {
     }
     let max = pre.len().min(text.len());
     // skip offsets that split a multi-byte char — slicing there panics
-    for k in (12..=max).rev().filter(|&k| pre.is_char_boundary(pre.len() - k)) {
+    for k in (12..=max)
+        .rev()
+        .filter(|&k| pre.is_char_boundary(pre.len() - k))
+    {
         if text.starts_with(&pre[pre.len() - k..]) {
             return text[k..].trim_start_matches('\n').to_string();
         }

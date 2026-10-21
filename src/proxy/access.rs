@@ -15,7 +15,9 @@ pub fn model_allowed(allowed: &[String], requested: &str, canonical: &str, upstr
 /// Allowlist matching for combos: "combo/flash" and "flash" are equivalent.
 pub fn combo_allowed(allowed: &[String], requested: &str) -> bool {
     let bare = requested.strip_prefix("combo/").unwrap_or(requested);
-    allowed.iter().any(|a| a.strip_prefix("combo/").unwrap_or(a) == bare)
+    allowed
+        .iter()
+        .any(|a| a.strip_prefix("combo/").unwrap_or(a) == bare)
 }
 
 pub fn model_disabled(

@@ -87,7 +87,9 @@ pub async fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str) -> Option<T> {
 
 /// POST and report success (2xx). Sets NEED_AUTH on 401 like the other helpers.
 pub async fn post_json<B: serde::Serialize>(url: &str, body: &B) -> bool {
-    let Ok(req) = Request::post(url).json(body) else { return false };
+    let Ok(req) = Request::post(url).json(body) else {
+        return false;
+    };
     if let Some(k) = stored_key() {
         req.headers().set("Authorization", &format!("Bearer {k}"));
     }

@@ -76,7 +76,10 @@ pub(crate) fn mask_proxy(url: &str) -> String {
 pub(crate) fn validate_name(kind: &str, name: &str) -> Result<(), (StatusCode, String)> {
     let n = name.trim();
     if n.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, format!("{kind} name must not be empty")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{kind} name must not be empty"),
+        ));
     }
     if n.chars().count() > 64 {
         return Err((
@@ -90,7 +93,9 @@ pub(crate) fn validate_name(kind: &str, name: &str) -> Result<(), (StatusCode, S
     {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("{kind} name may only contain letters, digits, '-', '_' and '.' (found '{bad}')"),
+            format!(
+                "{kind} name may only contain letters, digits, '-', '_' and '.' (found '{bad}')"
+            ),
         ));
     }
     Ok(())
@@ -143,6 +148,9 @@ mod tests {
 
     #[test]
     fn masking_survives_a_path_suffix() {
-        assert_eq!(mask_proxy("http://u:p@h:1/some?q=1"), "http://***:***@h:1/some?q=1");
+        assert_eq!(
+            mask_proxy("http://u:p@h:1/some?q=1"),
+            "http://***:***@h:1/some?q=1"
+        );
     }
 }

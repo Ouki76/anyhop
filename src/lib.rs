@@ -8,7 +8,6 @@
 pub mod anthropic;
 pub mod antigravity;
 pub mod api;
-pub mod middleware;
 pub mod codex;
 pub mod config;
 #[cfg(feature = "dashboard")]
@@ -16,13 +15,14 @@ pub mod dashboard;
 pub mod events;
 pub mod fim;
 pub mod gemini;
+pub mod middleware;
 pub mod pool;
-pub mod scan;
-pub mod sse;
-pub mod storage;
 pub mod providers;
 pub mod proxy;
 pub mod ratelimit;
+pub mod scan;
+pub mod sse;
+pub mod storage;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,7 +69,9 @@ async fn async_main() -> anyhow::Result<()> {
         if let Ok(meta) = std::fs::metadata(&config_path)
             && meta.permissions().mode() & 0o077 != 0
         {
-            tracing::warn!("config {config_path} is readable by others — secrets! chmod 600 recommended");
+            tracing::warn!(
+                "config {config_path} is readable by others — secrets! chmod 600 recommended"
+            );
         }
     }
 
@@ -82,7 +84,10 @@ async fn async_main() -> anyhow::Result<()> {
                 Some(s)
             }
             Err(e) => {
-                tracing::warn!("cannot open state file '{}': {e} (running without persistence)", cfg.server.state_file);
+                tracing::warn!(
+                    "cannot open state file '{}': {e} (running without persistence)",
+                    cfg.server.state_file
+                );
                 None
             }
         }
@@ -227,8 +232,8 @@ async fn async_main() -> anyhow::Result<()> {
             {
                 // Missing SIGTERM support must not block Ctrl+C shutdown:
                 // fall back to a never-resolving future for the term branch.
-                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .ok();
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {}
                     _ = async {
@@ -313,7 +318,10 @@ pub fn reload_config(state: &Arc<proxy::AppState>) -> anyhow::Result<usize> {
         }
     }
     {
-        let mut dm = state.disabled_models.write().unwrap_or_else(|e| e.into_inner());
+        let mut dm = state
+            .disabled_models
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         dm.clear();
         for m in &cfg.disabled_models {
             dm.insert(m.clone());
@@ -338,8 +346,12 @@ async fn handle_cli() -> anyhow::Result<bool> {
             println!("anyhop — OpenAI-compatible LLM gateway with key rotation\n");
             println!("USAGE:");
             println!("  anyhop                                          start the gateway");
-            println!("  anyhop auth antigravity [--proxy socks5://…]    add an Antigravity account via Google OAuth");
-            println!("  anyhop auth codex       [--proxy socks5://…]    add a ChatGPT/Codex account via OpenAI OAuth");
+            println!(
+                "  anyhop auth antigravity [--proxy socks5://…]    add an Antigravity account via Google OAuth"
+            );
+            println!(
+                "  anyhop auth codex       [--proxy socks5://…]    add a ChatGPT/Codex account via OpenAI OAuth"
+            );
             println!("  anyhop --help                                   this text");
             println!("\nENV:");
             println!("  ANYHOP_CONFIG   path to config (default: anyhop.toml)");
@@ -393,7 +405,9 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
             state.clone(),
             middleware::require_api_key,
         ))
-        .layer(axum::extract::DefaultBodyLimit::max(cfg.server.max_body_bytes));
+        .layer(axum::extract::DefaultBodyLimit::max(
+            cfg.server.max_body_bytes,
+        ));
 
     let admin_base = axum::Router::new()
         .route("/api/providers", get(api::providers))
@@ -411,7 +425,10 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
         .route("/api/combos/add", post(api::combo_add))
         .route("/api/combos/update", post(api::combo_update))
         .route("/api/combos/delete", post(api::combo_delete))
-        .route("/api/client-keys", get(api::client_keys_list).post(api::client_key_add))
+        .route(
+            "/api/client-keys",
+            get(api::client_keys_list).post(api::client_key_add),
+        )
         .route("/api/client-keys/add", post(api::client_key_add))
         .route("/api/client-keys/delete", post(api::client_key_delete))
         .route("/api/client-keys/update", post(api::client_key_update))
@@ -437,7 +454,9 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
             state.clone(),
             middleware::require_admin_key,
         ))
-        .layer(axum::extract::DefaultBodyLimit::max(cfg.server.max_body_bytes));
+        .layer(axum::extract::DefaultBodyLimit::max(
+            cfg.server.max_body_bytes,
+        ));
 
     // Applied last so it also normalises the bodies produced by the auth layers.
     let app = axum::Router::new()
@@ -452,23 +471,23 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
     #[cfg(feature = "dashboard")]
     let app = if cfg.server.dashboard {
         info!("dashboard: /dashboard (Sycamore UI)");
-        app.route("/", get(|| async { axum::response::Redirect::to("/dashboard") }))
-            .route("/dashboard", get(dashboard::index))
-            .route("/dashboard/", get(dashboard::index))
-            .route("/dashboard/{*path}", get(dashboard::asset))
+        app.route(
+            "/",
+            get(|| async { axum::response::Redirect::to("/dashboard") }),
+        )
+        .route("/dashboard", get(dashboard::index))
+        .route("/dashboard/", get(dashboard::index))
+        .route("/dashboard/{*path}", get(dashboard::asset))
     } else {
         info!("dashboard disabled by config");
         app
     };
 
-    let app = app
-        .with_state(state.clone())
+    app.with_state(state.clone())
         // Outermost layer: hardening headers on every response, including 401s
         // and errors produced by the auth middlewares inside.
-        .layer(axum::middleware::from_fn(middleware::security_headers));
-
-    app
-    }
+        .layer(axum::middleware::from_fn(middleware::security_headers))
+}
 
 /// Long-running maintenance tasks: SIGHUP hot reload, periodic stats/feed
 /// persistence and periodic model-list refresh.
@@ -480,14 +499,14 @@ fn spawn_background_tasks(state: Arc<proxy::AppState>, cfg: &config::Config) {
         tokio::spawn(async move {
             // Registration can fail on exotic kernels/containers; treat it as
             // "hot reload unavailable" rather than panicking the reload task.
-            let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("SIGHUP handler unavailable, hot reload disabled: {e}");
-                    return;
-                }
-            };
+            let mut sig =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("SIGHUP handler unavailable, hot reload disabled: {e}");
+                        return;
+                    }
+                };
             loop {
                 sig.recv().await;
                 match reload_config(&st) {
@@ -550,4 +569,3 @@ fn persist_feeds(state: &Arc<proxy::AppState>) {
         s.save_feed("requests", &v);
     }
 }
-

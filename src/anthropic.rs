@@ -37,8 +37,7 @@ fn content_blocks(content: Option<&Value>) -> Result<Vec<Value>, String> {
             for p in arr {
                 match p.get("type").and_then(|t| t.as_str()) {
                     Some("text") => {
-                        let mut b =
-                            json!({"type": "text", "text": p.get("text").cloned().unwrap_or(json!(""))});
+                        let mut b = json!({"type": "text", "text": p.get("text").cloned().unwrap_or(json!(""))});
                         // Prompt caching: forward cache_control breakpoints as-is.
                         if let Some(cc) = p.get("cache_control") {
                             b["cache_control"] = cc.clone();
@@ -169,7 +168,11 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
     // Anthropic requires strictly alternating user/assistant — merge same-role runs.
     let mut merged: Vec<Value> = Vec::new();
     for m in out_msgs {
-        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
+        let role = m
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
         if let Some(last) = merged.last_mut()
             && last.get("role").and_then(|r| r.as_str()) == Some(role.as_str())
         {
@@ -226,7 +229,10 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
             "high" | "xhigh" | "max" => Some(24576),
             _ => None,
         })
-        .or_else(|| body.pointer("/thinking/budget_tokens").and_then(|b| b.as_i64()));
+        .or_else(|| {
+            body.pointer("/thinking/budget_tokens")
+                .and_then(|b| b.as_i64())
+        });
     match budget {
         Some(b) if b > 0 => {
             // Anthropic 400s when max_tokens <= budget_tokens — grow max_tokens
@@ -343,7 +349,11 @@ pub fn translate_response(model: &str, v: &Value) -> Value {
     if tool_calls.is_empty() {
         msg["content"] = json!(content);
     } else {
-        msg["content"] = if content.is_empty() { Value::Null } else { json!(content) };
+        msg["content"] = if content.is_empty() {
+            Value::Null
+        } else {
+            json!(content)
+        };
         msg["tool_calls"] = json!(tool_calls);
     }
     if !reasoning.is_empty() {

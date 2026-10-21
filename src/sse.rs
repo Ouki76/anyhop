@@ -47,6 +47,12 @@ impl SseParser {
     }
 }
 
+impl Default for SseParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Extract `data:` payloads from one raw event block.
 fn push_event(event: &[u8], out: &mut Vec<Bytes>) {
     let mut data: Option<BytesMut> = None;
@@ -57,7 +63,11 @@ fn push_event(event: &[u8], out: &mut Vec<Bytes>) {
             _ => line,
         };
         if let Some(rest) = line.strip_prefix(b"data:") {
-            let rest = if rest.first() == Some(&b' ') { &rest[1..] } else { rest };
+            let rest = if rest.first() == Some(&b' ') {
+                &rest[1..]
+            } else {
+                rest
+            };
             match &mut data {
                 Some(d) => {
                     d.extend_from_slice(b"\n");

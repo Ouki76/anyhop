@@ -69,7 +69,9 @@ fn bearer_ok(req: &Request, expected: &str) -> bool {
         .map(|t| token_eq(t, expected))
         .unwrap_or(false);
     // EventSource cannot send headers — allow ?key= on GET requests
-    let query_ok = query_key(req).map(|k| token_eq(&k, expected)).unwrap_or(false);
+    let query_ok = query_key(req)
+        .map(|k| token_eq(&k, expected))
+        .unwrap_or(false);
     header_ok || query_ok
 }
 
@@ -223,7 +225,11 @@ pub async fn json_errors(req: Request, next: Next) -> Response {
     };
     let message = String::from_utf8_lossy(&bytes).trim().to_string();
     let message = if message.is_empty() {
-        parts.status.canonical_reason().unwrap_or("error").to_string()
+        parts
+            .status
+            .canonical_reason()
+            .unwrap_or("error")
+            .to_string()
     } else {
         message
     };
@@ -306,11 +312,11 @@ mod json_error_tests {
         assert_eq!(error_type(StatusCode::UNAUTHORIZED), "authentication_error");
         assert_eq!(error_type(StatusCode::FORBIDDEN), "permission_error");
         assert_eq!(error_type(StatusCode::NOT_FOUND), "not_found_error");
-        assert_eq!(error_type(StatusCode::TOO_MANY_REQUESTS), "rate_limit_error");
-        assert_eq!(error_type(StatusCode::BAD_GATEWAY), "api_error");
         assert_eq!(
-            error_type(StatusCode::INTERNAL_SERVER_ERROR),
-            "api_error"
+            error_type(StatusCode::TOO_MANY_REQUESTS),
+            "rate_limit_error"
         );
+        assert_eq!(error_type(StatusCode::BAD_GATEWAY), "api_error");
+        assert_eq!(error_type(StatusCode::INTERNAL_SERVER_ERROR), "api_error");
     }
 }

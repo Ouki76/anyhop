@@ -104,7 +104,11 @@ impl KeyState {
         // char-safe: &s[..8] panics when byte 8 splits a multi-byte char
         let mut it = s.chars();
         let prefix: String = it.by_ref().take(8).collect();
-        if it.next().is_none() { "****".into() } else { format!("{prefix}…") }
+        if it.next().is_none() {
+            "****".into()
+        } else {
+            format!("{prefix}…")
+        }
     }
 
     fn is_available(&self, model: &str) -> bool {
@@ -320,6 +324,10 @@ impl KeyPool {
         lock(&self.keys).len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Whether sticky routing can change the outcome for this pool.
     ///
     /// With a single key, or with `fill_first` (which is sticky by construction),
@@ -344,7 +352,8 @@ impl KeyPool {
                     let mut map = lock(&self.sticky);
                     match map.get_mut(&s) {
                         Some((kid, seen))
-                            if now.saturating_sub(*seen) < self.tuning.sticky_ttl().as_millis() as u64 =>
+                            if now.saturating_sub(*seen)
+                                < self.tuning.sticky_ttl().as_millis() as u64 =>
                         {
                             *seen = now;
                             Some(kid.clone())
@@ -482,7 +491,9 @@ impl KeyPool {
 
     /// Enable (clear dead/cooldown) or disable (dead) a key. Returns false if unknown id.
     pub fn set_enabled(&self, id: &str, enabled: bool) -> bool {
-        let Some(key) = self.key_by_id(id) else { return false };
+        let Some(key) = self.key_by_id(id) else {
+            return false;
+        };
         if enabled {
             key.status.store(STATUS_ACTIVE, Ordering::Relaxed);
             key.cooldown_until_ms.store(0, Ordering::Relaxed);
@@ -494,7 +505,12 @@ impl KeyPool {
         self.emit(
             &key,
             "backoff",
-            if enabled { "key enabled manually" } else { "key disabled manually" }.into(),
+            if enabled {
+                "key enabled manually"
+            } else {
+                "key disabled manually"
+            }
+            .into(),
         );
         true
     }
@@ -635,7 +651,13 @@ mod tests {
         }
         // Put the first key in cooldown: the next pick must move on.
         let first = p.pick("m", None).unwrap();
-        p.report_failure(&first, FailKind::RateLimited { retry_after_secs: Some(60) }, "m");
+        p.report_failure(
+            &first,
+            FailKind::RateLimited {
+                retry_after_secs: Some(60),
+            },
+            "m",
+        );
         assert_eq!(p.pick("m", None).unwrap().secret, "second");
     }
 
@@ -645,10 +667,20 @@ mod tests {
         let busy = p.pick("m", None).unwrap();
         // Same tie both times → `min_by_key` keeps the first; force a difference.
         busy.requests.store(10, Ordering::Relaxed);
-        let other = p.snapshot().iter().find(|k| k.id != busy.id_hash).unwrap().id.clone();
+        let other = p
+            .snapshot()
+            .iter()
+            .find(|k| k.id != busy.id_hash)
+            .unwrap()
+            .id
+            .clone();
         assert!(p.set_enabled(&other, true));
         let picked = p.pick("m", None).unwrap();
-        assert_eq!(picked.requests.load(Ordering::Relaxed), 0, "least_used picked the busy key");
+        assert_eq!(
+            picked.requests.load(Ordering::Relaxed),
+            0,
+            "least_used picked the busy key"
+        );
     }
 
     // ----- failure classification -----
@@ -670,7 +702,13 @@ mod tests {
     fn rate_limit_sets_a_cooldown_of_the_requested_length() {
         let p = pool(Strategy::RoundRobin, &["k1"]);
         let k = p.pick("m", None).unwrap();
-        p.report_failure(&k, FailKind::RateLimited { retry_after_secs: Some(120) }, "m");
+        p.report_failure(
+            &k,
+            FailKind::RateLimited {
+                retry_after_secs: Some(120),
+            },
+            "m",
+        );
         assert_eq!(k.status.load(Ordering::Relaxed), STATUS_COOLDOWN);
         let snap = p.snapshot();
         // 120s requested; allow a second of drift and enforce the upper clamp.
@@ -692,7 +730,10 @@ mod tests {
         let first = p.snapshot()[0].cooldown_remaining_secs;
         p.report_failure(&k, FailKind::Server, "m"); // 10s
         let second = p.snapshot()[0].cooldown_remaining_secs;
-        assert!(second > first, "expected exponential growth: {first}s → {second}s");
+        assert!(
+            second > first,
+            "expected exponential growth: {first}s → {second}s"
+        );
         for _ in 0..20 {
             p.report_failure(&k, FailKind::Server, "m");
         }
@@ -712,7 +753,10 @@ mod tests {
         assert_eq!(k.status.load(Ordering::Relaxed), STATUS_ACTIVE);
         // …but is unavailable for the exhausted model only.
         assert!(p.pick("m1", None).is_none());
-        assert!(p.pick("m2", None).is_some(), "sibling model must keep working");
+        assert!(
+            p.pick("m2", None).is_some(),
+            "sibling model must keep working"
+        );
     }
 
     #[test]
@@ -729,20 +773,38 @@ mod tests {
 
     #[test]
     fn max_concurrent_is_enforced_and_slots_are_released() {
-        let p = KeyPool::new("t".into(), vec!["k1".into()], Strategy::RoundRobin, 1, None, None);
+        let p = KeyPool::new(
+            "t".into(),
+            vec!["k1".into()],
+            Strategy::RoundRobin,
+            1,
+            None,
+            None,
+        );
         let k = p.pick("m", None).unwrap();
         let guard = k.try_acquire().expect("first slot");
-        assert!(k.try_acquire().is_none(), "limit 1 must not hand out a second slot");
-        assert!(p.pick("m", None).is_none(), "saturated key must not be picked");
+        assert!(
+            k.try_acquire().is_none(),
+            "limit 1 must not hand out a second slot"
+        );
+        assert!(
+            p.pick("m", None).is_none(),
+            "saturated key must not be picked"
+        );
         drop(guard);
-        assert!(k.try_acquire().is_some(), "dropping the guard must free the slot");
+        assert!(
+            k.try_acquire().is_some(),
+            "dropping the guard must free the slot"
+        );
     }
 
     #[test]
     fn unlimited_concurrency_always_grants() {
         let p = pool(Strategy::RoundRobin, &["k1"]);
         let k = p.pick("m", None).unwrap();
-        let guards: Vec<_> = (0..100).map(|_| k.try_acquire().expect("unlimited")).collect();
+        let guards: Vec<_> = (0..100)
+            .map(|_| k.try_acquire().expect("unlimited"))
+            .collect();
         assert_eq!(k.in_flight.load(Ordering::Relaxed), 100);
         drop(guards);
         assert_eq!(k.in_flight.load(Ordering::Relaxed), 0);
@@ -780,8 +842,14 @@ mod tests {
         // a valid handle and must be rejected rather than silently mis-matched.
         let tail = &snap[0].id[snap[0].id.len() - 8..];
         assert!(p.key_by_id(tail).is_some(), "unique suffix must resolve");
-        assert!(p.key_by_id("short").is_none(), "too-short ids must be rejected");
-        assert!(p.key_by_id("00000000not-a-real-id").is_none(), "unknown id must be rejected");
+        assert!(
+            p.key_by_id("short").is_none(),
+            "too-short ids must be rejected"
+        );
+        assert!(
+            p.key_by_id("00000000not-a-real-id").is_none(),
+            "unknown id must be rejected"
+        );
     }
 
     #[test]
@@ -811,7 +879,10 @@ mod tests {
         let k = KeyState::new("ключ-с-кириллицей-и-длиной".into(), 0);
         let m = k.masked();
         assert!(m.ends_with('…'), "long secret must be truncated: {m}");
-        assert!(!m.contains("длиной"), "masked form must not contain the tail: {m}");
+        assert!(
+            !m.contains("длиной"),
+            "masked form must not contain the tail: {m}"
+        );
         // Short secrets collapse to a constant, never the value itself.
         let short = KeyState::new("abc".into(), 0);
         assert_eq!(short.masked(), "****");
@@ -821,9 +892,18 @@ mod tests {
     fn wake_after_reports_the_soonest_recovery() {
         let p = pool(Strategy::RoundRobin, &["k1"]);
         let k = p.pick("m", None).unwrap();
-        p.report_failure(&k, FailKind::RateLimited { retry_after_secs: Some(30) }, "m");
+        p.report_failure(
+            &k,
+            FailKind::RateLimited {
+                retry_after_secs: Some(30),
+            },
+            "m",
+        );
         let d = p.wake_after("m").expect("cooldown must be reportable");
-        assert!((28..=30).contains(&d.as_secs()), "unexpected wake_after {d:?}");
+        assert!(
+            (28..=30).contains(&d.as_secs()),
+            "unexpected wake_after {d:?}"
+        );
     }
 
     #[test]
@@ -837,7 +917,14 @@ mod tests {
 
     #[test]
     fn wake_after_is_none_when_a_key_is_merely_busy() {
-        let p = KeyPool::new("t".into(), vec!["k1".into()], Strategy::RoundRobin, 1, None, None);
+        let p = KeyPool::new(
+            "t".into(),
+            vec!["k1".into()],
+            Strategy::RoundRobin,
+            1,
+            None,
+            None,
+        );
         let k = p.pick("m", None).unwrap();
         let _busy = k.try_acquire().expect("slot");
         // Busy is not cooling: the client should retry immediately, so no header.
@@ -851,6 +938,9 @@ mod tests {
         let c = KeyState::new("other-secret".into(), 0);
         assert_eq!(a.id_hash, b.id_hash);
         assert_ne!(a.id_hash, c.id_hash);
-        assert!(!a.id_hash.contains("secret"), "id must be a hash, not the secret");
+        assert!(
+            !a.id_hash.contains("secret"),
+            "id must be a hash, not the secret"
+        );
     }
 }

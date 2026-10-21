@@ -218,13 +218,11 @@ pub async fn auth_start(
 
     // Code channel: fed by the public callback route or by a pasted URL.
     let (code_tx, mut code_rx) = tokio::sync::mpsc::channel::<(String, String)>(4);
-    *state
-        .auth_code_tx
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(code_tx);
+    *state.auth_code_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(code_tx);
 
     let pending = if is_ag {
-        match crate::antigravity::start_auth_with(None, &state.tuning, redirect_uri.as_deref()).await
+        match crate::antigravity::start_auth_with(None, &state.tuning, redirect_uri.as_deref())
+            .await
         {
             Ok(p) => Flow::Antigravity(p),
             Err(e) => return (StatusCode::CONFLICT, e.to_string()).into_response(),
@@ -317,10 +315,7 @@ pub async fn auth_start(
     });
     // Keep the handle so /api/auth/cancel (and a flow for another provider) can
     // abort it: aborting drops the pending listener and frees the callback port.
-    *state
-        .auth_task
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    *state.auth_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
 
     Json(serde_json::json!({"url": url, "state": state_token, "mode": if headless_now { "public" } else { "loopback" }}))
         .into_response()
@@ -404,7 +399,11 @@ fn parse_callback_input(input: &str) -> (Option<String>, Option<String>) {
     if !input.contains("code=") {
         // A bare code was pasted.
         return (
-            if input.is_empty() { None } else { Some(input.to_string()) },
+            if input.is_empty() {
+                None
+            } else {
+                Some(input.to_string())
+            },
             None,
         );
     }
@@ -478,7 +477,11 @@ pub async fn auth_complete(
         .to_string();
     let (code, st) = parse_callback_input(&input);
     let Some(code) = code else {
-        return (StatusCode::BAD_REQUEST, "paste the callback URL or the code").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "paste the callback URL or the code",
+        )
+            .into_response();
     };
     // Prefer the state from the pasted URL; fall back to the pending flow's own.
     let state_token = st.or_else(|| {
@@ -500,7 +503,11 @@ pub async fn auth_complete(
 }
 
 pub async fn auth_status(State(state): State<Arc<AppState>>) -> Response {
-    let g = state.auth_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let g = state
+        .auth_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     Json(g).into_response()
 }
 
@@ -613,7 +620,10 @@ mod auth_flow_tests {
     #[test]
     fn a_pending_flow_is_only_resumed_for_the_same_provider() {
         assert_eq!(resume_or_replace(Some(("codex", "u")), "codex"), "resume");
-        assert_eq!(resume_or_replace(Some(("codex", "u")), "antigravity"), "replace");
+        assert_eq!(
+            resume_or_replace(Some(("codex", "u")), "antigravity"),
+            "replace"
+        );
         assert_eq!(resume_or_replace(None, "antigravity"), "start");
     }
 }

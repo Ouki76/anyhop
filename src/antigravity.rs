@@ -40,8 +40,8 @@ const SCOPES: &[&str] = &[
 /// cloudcode rejects newer models for older clients.
 pub const USER_AGENT: &str = "antigravity/hub/2.9.1 darwin/arm64";
 
-/// Refresh tokens are renewed slightly before expiry.
-// Token refresh window is configurable via `[tuning] token_refresh_window_secs`.
+// Refresh tokens are renewed slightly before expiry; the window is
+// `[tuning] token_refresh_window_secs`.
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -153,7 +153,13 @@ impl Account {
         }
     }
 
-    fn persist(&self, access_token: &str, expires_at_ms: u64, project_id: Option<&str>, refresh_token: Option<&str>) {
+    fn persist(
+        &self,
+        access_token: &str,
+        expires_at_ms: u64,
+        project_id: Option<&str>,
+        refresh_token: Option<&str>,
+    ) {
         if let Some(s) = &self.storage {
             s.save_oauth(
                 &self.provider,
@@ -247,7 +253,12 @@ impl Account {
             st.refresh_token = Some(rt.to_string());
         }
         let project = st.project_id.clone();
-        self.persist(&token, st.expires_at_ms, project.as_deref(), st.refresh_token.as_deref());
+        self.persist(
+            &token,
+            st.expires_at_ms,
+            project.as_deref(),
+            st.refresh_token.as_deref(),
+        );
         Ok(token)
     }
 
@@ -276,9 +287,13 @@ impl Account {
         if !status.is_success() {
             let snippet: String = body.chars().take(300).collect();
             return if matches!(status.as_u16(), 401 | 403) {
-                Err(AuthError::Permanent(format!("loadCodeAssist {status}: {snippet}")))
+                Err(AuthError::Permanent(format!(
+                    "loadCodeAssist {status}: {snippet}"
+                )))
             } else {
-                Err(AuthError::Transient(format!("loadCodeAssist {status}: {snippet}")))
+                Err(AuthError::Transient(format!(
+                    "loadCodeAssist {status}: {snippet}"
+                )))
             };
         }
 
@@ -358,7 +373,10 @@ pub async fn fetch_available_models(
         let q = m.get("quotaInfo").or_else(|| m.get("quota"));
         let frac = q
             .and_then(|q| q.get("remainingFraction").or_else(|| q.get("remaining")))
-            .and_then(|f| f.as_f64().or_else(|| f.as_str().and_then(|s| s.parse().ok())));
+            .and_then(|f| {
+                f.as_f64()
+                    .or_else(|| f.as_str().and_then(|s| s.parse().ok()))
+            });
         let reset = q
             .and_then(|q| q.get("resetTime").or_else(|| q.get("reset_time")))
             .and_then(|r| r.as_str())
@@ -408,9 +426,10 @@ pub fn translate_request_envelope(
     project_id: &str,
 ) -> Result<Value, String> {
     if let Some(obj) = inner.as_object_mut()
-        && let Some(si) = obj.remove("system_instruction") {
-            obj.insert("systemInstruction".into(), si);
-        }
+        && let Some(si) = obj.remove("system_instruction")
+    {
+        obj.insert("systemInstruction".into(), si);
+    }
     if let Some(tools) = inner.get_mut("tools").and_then(|t| t.as_array_mut()) {
         for tool in tools.iter_mut() {
             for key in ["function_declarations", "functionDeclarations"] {
@@ -586,7 +605,10 @@ pub async fn exchange_code(
             anyhow::anyhow!("no refresh_token in exchange response (retry the auth URL)")
         })?
         .to_string();
-    Ok(AuthTokens { access_token, refresh_token })
+    Ok(AuthTokens {
+        access_token,
+        refresh_token,
+    })
 }
 
 pub async fn fetch_email(http: &reqwest::Client, access_token: &str) -> Option<String> {
@@ -664,9 +686,11 @@ pub async fn start_auth_with(
             let url = build_auth_url_with(&state, &uri);
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
                 .await
-                .map_err(|e| anyhow::anyhow!(
-                    "cannot bind localhost:{CALLBACK_PORT}: {e} (auth already running?)"
-                ))?;
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "cannot bind localhost:{CALLBACK_PORT}: {e} (auth already running?)"
+                    )
+                })?;
             Ok(PendingAuth {
                 url,
                 state,
@@ -723,7 +747,10 @@ pub async fn wait_for_callback(p: &PendingAuth) -> anyhow::Result<String> {
 
     let ok = code.is_some() && got_state.as_deref() == Some(p.state.as_str());
     let (status, page) = if ok {
-        ("200 OK", "<h1>anyhop: authorized</h1><p>You can close this tab.</p>")
+        (
+            "200 OK",
+            "<h1>anyhop: authorized</h1><p>You can close this tab.</p>",
+        )
     } else {
         ("400 Bad Request", "<h1>anyhop: authorization failed</h1>")
     };
@@ -733,7 +760,10 @@ pub async fn wait_for_callback(p: &PendingAuth) -> anyhow::Result<String> {
     let _ = sock.write_all(html.as_bytes()).await;
 
     let code = code.ok_or_else(|| anyhow::anyhow!("callback without code"))?;
-    anyhow::ensure!(got_state.as_deref() == Some(p.state.as_str()), "state mismatch, retry");
+    anyhow::ensure!(
+        got_state.as_deref() == Some(p.state.as_str()),
+        "state mismatch, retry"
+    );
     Ok(code)
 }
 
@@ -782,8 +812,13 @@ pub async fn run_auth_flow(proxy: Option<String>) -> anyhow::Result<()> {
     if let Some(p) = &proxy {
         println!("Using proxy: {p}");
     }
-    println!("\nOpen this link in a browser and sign in to your Google account:\n\n{}\n", pending.url);
-    let _ = std::process::Command::new("xdg-open").arg(&pending.url).spawn();
+    println!(
+        "\nOpen this link in a browser and sign in to your Google account:\n\n{}\n",
+        pending.url
+    );
+    let _ = std::process::Command::new("xdg-open")
+        .arg(&pending.url)
+        .spawn();
     println!("Waiting for the callback on localhost:{CALLBACK_PORT} ...");
     println!("Exchanging the authorization code for tokens...");
     let out = complete_auth(pending).await?;
@@ -850,7 +885,10 @@ mod token_rotation_tests {
         crate::storage::Storage::open(path.to_str().unwrap()).unwrap()
     }
 
-    fn account_with(storage: &crate::storage::Storage, cfg: crate::config::OAuthAccountConfig) -> Account {
+    fn account_with(
+        storage: &crate::storage::Storage,
+        cfg: crate::config::OAuthAccountConfig,
+    ) -> Account {
         Account::new(
             &cfg,
             "antigravity",

@@ -39,18 +39,27 @@ pub async fn put_config(
         // Don't interleave with other config writers mid-write.
         let _guard = state.config_lock.lock().await;
         if let Err(e) = crate::config::write_atomic(&state.config_path, &body.toml) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("cannot write config: {e}"))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot write config: {e}"),
+            )
                 .into_response();
         }
     }
     match crate::reload_config(&state) {
         Ok(n) => {
-            state
-                .events
-                .emit_simple("config", "", "backoff", format!("config saved, {n} providers reloaded"));
+            state.events.emit_simple(
+                "config",
+                "",
+                "backoff",
+                format!("config saved, {n} providers reloaded"),
+            );
             StatusCode::OK.into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, format!("config saved but reload failed: {e}"))
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            format!("config saved but reload failed: {e}"),
+        )
             .into_response(),
     }
 }

@@ -42,10 +42,7 @@ pub async fn chat_completions(
                     );
                 }
             };
-            let m = v
-                .get("model")
-                .and_then(|m| m.as_str())
-                .map(str::to_string);
+            let m = v.get("model").and_then(|m| m.as_str()).map(str::to_string);
             let Some(m) = m else {
                 return error_response(
                     StatusCode::BAD_REQUEST,
@@ -71,7 +68,10 @@ pub async fn chat_completions(
     // (one String alloc per disabled model per request). The guard is dropped
     // at the end of this block — before the first .await, keeping the handler Send.
     let targets: Vec<(&Provider, String)> = {
-        let disabled = state.disabled_models.read().unwrap_or_else(|e| e.into_inner());
+        let disabled = state
+            .disabled_models
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         // The requested name may be bare (disabled) or "combo/name" — check both.
         {
             let bare = model.strip_prefix("combo/").unwrap_or(&model);
@@ -84,52 +84,53 @@ pub async fn chat_completions(
             }
         }
         match &resolved {
-        Resolved::One(p, m) => {
-            let canonical = format!("{}/{}", p.name, m);
-            if model_disabled(&disabled, &model, &canonical, m) {
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    format!("model '{model}' is disabled"),
-                    "model_not_found",
-                );
+            Resolved::One(p, m) => {
+                let canonical = format!("{}/{}", p.name, m);
+                if model_disabled(&disabled, &model, &canonical, m) {
+                    return error_response(
+                        StatusCode::NOT_FOUND,
+                        format!("model '{model}' is disabled"),
+                        "model_not_found",
+                    );
+                }
+                if let Some(allowed) = key_models
+                    && !model_allowed(allowed, &model, &canonical, m)
+                {
+                    return error_response(
+                        StatusCode::FORBIDDEN,
+                        format!("model '{model}' is not allowed for this API key"),
+                        "model_not_allowed",
+                    );
+                }
+                vec![(*p, m.clone())]
             }
-            if let Some(allowed) = key_models
-                && !model_allowed(allowed, &model, &canonical, m)
-            {
-                return error_response(
-                    StatusCode::FORBIDDEN,
-                    format!("model '{model}' is not allowed for this API key"),
-                    "model_not_allowed",
-                );
+            Resolved::Chain(c) => {
+                if let Some(allowed) = key_models
+                    && !combo_allowed(allowed, &model)
+                {
+                    return error_response(
+                        StatusCode::FORBIDDEN,
+                        format!("model '{model}' is not allowed for this API key"),
+                        "model_not_allowed",
+                    );
+                }
+                let active: Vec<_> = c
+                    .iter()
+                    .filter(|(p, m)| {
+                        !disabled.contains(&format!("{}/{}", p.name, m))
+                            && !disabled.contains(m.as_str())
+                    })
+                    .cloned()
+                    .collect();
+                if active.is_empty() {
+                    return error_response(
+                        StatusCode::NOT_FOUND,
+                        format!("all targets in combo '{model}' are disabled"),
+                        "model_not_found",
+                    );
+                }
+                active
             }
-            vec![(*p, m.clone())]
-        }
-        Resolved::Chain(c) => {
-            if let Some(allowed) = key_models
-                && !combo_allowed(allowed, &model)
-            {
-                return error_response(
-                    StatusCode::FORBIDDEN,
-                    format!("model '{model}' is not allowed for this API key"),
-                    "model_not_allowed",
-                );
-            }
-            let active: Vec<_> = c
-                .iter()
-                .filter(|(p, m)| {
-                    !disabled.contains(&format!("{}/{}", p.name, m)) && !disabled.contains(m.as_str())
-                })
-                .cloned()
-                .collect();
-            if active.is_empty() {
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    format!("all targets in combo '{model}' are disabled"),
-                    "model_not_found",
-                );
-            }
-            active
-        }
         }
     };
 
@@ -137,7 +138,9 @@ pub async fn chat_completions(
     // failed (non-string model value etc.).
     if json.is_none()
         && (model_span.is_none()
-            || targets.iter().any(|(p, _)| p.kind != ProviderKind::OpenaiCompat))
+            || targets
+                .iter()
+                .any(|(p, _)| p.kind != ProviderKind::OpenaiCompat))
     {
         json = match serde_json::from_slice(&body) {
             Ok(v) => Some(v),
@@ -171,9 +174,7 @@ pub async fn chat_completions(
         None
     };
 
-    let client_key = key_perm
-        .as_ref()
-        .and_then(|e| e.0.key_name.clone());
+    let client_key = key_perm.as_ref().and_then(|e| e.0.key_name.clone());
     let client_key = client_key.as_deref();
     let max_retries = state.rt().max_retries;
     let total = targets.len();
@@ -201,7 +202,10 @@ pub async fn chat_completions(
                 "combo",
                 &model,
                 "backoff",
-                format!("target '{}/{}' exhausted, trying next", provider.name, upstream_model),
+                format!(
+                    "target '{}/{}' exhausted, trying next",
+                    provider.name, upstream_model
+                ),
             ));
         } else {
             let wake = provider.pool.wake_after(&model);
@@ -275,7 +279,18 @@ pub async fn run_target_pub(
 ) -> Option<Response> {
     let body = Bytes::from(serde_json::to_vec(payload).unwrap_or_default());
     let span = crate::scan::string_field_span(&body, b"model");
-    run_target(state, provider, model, &body, span, Some(payload), is_stream, None, None).await
+    run_target(
+        state,
+        provider,
+        model,
+        &body,
+        span,
+        Some(payload),
+        is_stream,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Run the retry loop for one provider/model target.
@@ -323,7 +338,11 @@ async fn run_target(
     let translated = match translated {
         Some(Ok(b)) => Some(b),
         Some(Err(e)) => {
-            return Some(error_response(StatusCode::BAD_REQUEST, e, "invalid_request_error"));
+            return Some(error_response(
+                StatusCode::BAD_REQUEST,
+                e,
+                "invalid_request_error",
+            ));
         }
         None => None,
     };
@@ -463,8 +482,8 @@ async fn run_target(
                 let Some(inner) = translated.as_ref().cloned() else {
                     return Some(internal_body_error());
                 };
-                let envelope =
-                    match antigravity::translate_request_envelope(model, inner, &project) {
+                let envelope = match antigravity::translate_request_envelope(model, inner, &project)
+                {
                     Ok(v) => v,
                     Err(e) => {
                         return Some(error_response(
@@ -561,9 +580,11 @@ async fn run_target(
                 warn!(provider = %provider.name, key = %key.masked(), model, "model quota exhausted");
             }
             ErrorAction::RateLimited => {
-                provider
-                    .pool
-                    .report_failure(&key, FailKind::RateLimited { retry_after_secs }, model);
+                provider.pool.report_failure(
+                    &key,
+                    FailKind::RateLimited { retry_after_secs },
+                    model,
+                );
                 warn!(provider = %provider.name, key = %key.masked(), retry_after = ?retry_after_secs, "rate limited, key on cooldown");
             }
             ErrorAction::Auth => {
@@ -721,11 +742,14 @@ async fn success_response(
                             add_usage(
                                 &key,
                                 u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                                u.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                                u.get("completion_tokens")
+                                    .and_then(|x| x.as_u64())
+                                    .unwrap_or(0),
                             );
                         }
-                        let mut b = Response::builder()
-                            .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK));
+                        let mut b = Response::builder().status(
+                            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK),
+                        );
                         if let Some(ct) = content_type {
                             b = b.header(header::CONTENT_TYPE, ct);
                         }
@@ -736,20 +760,28 @@ async fn success_response(
                 }
             }
         }
-        ProviderKind::Gemini | ProviderKind::Antigravity | ProviderKind::Anthropic
+        ProviderKind::Gemini
+        | ProviderKind::Antigravity
+        | ProviderKind::Anthropic
         | ProviderKind::Codex => {
             let envelope = matches!(provider.kind, ProviderKind::Antigravity);
             if is_stream {
-                let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-                    match provider.kind {
-                        ProviderKind::Anthropic => {
-                            Box::pin(anthropic::translate_sse_stream(resp, model, Some(key)))
-                        }
-                        ProviderKind::Codex => {
-                            Box::pin(codex::translate_sse_stream(resp, model, Some(key)))
-                        }
-                        _ => Box::pin(gemini::translate_sse_stream(resp, model, envelope, Some(key))),
-                    };
+                let stream: std::pin::Pin<
+                    Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
+                > = match provider.kind {
+                    ProviderKind::Anthropic => {
+                        Box::pin(anthropic::translate_sse_stream(resp, model, Some(key)))
+                    }
+                    ProviderKind::Codex => {
+                        Box::pin(codex::translate_sse_stream(resp, model, Some(key)))
+                    }
+                    _ => Box::pin(gemini::translate_sse_stream(
+                        resp,
+                        model,
+                        envelope,
+                        Some(key),
+                    )),
+                };
                 let stream = stream.map(move |item| {
                     let _ = &guard; // keep the in-flight slot until the stream ends
                     item
@@ -770,7 +802,9 @@ async fn success_response(
                                 add_usage(
                                     &key,
                                     u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                                    u.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                                    u.get("completion_tokens")
+                                        .and_then(|x| x.as_u64())
+                                        .unwrap_or(0),
                                 );
                             }
                             Json(v).into_response()
@@ -793,7 +827,11 @@ async fn success_response(
                             );
                             Json(anthropic::translate_response(model, &v)).into_response()
                         } else {
-                            let v = if envelope { antigravity::unwrap_response(v) } else { v };
+                            let v = if envelope {
+                                antigravity::unwrap_response(v)
+                            } else {
+                                v
+                            };
                             let (p, c) = gemini::usage_pair(&v);
                             add_usage(&key, p, c);
                             Json(gemini::translate_response(model, &v)).into_response()
@@ -892,7 +930,11 @@ mod tests {
     fn gemini_invalid_key_is_detected_by_body() {
         // Gemini answers 400 INVALID_ARGUMENT instead of 401 for a bad key.
         assert_eq!(
-            classify_error_status(ProviderKind::Gemini, 400, r#"{"error":"API key not valid. Please pass a valid API key."}"#),
+            classify_error_status(
+                ProviderKind::Gemini,
+                400,
+                r#"{"error":"API key not valid. Please pass a valid API key."}"#
+            ),
             ErrorAction::Auth
         );
         // The same body from another provider must NOT kill the key — their 400s
@@ -930,12 +972,21 @@ mod tests {
 
     #[test]
     fn reset_durations_parse_the_openai_style_formats() {
-        assert_eq!(parse_reset_duration("500ms"), Some(Duration::from_millis(500)));
+        assert_eq!(
+            parse_reset_duration("500ms"),
+            Some(Duration::from_millis(500))
+        );
         assert_eq!(parse_reset_duration("1s"), Some(Duration::from_secs(1)));
         assert_eq!(parse_reset_duration("1m30s"), Some(Duration::from_secs(90)));
-        assert_eq!(parse_reset_duration("2h5m"), Some(Duration::from_secs(2 * 3600 + 5 * 60)));
+        assert_eq!(
+            parse_reset_duration("2h5m"),
+            Some(Duration::from_secs(2 * 3600 + 5 * 60))
+        );
         assert_eq!(parse_reset_duration("  7s  "), Some(Duration::from_secs(7)));
-        assert_eq!(parse_reset_duration("1.5s"), Some(Duration::from_millis(1500)));
+        assert_eq!(
+            parse_reset_duration("1.5s"),
+            Some(Duration::from_millis(1500))
+        );
     }
 
     #[test]
@@ -953,11 +1004,22 @@ mod tests {
 
     #[test]
     fn only_safe_upstream_headers_are_relayed() {
-        use reqwest::header::{HeaderName, CONTENT_LENGTH, TRANSFER_ENCODING, CONNECTION};
-        for ok in ["content-type", "cache-control", "etag", "retry-after", "x-request-id"] {
-            assert!(forward_header(&HeaderName::from_static(ok)), "{ok} should be relayed");
+        use reqwest::header::{CONNECTION, CONTENT_LENGTH, HeaderName, TRANSFER_ENCODING};
+        for ok in [
+            "content-type",
+            "cache-control",
+            "etag",
+            "retry-after",
+            "x-request-id",
+        ] {
+            assert!(
+                forward_header(&HeaderName::from_static(ok)),
+                "{ok} should be relayed"
+            );
         }
-        assert!(forward_header(&HeaderName::from_bytes(b"x-ratelimit-remaining-requests").unwrap()));
+        assert!(forward_header(
+            &HeaderName::from_bytes(b"x-ratelimit-remaining-requests").unwrap()
+        ));
         // Hop-by-hop / framing headers describe the upstream connection, not ours.
         for bad in [CONTENT_LENGTH, TRANSFER_ENCODING, CONNECTION] {
             assert!(!forward_header(&bad), "{bad} must never be copied");
@@ -976,7 +1038,10 @@ mod tests {
         // Same prefix but different tail must not collide (only the first 4KB is
         // hashed, so the payload beyond that is intentionally ignored).
         let other = Bytes::from_static(br#"{"messages":[{"role":"user","content":"yo"}]}"#);
-        assert_ne!(session_key("a/model", &body), session_key("a/model", &other));
+        assert_ne!(
+            session_key("a/model", &body),
+            session_key("a/model", &other)
+        );
     }
 
     #[test]
@@ -988,6 +1053,10 @@ mod tests {
         let a = session_key("m", &big);
         let mut almost = vec![b'x'; 4096];
         almost.extend_from_slice(b"tail");
-        assert_eq!(a, session_key("m", &Bytes::from(almost)), "only the first 4KB may matter");
+        assert_eq!(
+            a,
+            session_key("m", &Bytes::from(almost)),
+            "only the first 4KB may matter"
+        );
     }
 }
