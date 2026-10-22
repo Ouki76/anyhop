@@ -268,7 +268,11 @@ fn resolve_previous(
 /// carried (they were translated into a system message), so a changed
 /// `instructions` on the follow-up arrives as a later system turn — which every
 /// translating provider hoists back to a system prompt anyway.
-fn replay_history(chat: &mut Value, prev: &StoredResponse) {
+///
+/// Public (documentation-hidden) for `tests/fuzz_parsers.rs`: the replay builder
+/// splices history the client controlled on an earlier turn.
+#[doc(hidden)]
+pub fn replay_history(chat: &mut Value, prev: &StoredResponse) {
     let mut messages: Vec<Value> = Vec::new();
     match &prev.input {
         Value::Array(items) => messages.extend(items.iter().cloned()),
@@ -457,7 +461,10 @@ fn unsupported(field: &str) -> (StatusCode, String) {
 ///
 /// Pure by design: `Err` carries the exact status and message the client gets,
 /// so every acceptance and rejection rule is unit-testable.
-fn to_chat_request(v: &Value) -> Result<Value, (StatusCode, String)> {
+///
+/// Public (documentation-hidden) for `tests/fuzz_parsers.rs`.
+#[doc(hidden)]
+pub fn to_chat_request(v: &Value) -> Result<Value, (StatusCode, String)> {
     let model = v
         .get("model")
         .and_then(Value::as_str)

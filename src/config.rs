@@ -1032,6 +1032,79 @@ mod tests {
         }
     }
 
+    /// Every `[tuning]` knob has a range, and a value outside it has to be
+    /// refused *by name*: these numbers reach cooldown maths, timeouts and
+    /// allocation sizes, so a silently accepted zero disables a guard (a zero
+    /// cooldown turns a rate-limited key into a hot loop; a zero body timeout
+    /// disables the slowloris bound).
+    #[test]
+    fn every_tuning_knob_rejects_out_of_range_values_by_name() {
+        let cases = [
+            ("max_cooldown_secs = 0", "max_cooldown_secs"),
+            ("base_backoff_secs = 601", "base_backoff_secs"),
+            ("rate_limit_cooldown_secs = 0", "rate_limit_cooldown_secs"),
+            ("drain_fallback_secs = 0", "drain_fallback_secs"),
+            ("models_cache_ttl_secs = 0", "models_cache_ttl_secs"),
+            ("connect_timeout_secs = 0", "connect_timeout_secs"),
+            ("meta_timeout_secs = 301", "meta_timeout_secs"),
+            ("sticky_mode = \"rendezvous\"", "sticky_mode"),
+            ("shutdown_grace_secs = 0", "shutdown_grace_secs"),
+            ("client_body_timeout_secs = 0", "client_body_timeout_secs"),
+            ("capacity_wait_ms = 30001", "capacity_wait_ms"),
+            ("sticky_ttl_secs = 0", "sticky_ttl_secs"),
+            ("sticky_max_entries = 15", "sticky_max_entries"),
+            ("session_prefix_bytes = 255", "session_prefix_bytes"),
+            ("event_channel_capacity = 0", "event_channel_capacity"),
+            ("persist_interval_secs = 0", "persist_interval_secs"),
+            ("oauth_http_timeout_secs = 0", "oauth_http_timeout_secs"),
+            (
+                "token_refresh_window_secs = 3601",
+                "token_refresh_window_secs",
+            ),
+            ("ui_refresh_secs = 0", "ui_refresh_secs"),
+            ("sse_keepalive_secs = 0", "sse_keepalive_secs"),
+            ("quota_cache_ttl_secs = 0", "quota_cache_ttl_secs"),
+            ("response_store_max = 100001", "response_store_max"),
+        ];
+        for (line, field) in cases {
+            let text = format!(
+                r#"
+                [[providers]]
+                name = "p"
+                type = "openai_compat"
+                base_url = "http://127.0.0.1:9/v1"
+                keys = ["sk-1"]
+
+                [tuning]
+                {line}
+                "#
+            );
+            let e = error_of(&text);
+            assert!(
+                e.contains(field),
+                "tuning '{line}' must be rejected naming {field}, got: {e}"
+            );
+        }
+
+        // The documented "off" values are legal: 0 capacity wait (fail fast),
+        // 0 refresh window (refresh only on expiry) and 0 store cap (disabled).
+        let text = r#"
+            [[providers]]
+            name = "p"
+            type = "openai_compat"
+            base_url = "http://127.0.0.1:9/v1"
+            keys = ["sk-1"]
+
+            [tuning]
+            capacity_wait_ms = 0
+            token_refresh_window_secs = 0
+            response_store_max = 0
+        "#;
+        parse(text)
+            .validate()
+            .expect("the documented zero values are valid");
+    }
+
     #[test]
     fn the_boundary_values_the_dashboard_accepts_still_validate() {
         let text = r#"

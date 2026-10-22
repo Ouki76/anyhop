@@ -17,12 +17,42 @@ use std::ops::Range;
 pub fn peek_request(body: &[u8]) -> Option<(String, bool)> {
     let mut model: Option<String> = None;
     let mut stream: Option<bool> = None;
+    // A duplicate or escaped key is ambiguous: the caller must fall back to a real
+    // parse, otherwise authorization and the upstream would disagree (see
+    // `string_field_span`).
+    let mut model_seen = 0u32;
+    let mut stream_seen = 0u32;
+    let mut bail = false;
 
     walk_top_level(body, |key, content_end| {
-        if model.is_none() && key == b"model" {
+        // A key written with a JSON escape ("mod\u0065l") is the same key to
+        // serde but different bytes to us, so decode before comparing. This only
+        // allocates when the key actually contains a backslash.
+        let escaped = key.contains(&b'\\');
+        let is_model = key == b"model" || (escaped && decode_json_string(key) == "model");
+        if escaped && is_model {
+            // An escaped spelling of the field: the caller must fall back to a real
+            // parse (we cannot splice a span in a key we cannot match byte-for-byte,
+            // and the upstream decides by decoded name).
+            model = None;
+            stream = None;
+            bail = true;
+            return Some(true);
+        }
+        let is_stream =
+            key == b"stream" || (key.contains(&b'\\') && decode_json_string(key) == "stream");
+        if is_model {
+            model_seen += 1;
+            if model_seen > 1 {
+                return Some(true);
+            }
             let span = string_value_span(body, content_end)?;
             model = Some(decode_json_string(&body[span]));
-        } else if stream.is_none() && key == b"stream" {
+        } else if is_stream {
+            stream_seen += 1;
+            if stream_seen > 1 {
+                return Some(true);
+            }
             stream = bool_value(body, content_end);
         }
         // Stop as soon as both fields are known — the tail of a large body is
@@ -30,20 +60,60 @@ pub fn peek_request(body: &[u8]) -> Option<(String, bool)> {
         Some(model.is_some() && stream.is_some())
     });
 
+    if bail || model_seen > 1 || stream_seen > 1 {
+        return None;
+    }
     Some((model?, stream.unwrap_or(false)))
 }
 
 /// Span of a top-level string field's value (without quotes) for in-place splicing.
+///
+/// Returns `None` when the field is **ambiguous**: it appears more than once, or
+/// its key is written with a JSON escape (`"mod\u0065l"`). Both cases are
+/// security-relevant — an upstream JSON parser resolves duplicates as
+/// *last-one-wins* and decodes escapes, so a body like
+/// `{"model":"allowed","model":"disabled"}` would be authorized and routed as
+/// `allowed` here while the upstream executes `disabled`. Bailing out makes the
+/// caller fall back to a real `serde_json` parse, which agrees with the upstream.
 pub fn string_field_span(body: &[u8], key: &[u8]) -> Option<Range<usize>> {
-    let mut found = None;
+    match scan_key(body, key) {
+        KeyScan::Unique(span) => span,
+        KeyScan::Absent | KeyScan::Ambiguous => None,
+    }
+}
+
+/// Result of looking up one top-level key.
+enum KeyScan {
+    Unique(Option<Range<usize>>),
+    Absent,
+    Ambiguous,
+}
+
+/// Find a top-level key exactly once, refusing duplicates and escaped spellings.
+fn scan_key(body: &[u8], key: &[u8]) -> KeyScan {
+    let mut found: Option<Option<Range<usize>>> = None;
+    let mut ambiguous = false;
     walk_top_level(body, |k, content_end| {
-        if k == key {
-            found = string_value_span(body, content_end);
-            return Some(true); // stop
+        // An escaped key cannot be compared byte-for-byte against `key`: "A"
+        // and "A" are the same key to serde but different bytes to us.
+        let escaped = k.contains(&b'\\');
+        let matches = k == key || (escaped && decode_json_string(k).as_bytes() == key);
+        if matches {
+            if found.is_some() {
+                ambiguous = true;
+                return Some(true);
+            }
+            found = Some(string_value_span(body, content_end));
         }
         Some(false)
     });
-    found
+    if ambiguous {
+        return KeyScan::Ambiguous;
+    }
+    match found {
+        Some(span) => KeyScan::Unique(span),
+        None => KeyScan::Absent,
+    }
 }
 
 /// Walk the body once, calling `f(key, index_after_key_string)` for every
@@ -301,5 +371,39 @@ mod tests {
         // Worst case: no model → full walk, must terminate and return None.
         let body = format!(r#"{{"messages":[{{"content":"{}"}}]}}"#, "x".repeat(1000));
         assert!(peek_request(body.as_bytes()).is_none());
+    }
+
+    /// An authorization bypass, found by fuzzing: `{"model":"allowed","model":
+    /// "disabled"}` was routed and authorized as *allowed* while the upstream
+    /// (serde, last-wins) executed *disabled*. The scanner must refuse to answer.
+    #[test]
+    fn a_duplicate_model_key_is_refused() {
+        let body = br#"{"model":"allowed","messages":[],"model":"disabled"}"#;
+        assert!(
+            string_field_span(body, b"model").is_none(),
+            "a duplicate model key must fall back to a real parse"
+        );
+        assert!(peek_request(body).is_none(), "peek must bail as well");
+    }
+
+    /// The same bypass with an escape in the key: `"mod\u0065l"` decodes to
+    /// "model" for serde but not for a byte comparison.
+    #[test]
+    fn an_escaped_model_key_is_refused() {
+        let body = br#"{"model":"allowed","mod\u0065l":"disabled"}"#;
+        assert!(string_field_span(body, b"model").is_none());
+        assert!(peek_request(body).is_none(), "peek must bail on escapes");
+    }
+
+    /// A single, plain key still takes the fast path (no behaviour change).
+    #[test]
+    fn a_single_model_key_still_scans() {
+        let body = br#"{"model":"mock/test-model","stream":true,"messages":[]}"#;
+        let span = string_field_span(body, b"model").expect("span");
+        assert_eq!(&body[span], b"mock/test-model");
+        assert_eq!(
+            peek_request(body),
+            Some(("mock/test-model".to_string(), true))
+        );
     }
 }

@@ -1140,4 +1140,126 @@ mod tests {
             "id must be a hash, not the secret"
         );
     }
+
+    // ----- proactive drain (x-ratelimit headers) -----
+
+    /// `drain` is the proactive path: it benches a key *before* the upstream
+    /// returns 429, for exactly the advertised reset. It must not take the pool
+    /// down with it.
+    #[test]
+    fn a_proactive_drain_benches_only_the_advertised_key() {
+        let p = pool(Strategy::RoundRobin, &["a", "b"]);
+        let drained = p.pick("m", None).expect("a key");
+        let drained_id = drained.id_hash.clone();
+
+        p.drain(&drained, Duration::from_secs(45));
+
+        let snap = p.snapshot();
+        let row = snap
+            .iter()
+            .find(|k| k.id == drained_id)
+            .expect("the drained key is in the snapshot");
+        assert_eq!(row.status, "cooldown", "the drained key must be benched");
+        assert!(
+            (44..=45).contains(&row.cooldown_remaining_secs),
+            "the cooldown must be the advertised reset, got {}s",
+            row.cooldown_remaining_secs
+        );
+        // The other key still serves the model.
+        for _ in 0..4 {
+            let next = p.pick("m", None).expect("the healthy key still serves");
+            assert_ne!(
+                next.id_hash, drained_id,
+                "a cooled key must not be handed out"
+            );
+        }
+        // The pool is not "unavailable": a healthy key can serve right now, so a
+        // 503 would be a lie (nothing to wait for).
+        assert!(
+            p.wake_after("m").is_none(),
+            "one healthy key means the client does not have to wait"
+        );
+        // Once every key is drained the pool does report a wake time.
+        let other = p.pick("m", None).expect("the healthy key");
+        p.drain(&other, Duration::from_secs(30));
+        assert!(
+            p.wake_after("m").is_some(),
+            "a fully drained pool must tell the client when to come back"
+        );
+    }
+
+    /// The upstream can advertise an hour; `max_cooldown_secs` still bounds how
+    /// long a key is unusable (a hostile header must not disable a key all day).
+    #[test]
+    fn a_drain_is_clamped_to_the_configured_maximum() {
+        let tuning = crate::config::Tuning {
+            max_cooldown_secs: 120,
+            ..Default::default()
+        };
+        let p = pooled(Strategy::RoundRobin, &["a"], Arc::new(tuning));
+        let key = p.pick("m", None).expect("a key");
+        p.drain(&key, Duration::from_secs(6 * 3600));
+        let remaining = p.snapshot()[0].cooldown_remaining_secs;
+        assert!(
+            remaining <= 120,
+            "a drain longer than max_cooldown must be clamped, got {remaining}s"
+        );
+    }
+
+    /// A proactive drain is a health decision like any other: it has to be in the
+    /// state file before a config reload rebuilds the pool, or the dashboard save
+    /// that follows a drain resurrects exactly the key we benched.
+    #[tokio::test]
+    async fn a_drain_survives_a_pool_rebuild() {
+        let dir = scratch_dir("drain-persist");
+        let path = dir.join("state.redb");
+        let store = crate::storage::Storage::open(path.to_str().expect("utf-8")).expect("open");
+        let tuning = Arc::new(crate::config::Tuning::default());
+
+        let p = KeyPool::new(
+            "test".into(),
+            vec!["sk-drain".into()],
+            Strategy::RoundRobin,
+            0,
+            Some(store.clone()),
+            None,
+            tuning.clone(),
+        );
+        let key = p.pick("m", None).expect("a key");
+        p.drain(&key, Duration::from_secs(30));
+        assert_eq!(p.snapshot()[0].status, "cooldown");
+
+        // What a reload does for a provider whose credentials changed.
+        let rebuilt = KeyPool::new(
+            "test".into(),
+            vec!["sk-drain".into()],
+            Strategy::RoundRobin,
+            0,
+            Some(store),
+            None,
+            tuning,
+        );
+        assert_eq!(
+            rebuilt.snapshot()[0].status,
+            "cooldown",
+            "the rebuilt pool lost the drain (health was not persisted)"
+        );
+        assert!(
+            rebuilt.pick("m", None).is_none(),
+            "a drained key must not be handed out after a reload"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scratch directory for tests that need a state file.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "anyhop-pool-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
 }

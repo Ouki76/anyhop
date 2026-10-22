@@ -438,6 +438,17 @@ async fn parse_reply<R: AsyncBufRead + Unpin>(r: &mut R, depth: usize) -> Result
     parse_bounded(r, depth, &mut budget).await
 }
 
+/// Parse one complete reply out of a byte slice.
+///
+/// Thin wrapper over [`parse_reply`] for `tests/fuzz_parsers.rs`: the caps, the
+/// [`Budget`] and the error types are the ones the pool sees, so a hostile reply
+/// behaves here exactly as it does on a socket.
+#[doc(hidden)]
+pub async fn reply_from_slice(bytes: &[u8]) -> Result<Resp, RedisError> {
+    let mut r = tokio::io::BufReader::new(bytes);
+    parse_reply(&mut r, 0).await
+}
+
 /// One reply within a shared byte budget.
 async fn parse_bounded<R: AsyncBufRead + Unpin>(
     r: &mut R,

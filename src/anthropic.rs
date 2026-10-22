@@ -458,6 +458,8 @@ pub fn translate_response(model: &str, v: &Value) -> Value {
     }
 
     let u = v.get("usage").cloned().unwrap_or(json!({}));
+    let prompt_tokens = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+    let completion_tokens = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
     json!({
         "id": v.get("id").cloned().unwrap_or_else(|| json!(gen_id())),
         "object": "chat.completion",
@@ -469,10 +471,13 @@ pub fn translate_response(model: &str, v: &Value) -> Value {
             "finish_reason": map_stop(v.get("stop_reason").and_then(|r| r.as_str())),
         }],
         "usage": {
-            "prompt_tokens": u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-            "completion_tokens": u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-            "total_tokens": u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0)
-                + u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            // Saturating: both numbers are chosen by the upstream stream, and a
+            // hostile/broken provider must not turn the total into a debug-build
+            // panic (or a wrapped 0 in release). The same rule as the Responses
+            // shaping in `proxy::responses`.
+            "total_tokens": prompt_tokens.saturating_add(completion_tokens),
         },
     })
 }
@@ -523,7 +528,9 @@ impl SseState {
             "usage": {
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
-                "total_tokens": self.prompt_tokens + self.completion_tokens,
+                // See `translate_response`: the counters come from the upstream
+                // stream, so the sum saturates instead of overflowing.
+                "total_tokens": self.prompt_tokens.saturating_add(self.completion_tokens),
             },
         })
     }
@@ -1048,6 +1055,42 @@ mod translate_tests {
     }
 
     // ----- mid-stream errors -----
+
+    /// `usage` counters are upstream-chosen: `input_tokens + output_tokens` used
+    /// to overflow (panic in debug, a wrapped 0 in release) when a hostile or
+    /// broken provider reported both near `u64::MAX`. Found by
+    /// `tests/fuzz_parsers.rs`; both the streamed usage chunk and the
+    /// non-streaming body must saturate, like the Responses shaping already does.
+    #[tokio::test]
+    async fn hostile_usage_counters_saturate_instead_of_overflowing() {
+        let max = u64::MAX;
+        let resp = translate_response(
+            "claude-x",
+            &json!({"usage": {"input_tokens": max, "output_tokens": 1}}),
+        );
+        assert_eq!(resp["usage"]["total_tokens"], json!(max), "{resp}");
+
+        let body = vec![
+            event(json!({"type": "message_start", "message": {"usage": {"input_tokens": max}}})),
+            event(json!({"type": "message_delta", "usage": {"output_tokens": 1}})),
+            event(json!({"type": "message_stop"})),
+        ];
+        let out = frames(translate_sse_stream(
+            sse_response(body).await,
+            "claude-x",
+            None,
+        ))
+        .await;
+        let usage = chunks(&out)
+            .into_iter()
+            .find_map(|v| v.get("usage").cloned())
+            .unwrap_or_else(|| panic!("no usage chunk: {out:?}"));
+        assert_eq!(
+            usage["total_tokens"],
+            json!(max),
+            "the total saturates at u64::MAX instead of wrapping to 0"
+        );
+    }
 
     #[tokio::test]
     async fn a_fragmented_error_event_becomes_an_error_frame() {

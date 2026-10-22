@@ -778,3 +778,412 @@ mod json_error_tests {
         assert_eq!(error_type(StatusCode::INTERNAL_SERVER_ERROR), "api_error");
     }
 }
+
+/// Credential handling: the comparison itself, where the credential may come
+/// from, and the failed-attempt budget. All of it is pure enough to test
+/// without a socket — except the two request-level guarantees (per-key
+/// admission and the upgrade handoff), which need a real router.
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+
+    fn req(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request builds")
+    }
+
+    // ----- the comparison -----
+
+    /// `token_eq` is the one function every credential check goes through. If it
+    /// ever reported equality for a prefix or for a different-length string, any
+    /// key that shares a prefix would authenticate.
+    #[test]
+    fn credentials_compare_exactly() {
+        assert!(token_eq("sk-secret", "sk-secret"));
+        assert!(token_eq("", ""), "two empty strings are equal");
+        assert!(!token_eq("", "a"), "empty is not a prefix match");
+        assert!(!token_eq("sk-secret", "sk-secreT"), "one flipped byte");
+        assert!(
+            !token_eq("sk-secret", "sk-secre"),
+            "a prefix is not a match"
+        );
+        assert!(
+            !token_eq("sk-secret", "sk-secrets"),
+            "a longer string is not"
+        );
+        assert!(
+            !token_eq("sk-secret", "sk-secret "),
+            "trailing whitespace must not be ignored"
+        );
+        // Multi-byte secrets are compared byte-wise; this must neither panic nor
+        // report a split character as equal.
+        assert!(token_eq("ключ-1", "ключ-1"));
+        assert!(!token_eq("ключ-1", "ключ-2"));
+        assert!(!token_eq("ключ", "ключ-"));
+    }
+
+    // ----- where a credential may come from -----
+
+    /// EventSource cannot set headers, so `?key=` is accepted — but only for GET:
+    /// a key in a URL ends up in logs and history, which is bad enough for a
+    /// long-lived connection and unacceptable for a state-changing request.
+    #[test]
+    fn a_query_key_only_authenticates_get_requests() {
+        assert!(bearer_ok(
+            &req("GET", "/v1/models?key=sk-query"),
+            "sk-query"
+        ));
+        assert!(
+            !bearer_ok(
+                &req("POST", "/v1/chat/completions?key=sk-query"),
+                "sk-query"
+            ),
+            "POST must not authenticate from the query"
+        );
+        assert!(
+            !bearer_ok(&req("GET", "/v1/models?key=sk-wrong"), "sk-query"),
+            "a wrong query key is still wrong"
+        );
+        // The header path works for every method and keeps working alongside it.
+        let with_header = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, "Bearer sk-header")
+            .body(Body::empty())
+            .expect("request builds");
+        assert!(bearer_ok(&with_header, "sk-header"));
+        assert!(!bearer_ok(&with_header, "sk-other"));
+        // A different scheme is not a bearer token.
+        let basic = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .body(Body::empty())
+            .expect("request builds");
+        assert!(!bearer_ok(&basic, "dXNlcjpwYXNz"));
+    }
+
+    /// The dashboard percent-encodes the key before putting it in the EventSource
+    /// URL, so a key with reserved characters must authenticate. A malformed
+    /// escape must be kept literally rather than truncating or panicking.
+    #[test]
+    fn percent_escapes_in_the_query_key_are_decoded() {
+        assert_eq!(
+            extract_bearer(&req("GET", "/api/events?key=a%2Fb%20c%26d")).as_deref(),
+            Some("a/b c&d")
+        );
+        assert_eq!(
+            extract_bearer(&req("GET", "/api/events?key=100%zz")).as_deref(),
+            Some("100%zz"),
+            "a malformed escape is not silently dropped"
+        );
+        // `key=` may follow other parameters, and other parameters are ignored.
+        assert_eq!(
+            extract_bearer(&req("GET", "/api/events?since=4&key=sk-x")).as_deref(),
+            Some("sk-x")
+        );
+        // No credential at all.
+        assert_eq!(extract_bearer(&req("GET", "/api/events")), None);
+    }
+
+    /// The lockout is a counter with a window. A lapsed window must hand out a
+    /// fresh budget (otherwise one bad password bans the address forever).
+    #[test]
+    fn a_lapsed_window_starts_a_fresh_budget() {
+        let lapsed = std::time::Duration::from_nanos(1);
+        let mut fails = AuthFailures::default();
+        assert!(!fails.note("198.51.100.1", 2, lapsed), "first failure");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(
+            !fails.note("198.51.100.1", 2, lapsed),
+            "a lapsed window must restart the count, not lock the address out"
+        );
+
+        // Inside one window the budget still trips, and only for that address.
+        let window = std::time::Duration::from_secs(60);
+        let mut fails = AuthFailures::default();
+        assert!(!fails.note("198.51.100.2", 2, window));
+        assert!(fails.note("198.51.100.2", 2, window));
+        assert!(!fails.note("198.51.100.3", 2, window));
+        // A zero-length window is meaningless but must not panic or report 0.
+        assert!(fails.retry_after_secs("198.51.100.9", std::time::Duration::ZERO) >= 1);
+    }
+
+    /// The socket peer is authoritative; X-Forwarded-For is the fallback for
+    /// setups where a reverse proxy terminates the connection. Without either
+    /// there is still a bucket ("unknown") so the guard cannot be skipped.
+    #[test]
+    fn the_peer_address_wins_over_a_forwarding_header() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9, 10.0.0.1".parse().unwrap());
+        let mut ext = axum::http::Extensions::new();
+        assert_eq!(ip_of(&headers, &ext), "203.0.113.9", "the first hop");
+        ext.insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            4242,
+        ))));
+        assert_eq!(
+            ip_of(&headers, &ext),
+            "127.0.0.1",
+            "a forwarded header cannot override the real peer"
+        );
+        assert_eq!(
+            ip_of(
+                &axum::http::HeaderMap::new(),
+                &axum::http::Extensions::new()
+            ),
+            "unknown"
+        );
+    }
+
+    // ----- per-key admission and the upgrade handoff (needs a live router) -----
+
+    /// One request that the probe route holds open until the test releases it.
+    #[derive(Clone)]
+    struct Gate(std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>);
+
+    async fn probe(
+        axum::extract::Extension(gate): axum::extract::Extension<Gate>,
+        req: axum::extract::Request,
+    ) -> String {
+        let handed_over = req.extensions().get::<ClientKeyGuard>().is_some();
+        // Take the receiver out under a short lock, then await it *outside* the
+        // guard: holding the mutex across the await would serialise the probe and
+        // turn "the cap is missing" into a hang instead of a failed assertion.
+        let held = { gate.0.lock().await.take() };
+        if let Some(rx) = held {
+            let _ = rx.await;
+        }
+        if handed_over {
+            "handoff".to_string()
+        } else {
+            "guard-on-response".to_string()
+        }
+    }
+
+    fn router(state: std::sync::Arc<proxy::AppState>, gate: Gate) -> axum::Router {
+        use axum::routing::get;
+        axum::Router::new()
+            .route("/probe", get(probe))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_api_key,
+            ))
+            .layer(axum::extract::Extension(gate))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                security_headers,
+            ))
+            .with_state(state)
+    }
+
+    async fn serve(app: axum::Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        for _ in 0..300 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn key_runtime(max_concurrent: u32) -> std::sync::Arc<proxy::ClientKeyRuntime> {
+        std::sync::Arc::new(proxy::ClientKeyRuntime::new_with(
+            crate::config::ClientKeyConfig {
+                key: "ck-tenant".to_string(),
+                name: Some("tenant".to_string()),
+                models: Vec::new(),
+                created_at: None,
+                rpm: None,
+                burst: None,
+                max_concurrent: Some(max_concurrent),
+            },
+            &crate::config::RateLimitConfig::default(),
+        ))
+    }
+
+    fn state_with_key(
+        rt: std::sync::Arc<proxy::ClientKeyRuntime>,
+    ) -> std::sync::Arc<proxy::AppState> {
+        let path = crate::api::server::test_support::temp_config(
+            crate::api::server::test_support::MINIMAL,
+        );
+        let st = crate::api::server::test_support::state(&path);
+        st.client_keys
+            .write()
+            .unwrap()
+            .insert("ck-tenant".to_string(), rt);
+        st
+    }
+
+    /// The per-key in-flight cap is what stops one tenant from eating the whole
+    /// gateway. It must be enforced during the handler (not only per response),
+    /// count rejections, and release the slot when the request really ends —
+    /// including for a request whose body the client is still reading.
+    #[tokio::test]
+    async fn a_client_keys_concurrency_cap_holds_until_the_request_ends() {
+        let rt = key_runtime(1);
+        let st = state_with_key(rt.clone());
+        let (release, held) = tokio::sync::oneshot::channel();
+        let gate = Gate(std::sync::Arc::new(tokio::sync::Mutex::new(Some(held))));
+        let addr = serve(router(st, gate)).await;
+        let url = format!("http://{addr}/probe");
+        let client = reqwest::Client::new();
+
+        // The first request takes the only slot and stays inside the handler.
+        let first = {
+            let client = client.clone();
+            let url = url.clone();
+            tokio::spawn(async move { client.get(url).bearer_auth("ck-tenant").send().await })
+        };
+        wait_until("the first request to take its slot", || {
+            rt.in_flight.load(std::sync::atomic::Ordering::Relaxed) == 1
+        })
+        .await;
+
+        let second = client
+            .get(&url)
+            .bearer_auth("ck-tenant")
+            .send()
+            .await
+            .expect("second request");
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a second concurrent request must not be admitted"
+        );
+        assert_eq!(
+            rt.saturated.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the rejection must be counted for /metrics"
+        );
+        let body: serde_json::Value = second.json().await.expect("json envelope");
+        assert_eq!(body["error"]["type"], "rate_limit_exceeded", "{body}");
+
+        release.send(()).expect("release the first request");
+        let first = first.await.expect("join").expect("first response");
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.text().await.expect("body"), "guard-on-response");
+
+        // The slot follows the response, so it is back once the first request is
+        // done — a leaked permit would 429 this key forever.
+        wait_until("the slot to come back", || {
+            rt.in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0
+        })
+        .await;
+        let third = client
+            .get(&url)
+            .bearer_auth("ck-tenant")
+            .send()
+            .await
+            .expect("third request");
+        assert_eq!(third.status(), StatusCode::OK, "the slot must be reusable");
+    }
+
+    /// An upgrade outlives its response, so its slot cannot ride on the response:
+    /// the middleware parks the guard in the request extensions and the handler
+    /// that owns the session takes it. (A normal request gets the guard on the
+    /// response instead — see the test above.)
+    #[tokio::test]
+    async fn a_websocket_upgrade_receives_its_slot_in_the_request() {
+        let rt = key_runtime(1);
+        let st = state_with_key(rt.clone());
+        let gate = Gate(std::sync::Arc::new(tokio::sync::Mutex::new(None)));
+        let addr = serve(router(st, gate)).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/probe"))
+            .bearer_auth("ck-tenant")
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .send()
+            .await
+            .expect("upgrade probe");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.text().await.expect("body"),
+            "handoff",
+            "a websocket request must receive the slot in its extensions"
+        );
+        wait_until("the upgrade slot to be released", || {
+            rt.in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0
+        })
+        .await;
+    }
+
+    /// Hardening headers are applied by the outermost layer, so they are present
+    /// on error responses too; HSTS is only sent where it can be honoured.
+    #[tokio::test]
+    async fn hardening_headers_cover_401s_and_hsts_needs_tls() {
+        let st = state_with_key(key_runtime(0));
+        let addr = serve(router(
+            st.clone(),
+            Gate(std::sync::Arc::new(tokio::sync::Mutex::new(None))),
+        ))
+        .await;
+        let client = reqwest::Client::new();
+
+        let unauth = client
+            .get(format!("http://{addr}/probe"))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+        let h = unauth.headers();
+        assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+        assert_eq!(h.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+        assert_eq!(h.get(header::WWW_AUTHENTICATE).unwrap(), "Bearer");
+        assert!(
+            !h.contains_key(header::STRICT_TRANSPORT_SECURITY),
+            "HSTS on plain HTTP is a lie to the browser"
+        );
+
+        // Behind a TLS-terminating proxy the browser is on HTTPS, so HSTS applies.
+        let proxied = client
+            .get(format!("http://{addr}/probe"))
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .expect("request");
+        assert!(
+            proxied
+                .headers()
+                .get(header::STRICT_TRANSPORT_SECURITY)
+                .is_some(),
+            "X-Forwarded-Proto: https must turn HSTS on"
+        );
+
+        // ... and so does our own listener when it serves TLS.
+        st.tls_enabled_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let own_tls = client
+            .get(format!("http://{addr}/probe"))
+            .send()
+            .await
+            .expect("request");
+        assert!(
+            own_tls
+                .headers()
+                .get(header::STRICT_TRANSPORT_SECURITY)
+                .is_some(),
+            "a TLS listener advertises HSTS without any header from a proxy"
+        );
+    }
+}

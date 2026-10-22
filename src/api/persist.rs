@@ -223,4 +223,133 @@ mod tests {
         assert_eq!(mode & 0o077, 0, "config mode {mode:o} is not owner-only");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The disabled-model list is a plain array in the config file. Rewriting it
+    /// must not duplicate the key (each toggle used to append another array) and
+    /// must leave the rest of the file — comments included — alone.
+    #[test]
+    fn the_disabled_models_round_trip_keeps_one_array() {
+        let (dir, path) = scratch("disabled");
+        std::fs::write(
+            &path,
+            "# operator notes: keep me\nlisten = \"127.0.0.1:1\"\n",
+        )
+        .expect("seed");
+        save_disabled_models_to_toml(&path, &["a/model".into(), "combo/x".into()]).expect("write");
+        save_disabled_models_to_toml(&path, &["a/model".into(), "combo/x".into()])
+            .expect("write again");
+
+        let raw = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            raw.matches("disabled_models").count(),
+            1,
+            "a second save duplicated the key:\n{raw}"
+        );
+        assert!(raw.contains("keep me"), "comments must survive:\n{raw}");
+        let parsed: crate::config::Config = toml::from_str(&raw).expect("parse back");
+        assert_eq!(
+            parsed.disabled_models,
+            vec!["a/model".to_string(), "combo/x".to_string()]
+        );
+
+        // Removing every entry leaves an empty array, not a stale one.
+        save_disabled_models_to_toml(&path, &[]).expect("clear");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let parsed: crate::config::Config = toml::from_str(&raw).expect("parse back");
+        assert!(parsed.disabled_models.is_empty(), "{raw}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- commit_config_text: build before write -----
+
+    /// `commit_config_text` is the single write path for the raw config editor and
+    /// every other config mutation. Nothing may reach the disk before the new
+    /// document has been parsed, validated *and* built: a file that the runtime
+    /// refuses would brick the next start.
+    #[tokio::test]
+    async fn a_rejected_document_never_reaches_the_disk() {
+        use crate::api::server::test_support::{MINIMAL, state, temp_config};
+
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+        let before = std::fs::read_to_string(&path).expect("read");
+
+        // 1) Not TOML at all.
+        let err = commit_config_text(&st, "providers = [[")
+            .await
+            .expect_err("parse error");
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // 2) Valid TOML, rejected by Config::validate (a provider with no keys).
+        let keyless = r#"
+            [[providers]]
+            name = "mock"
+            type = "openai_compat"
+            base_url = "http://127.0.0.1:1/v1"
+
+            [server]
+            listen = "127.0.0.1:18080"
+        "#;
+        let err = commit_config_text(&st, keyless)
+            .await
+            .expect_err("no keys must be refused");
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "an invalid document must leave the old config intact"
+        );
+
+        // 3) Valid and buildable *looking*, but the runtime cannot build it: a
+        //    proxy URL reqwest rejects. This is the case only a build-first order
+        //    catches (validate() cannot know).
+        let unbuildable = MINIMAL.replace(
+            "listen = \"127.0.0.1:18080\"",
+            "listen = \"127.0.0.1:18080\"\nproxy = \"http://[\"",
+        );
+        let err = commit_config_text(&st, &unbuildable)
+            .await
+            .expect_err("an unbuildable config must be refused");
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "write-then-build would have left the broken config on disk"
+        );
+        // Nothing was swapped into the live router either.
+        assert_eq!(st.router.load().providers.len(), 0);
+
+        // A document that does build is written and installed.
+        let n = commit_config_text(&st, MINIMAL)
+            .await
+            .expect("valid config");
+        assert_eq!(n, 1, "one provider installed");
+        assert_ne!(std::fs::read_to_string(&path).unwrap(), "", "written");
+        assert_eq!(st.router.load().providers.len(), 1);
+        assert_eq!(st.router.load().providers[0].name, "mock");
+    }
+
+    /// A write failure must be reported as a server error, not as "invalid
+    /// config" and not as success: the operator has to know the file did not
+    /// change.
+    #[tokio::test]
+    async fn an_unwritable_config_reports_a_server_error() {
+        use crate::api::server::test_support::{MINIMAL, state};
+
+        let dir =
+            std::env::temp_dir().join(format!("anyhop-persist-unwritable-{}", std::process::id()));
+        let path = dir.join("state").join("anyhop.toml");
+        let st = state(&path);
+        let err = commit_config_text(&st, MINIMAL)
+            .await
+            .expect_err("the directory does not exist");
+        assert_eq!(err.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            st.router.load().providers.len(),
+            0,
+            "a write failure must not install the new router"
+        );
+    }
 }

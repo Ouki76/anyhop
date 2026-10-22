@@ -55,6 +55,29 @@ pub struct KeyState {
     pub(super) consecutive_failures: AtomicU64,
 }
 
+/// Redact an e-mail to the shape `a***@gmail.com` — the first character of the
+/// local part, then a fixed mask, then the domain.
+///
+/// Returns `None` for anything that does not look like an e-mail (key masks,
+/// `acct:<hash>` labels), which are shown unchanged: the masked form must still
+/// tell one account from another, so the domain stays visible and a different
+/// first letter still differs.
+fn redact_email(label: &str) -> Option<String> {
+    let (local, domain) = label.split_once('@')?;
+    // Exactly one '@', a non-empty local part, and a dotted domain with no
+    // whitespace — enough to be a mail address without a full RFC parser.
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || !domain.contains('.')
+        || label.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    let first = local.chars().next()?;
+    Some(format!("{first}***@{domain}"))
+}
+
 impl KeyState {
     pub(super) fn new(secret: String, max_concurrent: u32) -> Self {
         // Same id format storage uses for health/stats keys — computed directly
@@ -87,7 +110,11 @@ impl KeyState {
     /// more useful.
     pub fn masked(&self) -> String {
         if let Some(l) = self.label.get() {
-            return l.clone();
+            // OAuth labels are account e-mails, and `masked()` is what
+            // `/api/providers` and the logs print: redact them to
+            // `u***@domain` so the dashboard does not publish addresses. Other
+            // labels (account hashes like `acct:1a2b3c4d`) stay verbatim.
+            return redact_email(l).unwrap_or_else(|| l.clone());
         }
         let s = &self.secret;
         // char-safe: &s[..8] panics when byte 8 splits a multi-byte char
@@ -217,5 +244,69 @@ pub struct KeyGuard {
 impl Drop for KeyGuard {
     fn drop(&mut self) {
         self.key.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn labelled(secret: &str, label: &str) -> KeyState {
+        let k = KeyState::new(secret.to_string(), 0);
+        k.label.set(label.to_string()).ok();
+        k
+    }
+
+    /// OAuth labels are account e-mails and `masked()` is what `/api/providers`
+    /// and the logs print: the address must not survive verbatim.
+    #[test]
+    fn an_account_email_label_is_redacted_to_its_shape() {
+        let k = labelled("1//0cREFRESH", "user@gmail.com");
+        assert_eq!(k.masked(), "u***@gmail.com");
+        assert!(!k.masked().contains("user"), "the local part leaked");
+    }
+
+    /// The redacted form must still tell accounts apart — otherwise every log
+    /// line about a key becomes anonymous.
+    #[test]
+    fn redacted_emails_still_distinguish_accounts() {
+        let alice = labelled("a", "alice@gmail.com");
+        let bob = labelled("b", "bob@gmail.com");
+        assert_ne!(alice.masked(), bob.masked());
+        // Same first letter, different domain is still distinguishable too.
+        assert_eq!(labelled("a", "a@one.com").masked(), "a***@one.com");
+        assert_eq!(labelled("b", "a@two.com").masked(), "a***@two.com");
+    }
+
+    /// Non-e-mail labels (account hashes, operator labels) keep their form.
+    #[test]
+    fn non_email_labels_are_left_alone() {
+        assert_eq!(labelled("1//0c", "acct:1a2b3c4d").masked(), "acct:1a2b3c4d");
+        assert_eq!(labelled("k", "prod-key-1").masked(), "prod-key-1");
+        // Neither shape has a domain part: not an e-mail.
+        assert_eq!(redact_email("no-at-sign"), None);
+        assert_eq!(redact_email("a@b"), None, "a bare domain is not an e-mail");
+        assert_eq!(redact_email("@x.com"), None);
+        assert_eq!(redact_email("a@"), None);
+        assert_eq!(redact_email("a@b@c.com"), None);
+        assert_eq!(redact_email("a b@c.com"), None);
+    }
+
+    /// Without a label the secret mask still applies (unchanged behaviour).
+    #[test]
+    fn a_key_without_a_label_is_masked_by_secret() {
+        let k = KeyState::new("sk-super-secret-value".into(), 0);
+        let m = k.masked();
+        assert!(m.ends_with('…'), "{m}");
+        assert!(!m.contains("super-secret"), "{m}");
+    }
+
+    /// A first character that is multi-byte must not panic or split.
+    #[test]
+    fn a_multibyte_local_part_is_redacted_on_char_boundaries() {
+        assert_eq!(
+            redact_email("ключ@example.com").as_deref(),
+            Some("к***@example.com")
+        );
     }
 }

@@ -139,3 +139,171 @@ pub async fn get_model(State(state): State<Arc<AppState>>, Path(id): Path<String
         "not_found_error",
     )
 }
+
+/// `GET /v1/models` is cached per catalogue epoch and filtered twice (disabled
+/// set, client-key allowlist). Both behaviours are invisible until they are
+/// wrong: a stale cache keeps serving a model the admin just disabled, and a
+/// missing filter hands a restricted key a catalogue it may not use.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::server::test_support::{MINIMAL, state, temp_config};
+    use crate::config::{ComboConfig, ProviderConfig};
+
+    fn state_with_catalogue() -> (Arc<AppState>, std::path::PathBuf) {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+        let pcfg: ProviderConfig = toml::from_str(
+            r#"
+            name = "mock"
+            type = "openai_compat"
+            base_url = "http://127.0.0.1:1/v1"
+            keys = ["sk-test"]
+            models = ["alpha", "beta"]
+            "#,
+        )
+        .expect("provider config");
+        let provider = crate::providers::Provider::from_config(
+            &pcfg,
+            None,
+            None,
+            None,
+            std::sync::Arc::new(crate::config::Tuning::default()),
+            std::time::Duration::from_secs(5),
+            1,
+        )
+        .expect("builds offline");
+        st.router
+            .store(std::sync::Arc::new(crate::providers::ProviderRouter {
+                providers: vec![provider],
+                combos: vec![ComboConfig {
+                    name: "fast".to_string(),
+                    chain: vec!["mock/alpha".to_string()],
+                }],
+            }));
+        (st, path)
+    }
+
+    async fn ids(resp: Response) -> Vec<String> {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        v["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .map(|m| m["id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_catalogue_lists_provider_models_and_combos() {
+        let (st, path) = state_with_catalogue();
+        let list = ids(list_models(State(st.clone()), None).await).await;
+        assert_eq!(list, vec!["mock/alpha", "mock/beta", "fast"], "{list:?}");
+
+        // A single model resolves, with the provider that owns it.
+        let one = get_model(State(st.clone()), Path("mock/alpha".to_string())).await;
+        assert_eq!(one.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(one.into_body(), 8192).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["id"], "mock/alpha");
+        assert_eq!(v["owned_by"], "mock");
+
+        // A combo resolves too, under its bare name.
+        assert_eq!(
+            get_model(State(st.clone()), Path("fast".to_string()))
+                .await
+                .status(),
+            axum::http::StatusCode::OK
+        );
+
+        // Unknown models and unknown providers are a 404, not an empty 200.
+        for bad in ["mock/nope", "other/alpha", "nope"] {
+            assert_eq!(
+                get_model(State(st.clone()), Path(bad.to_string()))
+                    .await
+                    .status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "{bad}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A disabled model must disappear from the list *and* from the single-model
+    /// endpoint — even though the cached body already exists. The catalogue
+    /// epoch is what makes the cache safe to keep.
+    #[tokio::test]
+    async fn disabling_a_model_invalidates_the_cached_catalogue() {
+        let (st, path) = state_with_catalogue();
+
+        let before = ids(list_models(State(st.clone()), None).await).await;
+        assert!(before.contains(&"mock/beta".to_string()));
+        assert!(
+            st.models_cache.lock().unwrap().is_some(),
+            "the unfiltered catalogue is cached"
+        );
+
+        // What the admin handler does: mutate the set, then bump the epoch.
+        st.disabled_models
+            .write()
+            .unwrap()
+            .insert("mock/beta".to_string());
+        st.invalidate_catalog();
+
+        let after = ids(list_models(State(st.clone()), None).await).await;
+        assert_eq!(after, vec!["mock/alpha", "fast"], "{after:?}");
+        assert_eq!(
+            get_model(State(st.clone()), Path("mock/beta".to_string()))
+                .await
+                .status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "a disabled model must not be resolvable by id"
+        );
+
+        // Disabling the combo removes it from the listing as well. The admin API
+        // stores combo names bare (it strips the `combo/` prefix), so that is the
+        // spelling the catalogue has to match.
+        st.disabled_models
+            .write()
+            .unwrap()
+            .insert("fast".to_string());
+        st.invalidate_catalog();
+        assert_eq!(
+            ids(list_models(State(st.clone()), None).await).await,
+            vec!["mock/alpha"]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A client key's allowlist filters the catalogue, and that path must bypass
+    /// the cache (the same epoch serves different bodies per key).
+    #[tokio::test]
+    async fn a_client_key_only_sees_its_allowlist() {
+        let (st, path) = state_with_catalogue();
+        let perm = KeyPermissions {
+            allowed_models: Some(vec!["alpha".to_string()]),
+            key_name: Some("tenant".to_string()),
+        };
+        let list =
+            ids(list_models(State(st.clone()), Some(axum::extract::Extension(perm))).await).await;
+        assert_eq!(list, vec!["mock/alpha"], "{list:?}");
+        assert!(
+            st.models_cache.lock().unwrap().is_none(),
+            "a filtered catalogue must never be cached for everyone else"
+        );
+
+        // Only the combo is allowed: the provider models disappear.
+        let perm = KeyPermissions {
+            allowed_models: Some(vec!["combo/fast".to_string()]),
+            key_name: Some("tenant".to_string()),
+        };
+        assert_eq!(
+            ids(list_models(State(st.clone()), Some(axum::extract::Extension(perm))).await).await,
+            vec!["fast"]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}

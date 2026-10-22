@@ -248,3 +248,210 @@ pub async fn models_disable_all(State(state): State<Arc<AppState>>) -> ApiResult
         .emit_simple("models", "", "dead", "all models disabled".into());
     Ok(StatusCode::OK.into_response())
 }
+
+/// The `disabled_models` set has three spellings in play (`m`, `provider/m`,
+/// `combo/m`). Listing, toggling and the request path must agree, or a toggle
+/// inserts a second entry that is already disabled and never undoes the first.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::server::test_support::{MINIMAL, json, state, temp_config};
+    use crate::config::{ComboConfig, ProviderConfig};
+
+    fn action(model: &str) -> Json<ModelAction> {
+        json(&serde_json::json!({ "model": model }).to_string())
+    }
+
+    /// A state with one provider serving `mock/m` and one combo `combo/x`.
+    fn state_with_catalogue() -> (std::sync::Arc<AppState>, std::path::PathBuf) {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+        let pcfg: ProviderConfig = toml::from_str(
+            r#"
+            name = "mock"
+            type = "openai_compat"
+            base_url = "http://127.0.0.1:1/v1"
+            keys = ["sk-test"]
+            models = ["m", "m2"]
+            "#,
+        )
+        .expect("provider config");
+        let provider = crate::providers::Provider::from_config(
+            &pcfg,
+            None,
+            None,
+            None,
+            std::sync::Arc::new(crate::config::Tuning::default()),
+            std::time::Duration::from_secs(5),
+            1,
+        )
+        .expect("builds offline");
+        st.router
+            .store(std::sync::Arc::new(crate::providers::ProviderRouter {
+                providers: vec![provider],
+                combos: vec![ComboConfig {
+                    name: "x".to_string(),
+                    chain: vec!["mock/m".to_string()],
+                }],
+            }));
+        (st, path)
+    }
+
+    // ----- the predicates -----
+
+    #[test]
+    fn a_disabled_spelling_matches_every_other_spelling_of_the_same_model() {
+        let mut dm = HashSet::new();
+        // A bare model name disables it under every provider and as a combo.
+        dm.insert("flash".to_string());
+        assert!(is_disabled(&dm, "flash"));
+        assert!(is_disabled(&dm, "combo/flash"));
+        assert!(is_disabled(&dm, "openrouter/flash"));
+        assert!(!is_disabled(&dm, "flash-lite"));
+
+        // A combo name stored with the prefix is the same model as the bare one.
+        let mut dm = HashSet::new();
+        dm.insert("combo/flash".to_string());
+        assert!(is_disabled(&dm, "flash"));
+        assert!(is_disabled(&dm, "combo/flash"));
+        assert!(!is_disabled(&dm, "other"));
+
+        // A qualified id disables exactly the id the listing passes around
+        // (`provider/model`); another provider's identically named model is a
+        // different entry. (The request path additionally consults the canonical
+        // and upstream ids — see the `proxy::access` tests.)
+        let mut dm = HashSet::new();
+        dm.insert("mock/m".to_string());
+        assert!(is_disabled(&dm, "mock/m"));
+        assert!(!is_disabled(&dm, "other/m"));
+    }
+
+    /// `clear_model` has to be the exact inverse of `is_disabled`: an enable that
+    /// leaves one spelling behind leaves the model disabled.
+    #[test]
+    fn enabling_clears_every_spelling_the_predicate_recognises() {
+        for (model, seeded) in [
+            ("mock/m", vec!["mock/m", "m"]),
+            ("flash", vec!["flash", "combo/flash"]),
+            ("combo/flash", vec!["flash", "combo/flash"]),
+        ] {
+            let mut dm: HashSet<String> = seeded.iter().map(|s| s.to_string()).collect();
+            assert!(is_disabled(&dm, model), "{model} must start disabled");
+            clear_model(&mut dm, model);
+            assert!(
+                !is_disabled(&dm, model),
+                "enabling {model} left {dm:?} behind"
+            );
+        }
+    }
+
+    #[test]
+    fn the_combo_prefix_is_normalised_away() {
+        assert_eq!(
+            normalize(&ModelAction {
+                model: "  combo/x  ".into()
+            }),
+            "x"
+        );
+        assert_eq!(
+            normalize(&ModelAction {
+                model: "mock/m".into()
+            }),
+            "mock/m"
+        );
+        assert_eq!(
+            normalize(&ModelAction {
+                model: " x ".into()
+            }),
+            "x"
+        );
+    }
+
+    // ----- the handlers: state, file and idempotence -----
+
+    /// Every toggle rewrites the config. Two toggles must return to the starting
+    /// point — the old code inserted a second spelling instead, so the model
+    /// stayed disabled and the file grew on every click.
+    #[tokio::test]
+    async fn toggling_twice_restores_the_model_and_leaves_no_stale_entry() {
+        let (st, path) = state_with_catalogue();
+
+        model_toggle(State(st.clone()), action("mock/m"))
+            .await
+            .expect("disable");
+        assert!(is_disabled(&dm_read(&st), "mock/m"));
+        model_toggle(State(st.clone()), action("mock/m"))
+            .await
+            .expect("enable");
+        assert!(
+            !is_disabled(&dm_read(&st), "mock/m"),
+            "the second toggle must re-enable the model"
+        );
+        assert!(
+            dm_read(&st).is_empty(),
+            "a stale spelling survived: {:?}",
+            dm_read(&st)
+        );
+
+        // Disabling by the bare name and toggling by the qualified id must still
+        // reach the enabled state (they are the same model).
+        model_disable(State(st.clone()), action("m"))
+            .await
+            .expect("disable by bare name");
+        assert!(is_disabled(&dm_read(&st), "mock/m"));
+        let resp = model_toggle(State(st.clone()), action("mock/m"))
+            .await
+            .expect("toggle the qualified id");
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["enabled"], true, "{body}");
+
+        // The file agrees with the live set: empty, and still a valid config.
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let parsed: crate::config::Config = toml::from_str(&raw).expect("valid config");
+        assert!(parsed.disabled_models.is_empty(), "{raw}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `disable-all` must cover provider models *and* combos; `enable-all` must
+    /// clear everything again.
+    #[tokio::test]
+    async fn disable_all_covers_models_and_combos_and_enable_all_clears_them() {
+        let (st, path) = state_with_catalogue();
+
+        models_disable_all(State(st.clone()))
+            .await
+            .expect("disable all");
+        let dm = dm_read(&st).clone();
+        assert!(dm.contains("mock/m"), "{dm:?}");
+        assert!(dm.contains("mock/m2"), "{dm:?}");
+        assert!(dm.contains("x"), "{dm:?}");
+        assert!(is_disabled(&dm, "combo/x"));
+
+        // The listing reflects it.
+        let listed = models_list(State(st.clone())).await.expect("list");
+        let listed: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["enabled"] == false),
+            "{listed}"
+        );
+
+        models_enable_all(State(st.clone()))
+            .await
+            .expect("enable all");
+        assert!(dm_read(&st).is_empty());
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let parsed: crate::config::Config = toml::from_str(&raw).expect("valid config");
+        assert!(parsed.disabled_models.is_empty(), "{raw}");
+        let _ = std::fs::remove_file(&path);
+    }
+}

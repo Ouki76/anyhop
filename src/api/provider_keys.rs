@@ -833,3 +833,167 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// Provider add/delete rewrite the whole provider list and (for add) a key. The
+/// config is the only source of truth across a restart, so every accepted edit
+/// must leave a document the next start can load, and every rejected one must
+/// leave the file untouched.
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    use crate::api::server::test_support::{json, state, temp_config};
+
+    /// Two providers and a combo that spans them, so deletion has something to
+    /// clean up and the config stays valid afterwards.
+    const TWO: &str = r#"
+        [[providers]]
+        name = "mock"
+        type = "openai_compat"
+        base_url = "http://127.0.0.1:1/v1"
+        keys = ["sk-one"]
+        models = ["m"]
+
+        [[providers]]
+        name = "spare"
+        type = "openai_compat"
+        base_url = "http://127.0.0.1:2/v1"
+        keys = ["sk-two"]
+        models = ["m2"]
+
+        [[combos]]
+        name = "chain"
+        chain = ["mock/m", "spare/m2"]
+
+        [[combos]]
+        name = "alone"
+        chain = ["spare/m2"]
+
+        [server]
+        listen = "127.0.0.1:18080"
+        api_key = "test-gw-key"
+    "#;
+
+    fn load(path: &std::path::Path) -> crate::config::Config {
+        let raw = std::fs::read_to_string(path).expect("read");
+        let cfg: crate::config::Config = toml::from_str(&raw).expect("the file must still parse");
+        cfg.validate()
+            .expect("the file must still be a loadable config");
+        cfg
+    }
+
+    /// Adding a provider must write something the runtime can build, install it,
+    /// and stay out of the way of the existing entries (comments included).
+    #[tokio::test]
+    async fn adding_a_provider_installs_it_and_keeps_the_config_loadable() {
+        let seed = format!("# keep this comment\n{TWO}");
+        let path = temp_config(&seed);
+        let st = state(&path);
+
+        let resp = provider_add(
+            State(st.clone()),
+            json(
+                r#"{"kind":"openai_compat","base_url":"http://127.0.0.1:3/v1","key":"sk-new","capabilities":["images"]}"#,
+            ),
+        )
+        .await
+        .expect("added");
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["name"], "openai_compat", "{body}");
+
+        let cfg = load(&path);
+        let names: Vec<&str> = cfg.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["mock", "spare", "openai_compat"], "{names:?}");
+        let added = cfg
+            .providers
+            .iter()
+            .find(|p| p.name == "openai_compat")
+            .expect("the new provider");
+        assert_eq!(added.keys, vec!["sk-new".to_string()]);
+        assert_eq!(added.capabilities, vec!["images".to_string()]);
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("keep this comment"),
+            "the operator's comments must survive the edit"
+        );
+        // The live router follows (reload_config ran).
+        assert_eq!(st.router.load().providers.len(), 3);
+
+        // The default name is not overwritten by a second provider of that kind.
+        let resp = provider_add(
+            State(st.clone()),
+            json(r#"{"kind":"openai_compat","base_url":"http://127.0.0.1:4/v1","key":"sk-new2"}"#),
+        )
+        .await
+        .expect("added");
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["name"], "openai_compat-2", "{body}");
+        assert_eq!(load(&path).providers.len(), 4);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Nothing is written when the request is invalid — not even a partial
+    /// provider entry.
+    #[tokio::test]
+    async fn a_rejected_provider_add_leaves_the_file_untouched() {
+        let path = temp_config(TWO);
+        let st = state(&path);
+        let before = std::fs::read_to_string(&path).expect("read");
+
+        for body in [
+            r#"{"kind":"openai_compat","base_url":"file:///etc/passwd","key":"sk-x"}"#,
+            r#"{"kind":"openai_compat","base_url":"http://127.0.0.1:3/v1","key":"sk-x","capabilities":["shell"]}"#,
+            r#"{"kind":"gemini","base_url":"http://127.0.0.1:3/v1","key":"sk-x","capabilities":["images"]}"#,
+            r#"{"kind":"mystery","base_url":"http://127.0.0.1:3/v1","key":"sk-x"}"#,
+            r#"{"kind":"openai_compat","key":"sk-x"}"#,
+            r#"{"kind":"openai_compat","base_url":"http://127.0.0.1:3/v1","name":"bad name/x","key":"sk-x"}"#,
+        ] {
+            let parsed: AddProvider = serde_json::from_str(body).expect("valid JSON case");
+            assert!(
+                provider_add(State(st.clone()), Json(parsed)).await.is_err(),
+                "{body} must be rejected"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            before,
+            "a rejected add rewrote the config"
+        );
+        assert_eq!(st.router.load().providers.len(), 0, "nothing installed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Deleting a provider has to remove the combos that reference it in the same
+    /// edit: the dangling chain would fail validation, so the delete would either
+    /// be refused or (worse) leave a file the next start cannot load.
+    #[tokio::test]
+    async fn deleting_a_provider_also_drops_the_combos_that_used_it() {
+        let path = temp_config(TWO);
+        let st = state(&path);
+
+        provider_delete(State(st.clone()), json(r#"{"name":"mock"}"#))
+            .await
+            .expect("deleted");
+
+        let cfg = load(&path);
+        let names: Vec<&str> = cfg.providers.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["spare"], "{names:?}");
+        let combos: Vec<&str> = cfg.combos.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            combos,
+            vec!["alone"],
+            "the combo that referenced 'mock' had to go, the other one stays"
+        );
+        assert_eq!(st.router.load().providers.len(), 1);
+
+        // Unknown provider: a 404, and nothing changes.
+        assert!(
+            provider_delete(State(st.clone()), json(r#"{"name":"ghost"}"#))
+                .await
+                .is_err()
+        );
+        assert_eq!(st.router.load().providers.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+}

@@ -15,7 +15,7 @@ use bytes::{Bytes, BytesMut};
 /// event is a few hundred bytes (a chat delta, a usage chunk), so 1 MiB is far
 /// above any working provider and small enough to be irrelevant when a stream
 /// does stall. Same reasoning as the WebSocket frame cap in [`crate::ws`].
-const MAX_EVENT_BYTES: usize = 1024 * 1024;
+pub const MAX_EVENT_BYTES: usize = 1024 * 1024;
 
 /// Reported when the buffered partial event exceeds [`MAX_EVENT_BYTES`].
 ///
@@ -125,8 +125,10 @@ impl SseParser {
         out
     }
 
-    /// Bytes currently held for a partial event (test-only).
-    #[cfg(test)]
+    /// Bytes currently held for a partial event.
+    ///
+    /// Public so `tests/fuzz_parsers.rs` can assert the bound from outside the
+    /// crate: after any `feed`, this is at most [`MAX_EVENT_BYTES`].
     pub fn buffered_len(&self) -> usize {
         self.buf.len()
     }

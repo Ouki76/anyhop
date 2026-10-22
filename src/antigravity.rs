@@ -426,6 +426,13 @@ pub fn translate_request_envelope(
     mut inner: Value,
     project_id: &str,
 ) -> Result<Value, String> {
+    // A client can hand us an id taken verbatim from a Gemini model list
+    // (`models/gemini-2.5-flash`) with the provider name in front. Unlike
+    // `gemini::endpoint()`, this path has no `models/` URL segment of its own —
+    // the model goes in the envelope body — so the prefix would survive all the
+    // way upstream, which 404s on it. Strip it once here (not repeatedly: only
+    // the one a list prefix added).
+    let model = model.strip_prefix("models/").unwrap_or(model);
     if let Some(obj) = inner.as_object_mut()
         && let Some(si) = obj.remove("system_instruction")
     {
@@ -445,6 +452,18 @@ pub fn translate_request_envelope(
                 }
             }
         }
+    }
+    // Structured output: the public Gemini API takes the newer
+    // `responseJsonSchema`, but v1internal is the older proto surface and only
+    // understands `responseSchema`. Rename it here (like systemInstruction
+    // above) instead of in the shared translator, which serves `type = "gemini"`
+    // too.
+    if let Some(gc) = inner
+        .get_mut("generationConfig")
+        .and_then(|g| g.as_object_mut())
+        && let Some(schema) = gc.remove("responseJsonSchema")
+    {
+        gc.insert("responseSchema".into(), schema);
     }
 
     Ok(json!({
@@ -1115,6 +1134,262 @@ mod pkce_tests {
         assert!(
             !url.contains(&verifier),
             "the verifier must never appear in a URL the browser sees"
+        );
+    }
+}
+
+#[cfg(test)]
+mod envelope_model_tests {
+    use super::*;
+
+    fn envelope(model: &str) -> Value {
+        translate_request_envelope(model, json!({"contents": []}), "proj")
+            .expect("the envelope is a pure transform")
+    }
+
+    /// `antigravity/models/gemini-2.5-flash` reaches the upstream as
+    /// `models/gemini-2.5-flash`, which it answers with 404: the antigravity
+    /// provider carries the model in the body, so `gemini::endpoint()`'s strip
+    /// never applied. Both spellings must produce the same envelope.
+    #[test]
+    fn a_models_prefixed_model_is_stripped_from_the_envelope() {
+        assert_eq!(envelope("gemini-2.5-flash")["model"], "gemini-2.5-flash");
+        assert_eq!(
+            envelope("models/gemini-2.5-flash"),
+            envelope("gemini-2.5-flash"),
+            "the prefix is addressing noise, not part of the model id"
+        );
+    }
+
+    /// Strip once: only the prefix a client added is removed, an id that really
+    /// begins with `models/` is not eaten repeatedly.
+    #[test]
+    fn the_prefix_is_stripped_exactly_once() {
+        assert_eq!(
+            envelope("models/models/gemini-2.5-flash")["model"],
+            "models/gemini-2.5-flash"
+        );
+    }
+
+    /// The rest of the envelope is unaffected by the normalization.
+    #[test]
+    fn the_envelope_still_wraps_and_rewrites_the_inner_request() {
+        let inner = json!({
+            "contents": [],
+            "system_instruction": {"parts": [{"text": "be nice"}]},
+            "tools": [{"function_declarations": [{"name": "f", "parameters": {"type": "object"}}]}],
+        });
+        let out =
+            translate_request_envelope("models/gemini-2.5-flash", inner, "proj").expect("envelope");
+        assert_eq!(out["model"], "gemini-2.5-flash");
+        assert_eq!(out["project"], "proj");
+        assert_eq!(
+            out["request"]["systemInstruction"]["parts"][0]["text"],
+            "be nice"
+        );
+        assert!(
+            out["request"]["tools"][0]["function_declarations"][0]
+                .get("parameters")
+                .is_none()
+        );
+        assert_eq!(
+            out["request"]["tools"][0]["function_declarations"][0]["parametersJsonSchema"],
+            json!({"type": "object"})
+        );
+    }
+
+    /// v1internal is the older proto surface: it wants `responseSchema`, while
+    /// the public Gemini API takes `responseJsonSchema`. Sending the newer name
+    /// here is silently ignored (live: the constrained request came back as
+    /// prose until this rename), so the envelope must translate it — like
+    /// `systemInstruction` and `parametersJsonSchema` above.
+    #[test]
+    fn structured_output_uses_the_legacy_response_schema_name() {
+        let inner = json!({
+            "contents": [],
+            "generationConfig": {
+                "maxOutputTokens": 100,
+                "responseMimeType": "application/json",
+                "responseJsonSchema": {"type": "object", "properties": {"name": {"type": "string"}}},
+            },
+        });
+        let out = translate_request_envelope("gemini-2.5-flash", inner, "proj").expect("envelope");
+        let gc = &out["request"]["generationConfig"];
+        assert_eq!(
+            gc["responseSchema"],
+            json!({"type": "object", "properties": {"name": {"type": "string"}}})
+        );
+        assert!(
+            gc.get("responseJsonSchema").is_none(),
+            "the public-API name must not reach v1internal: {gc}"
+        );
+        // The other generation knobs survive the rename.
+        assert_eq!(gc["responseMimeType"], "application/json");
+        assert_eq!(gc["maxOutputTokens"], 100);
+    }
+
+    /// A request without response_format is untouched by the rename.
+    #[test]
+    fn an_unstructured_request_gets_no_response_schema() {
+        let out = translate_request_envelope("gemini-2.5-flash", json!({"contents": []}), "p")
+            .expect("envelope");
+        assert!(out["request"].get("generationConfig").is_none(), "{out}");
+    }
+}
+
+/// Quota-reset parsing decides how long a *model* is benched after a 429, so the
+/// arithmetic and the RFC3339 reader are pinned exactly. Both are pure.
+#[cfg(test)]
+mod quota_reset_tests {
+    use super::*;
+
+    fn now_ms_test() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    /// `RetryInfo.retryDelay` is a duration ("30s", "1.5s"); the reset is now +
+    /// that duration. Getting this wrong benches a model for the wrong window.
+    #[test]
+    fn a_retry_delay_becomes_a_deadline_from_now() {
+        let before = now_ms_test();
+        let body = json!({
+            "error": {"code": 429, "details": [
+                {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "30s"}
+            ]}
+        })
+        .to_string();
+        let until = parse_quota_reset_ms(&body).expect("a reset time");
+        let after = now_ms_test();
+        assert!(
+            (before + 30_000..=after + 30_000).contains(&until),
+            "expected ~30s from now, got {until} (window {before}..{after})"
+        );
+
+        // Fractional seconds and more than one detail entry are accepted.
+        let body = json!({"error": {"details": [{"retryDelay": "1.5s"}]}}).to_string();
+        let until = parse_quota_reset_ms(&body).expect("a reset time");
+        assert!(until >= now_ms_test() + 1_400);
+    }
+
+    /// The absolute `quotaResetTimeStamp` is the more precise signal. It is
+    /// RFC3339 with an offset, and the result must be the same instant regardless
+    /// of how the upstream spelled the zone.
+    #[test]
+    fn a_quota_reset_timestamp_is_parsed_to_exact_epoch_millis() {
+        for ts in [
+            "2026-10-22T12:00:00Z",
+            "2026-10-22T14:00:00+02:00",
+            "2026-10-22T06:30:00-05:30",
+            "2026-10-22T12:00:00.000Z",
+        ] {
+            let body = json!({"error": {"details": [{"quotaResetTimeStamp": ts}]}}).to_string();
+            assert_eq!(
+                parse_quota_reset_ms(&body),
+                Some(1_792_670_400_000),
+                "{ts} must resolve to the same instant"
+            );
+        }
+        // Sub-second precision is discarded (documented: a cooldown measured in
+        // seconds does not need it), but the second itself must be right.
+        let body =
+            json!({"error": {"details": [{"quotaResetTimeStamp": "2026-10-22T12:00:00.750Z"}]}})
+                .to_string();
+        assert_eq!(parse_quota_reset_ms(&body), Some(1_792_670_400_000));
+        // The epoch itself is a valid value, not a "missing" one.
+        let body = json!({"error": {"details": [{"quotaResetTimeStamp": "1970-01-01T00:00:00Z"}]}})
+            .to_string();
+        assert_eq!(parse_quota_reset_ms(&body), Some(0));
+    }
+
+    /// When both forms are present the *later* deadline wins: honouring the
+    /// shorter one sends the client back into the same 429.
+    #[test]
+    fn the_later_of_two_signals_wins() {
+        let body = json!({"error": {"details": [
+            {"retryDelay": "5s"},
+            {"quotaResetTimeStamp": "2030-01-01T00:00:00Z"}
+        ]}})
+        .to_string();
+        let until = parse_quota_reset_ms(&body).expect("a reset time");
+        assert!(
+            until >= 1_893_456_000_000,
+            "the timestamp (2030) is later than 5s from now, got {until}"
+        );
+
+        // ... regardless of the order in the array.
+        let body = json!({"error": {"details": [
+            {"quotaResetTimeStamp": "2030-01-01T00:00:00Z"},
+            {"retryDelay": "5s"}
+        ]}})
+        .to_string();
+        assert!(parse_quota_reset_ms(&body).expect("a reset time") >= 1_893_456_000_000);
+
+        // Two delays: the longer one is the real quota window.
+        let now = now_ms_test();
+        let body = json!({"error": {"details": [{"retryDelay": "10s"}, {"retryDelay": "120s"}]}})
+            .to_string();
+        let until = parse_quota_reset_ms(&body).expect("a reset time");
+        assert!(until >= now + 119_000, "got {until}");
+    }
+
+    /// Anything unparseable means "no hint", so the caller falls back to its
+    /// short default. It must never invent a decade-long cooldown.
+    #[test]
+    fn malformed_or_absent_details_yield_no_hint() {
+        for body in [
+            "not json",
+            "{}",
+            r#"{"error":{}}"#,
+            r#"{"error":{"details":[]}}"#,
+            r#"{"error":{"details":"nope"}}"#,
+            r#"{"error":{"details":[{"quotaResetTimeStamp":"yesterday"}]}}"#,
+            r#"{"error":{"details":[{"retryDelay":"soon"}]}}"#,
+            r#"{"error":{"details":[{}]}}"#,
+        ] {
+            assert_eq!(parse_quota_reset_ms(body), None, "for body {body}");
+        }
+    }
+}
+
+/// The v1internal envelope and the two endpoint shapes: the request must be
+/// wrapped exactly the way the Cloud Code backend expects.
+#[cfg(test)]
+mod response_envelope_tests {
+    use super::*;
+
+    /// A successful v1internal answer is wrapped in `{"response": …}`; the
+    /// translator must look inside it or every reply parses as empty.
+    #[test]
+    fn a_wrapped_response_is_unwrapped_and_anything_else_is_left_alone() {
+        let inner = json!({"candidates": [{"content": {"parts": [{"text": "hi"}]}}]});
+        let wrapped = json!({"response": inner.clone()});
+        assert_eq!(unwrap_response(wrapped), inner);
+
+        // No envelope: the value is already the payload.
+        let direct = json!({"candidates": []});
+        assert_eq!(unwrap_response(direct.clone()), direct);
+
+        // A non-object "response" key is payload, not an envelope.
+        let odd = json!({"response": "text"});
+        assert_eq!(unwrap_response(odd.clone()), odd);
+    }
+
+    /// Streaming goes to `:streamGenerateContent?alt=sse`; a non-stream call to
+    /// `:generateContent`. Swapping them yields an unparseable body.
+    #[test]
+    fn the_endpoint_selects_the_sse_variant_only_when_streaming() {
+        assert_eq!(
+            endpoint("https://daily-cloudcode-pa.googleapis.com", false),
+            format!("https://daily-cloudcode-pa.googleapis.com/{API_VERSION}:generateContent")
+        );
+        assert_eq!(
+            endpoint("https://daily-cloudcode-pa.googleapis.com", true),
+            format!(
+                "https://daily-cloudcode-pa.googleapis.com/{API_VERSION}:streamGenerateContent?alt=sse"
+            )
         );
     }
 }

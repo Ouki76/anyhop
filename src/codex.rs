@@ -407,7 +407,7 @@ impl SseState {
             ch["usage"] = json!({
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
-                "total_tokens": self.prompt_tokens + self.completion_tokens,
+                "total_tokens": self.prompt_tokens.saturating_add(self.completion_tokens),
             });
         }
         ch
@@ -1007,5 +1007,383 @@ mod oauth_state_tests {
         );
         // The PKCE verifier is independent of the state and still present.
         assert!(a.url.contains("code_challenge="), "{}", a.url);
+    }
+}
+
+/// The Codex provider is a full translation layer: chat.completions in,
+/// Responses API out (request), and Responses SSE events back as OpenAI chunks.
+/// Both directions are pure functions of the payload, so they are pinned here
+/// instead of only through the Python mock upstream.
+#[cfg(test)]
+mod translate_tests {
+    use super::*;
+
+    // ----- request: chat.completions -> Responses API -----
+
+    /// The Codex backend has no "system" role: system/developer content becomes
+    /// `instructions`, and the conversation becomes typed `input` items. Getting
+    /// this wrong silently drops the operator's system prompt.
+    #[test]
+    fn a_chat_request_becomes_a_responses_request() {
+        let body = json!({
+            "model": "ignored-client-model",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "developer", "content": "and precise"},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi there"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look:"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]}
+            ]
+        });
+        let out = translate_request("gpt-5-codex", &body).expect("translates");
+
+        assert_eq!(out["model"], "gpt-5-codex", "the resolved model wins");
+        assert_eq!(out["store"], false);
+        assert_eq!(out["stream"], true, "the Codex backend is stream-only");
+        assert_eq!(out["instructions"], "be terse\n\nand precise");
+
+        let input = out["input"].as_array().expect("input array");
+        assert_eq!(
+            input.len(),
+            3,
+            "system/developer become instructions, the rest is one item each: {input:?}"
+        );
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][0]["text"], "hello");
+        // Assistant text is replayed as output_text, not input_text.
+        assert_eq!(input[1]["content"][0]["type"], "output_text");
+        assert_eq!(input[1]["content"][0]["text"], "hi there");
+        // The multimodal user turn keeps its text and its data: image.
+        assert_eq!(input[2]["content"][0]["text"], "look:");
+        assert_eq!(input[2]["content"][1]["type"], "input_image");
+        assert_eq!(
+            input[2]["content"][1]["image_url"],
+            "data:image/png;base64,AAAA"
+        );
+    }
+
+    /// Tool calls and their results are how an agent loop continues. A chat
+    /// `tool_calls` array must become `function_call` items (in order), and a
+    /// `tool` message must become a `function_call_output` bound by call_id.
+    #[test]
+    fn tool_calls_and_tool_results_round_trip_as_responses_items() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\":\"Oslo\"}"}},
+                    {"id": "call_2", "type": "function",
+                     "function": {"name": "get_time", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "3 degrees"}
+            ]
+        });
+        let out = translate_request("m", &body).expect("translates");
+        let input = out["input"].as_array().expect("input");
+
+        let calls: Vec<&Value> = input
+            .iter()
+            .filter(|i| i["type"] == "function_call")
+            .collect();
+        assert_eq!(calls.len(), 2, "{input:?}");
+        assert_eq!(calls[0]["call_id"], "call_1");
+        assert_eq!(calls[0]["name"], "get_weather");
+        assert_eq!(calls[0]["arguments"], "{\"city\":\"Oslo\"}");
+        assert_eq!(calls[1]["call_id"], "call_2");
+        // The assistant turn had no text, so no empty message may be emitted.
+        assert!(
+            !input
+                .iter()
+                .any(|i| i["type"] == "message" && i["role"] == "assistant"),
+            "an empty assistant message must be dropped: {input:?}"
+        );
+
+        let result = input
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .expect("the tool result is forwarded");
+        assert_eq!(result["call_id"], "call_1");
+        assert_eq!(result["output"], "3 degrees");
+    }
+
+    /// OpenAI's chat `tools` have the definition nested under `function`; the
+    /// Responses API flattens it. Sending the nested shape is a 400 upstream, so
+    /// this is a hard requirement, not cosmetics.
+    #[test]
+    fn tool_definitions_are_flattened_and_choices_are_mapped() {
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "function": {
+                    "name": "f", "description": "does f",
+                    "parameters": {"type": "object", "properties": {"x": {"type": "string"}}}
+                }},
+                {"type": "function", "function": {"name": "g"}}
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "g"}}
+        });
+        let out = translate_request("m", &body).expect("translates");
+        let tools = out["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "f");
+        assert_eq!(tools[0]["description"], "does f");
+        assert_eq!(tools[0]["parameters"]["properties"]["x"]["type"], "string");
+        assert!(
+            tools[0].get("function").is_none(),
+            "the nested form must not survive: {:?}",
+            tools[0]
+        );
+        // A tool with no schema still gets a valid empty object schema.
+        assert_eq!(tools[1]["parameters"]["type"], "object");
+        // A specific choice becomes {type, name}; string choices pass through.
+        assert_eq!(out["tool_choice"]["type"], "function");
+        assert_eq!(out["tool_choice"]["name"], "g");
+
+        for choice in ["none", "auto", "required"] {
+            let body = json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "tool_choice": choice
+            });
+            assert_eq!(
+                translate_request("m", &body).expect("translates")["tool_choice"],
+                choice
+            );
+        }
+    }
+
+    /// Sampling knobs and the reasoning effort vocabulary (OpenAI chat names vs
+    /// Responses names) must be carried, not dropped.
+    #[test]
+    fn generation_knobs_are_carried_over() {
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0.3,
+            "max_completion_tokens": 512,
+            "reasoning_effort": "max"
+        });
+        let out = translate_request("m", &body).expect("translates");
+        assert_eq!(out["temperature"], 0.3);
+        assert_eq!(out["max_output_tokens"], 512);
+        assert_eq!(
+            out["reasoning"]["effort"], "xhigh",
+            "max is xhigh on Responses"
+        );
+        assert_eq!(out["reasoning"]["summary"], "auto");
+
+        // max_tokens is the legacy spelling and is accepted as a fallback.
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 64,
+            "reasoning_effort": "minimal"
+        });
+        let out = translate_request("m", &body).expect("translates");
+        assert_eq!(out["max_output_tokens"], 64);
+        assert_eq!(out["reasoning"]["effort"], "minimal");
+    }
+
+    /// Local validation instead of a doomed upstream call: the Codex backend
+    /// cannot fetch remote images, and a body without messages is not a request.
+    #[test]
+    fn locally_undeliverable_requests_are_rejected_with_a_reason() {
+        let missing = json!({"messages": "not an array"});
+        assert!(
+            translate_request("m", &missing)
+                .expect_err("no messages")
+                .contains("messages")
+        );
+
+        let remote_image = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+        ]}]});
+        let err = translate_request("m", &remote_image).expect_err("remote images are refused");
+        assert!(err.contains("data:"), "{err}");
+
+        let bad_content = json!({"messages": [{"role": "user", "content": 42}]});
+        assert!(translate_request("m", &bad_content).is_err());
+    }
+
+    // ----- response: Responses SSE events -> chat.completion.chunk -----
+
+    fn sse_state() -> SseState {
+        SseState {
+            id: "chatcmpl-test".into(),
+            created: 1_700_000_000,
+            model: "gpt-5-codex".into(),
+            sent_role: false,
+            item_tool: Vec::new(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn text_and_reasoning_deltas_become_content_and_reasoning_content() {
+        let mut st = sse_state();
+        let text = translate_event(
+            &json!({"type": "response.output_text.delta", "delta": "Hello"}),
+            &mut st,
+        )
+        .expect("a chunk");
+        assert_eq!(text["object"], "chat.completion.chunk");
+        assert_eq!(text["model"], "gpt-5-codex");
+        assert_eq!(text["choices"][0]["delta"]["content"], "Hello");
+        assert_eq!(text["choices"][0]["finish_reason"], Value::Null);
+        assert!(text.get("usage").is_none(), "usage only at the end");
+
+        let reasoning = translate_event(
+            &json!({"type": "response.reasoning_summary_text.delta", "delta": "thinking"}),
+            &mut st,
+        )
+        .expect("a chunk");
+        assert_eq!(
+            reasoning["choices"][0]["delta"]["reasoning_content"],
+            "thinking"
+        );
+    }
+
+    /// Tool calls arrive as an item announcement followed by argument deltas
+    /// keyed by `item_id`. The index mapping must be stable, and arguments must
+    /// land on the same tool_calls entry; otherwise the client assembles two
+    /// half calls.
+    #[test]
+    fn streamed_tool_calls_keep_one_index_per_item() {
+        let mut st = sse_state();
+        let added = translate_event(
+            &json!({
+                "type": "response.output_item.added",
+                "item": {"type": "function_call", "id": "item_a", "call_id": "call_a", "name": "f"}
+            }),
+            &mut st,
+        )
+        .expect("the tool call is announced");
+        assert_eq!(added["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert_eq!(
+            added["choices"][0]["delta"]["tool_calls"][0]["id"],
+            "call_a"
+        );
+        assert_eq!(
+            added["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "f"
+        );
+        assert_eq!(
+            added["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            ""
+        );
+
+        let delta = translate_event(
+            &json!({"type": "response.function_call_arguments.delta", "item_id": "item_a", "delta": "{\"x\":"}),
+            &mut st,
+        )
+        .expect("argument delta");
+        assert_eq!(
+            delta["choices"][0]["delta"]["tool_calls"][0]["index"], 0,
+            "the delta must target the announced index"
+        );
+        assert_eq!(
+            delta["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{\"x\":"
+        );
+
+        // A second call gets its own index; an unknown item id is ignored rather
+        // than fabricating a call.
+        let second = translate_event(
+            &json!({
+                "type": "response.output_item.added",
+                "item": {"type": "function_call", "id": "item_b", "call_id": "call_b", "name": "g"}
+            }),
+            &mut st,
+        )
+        .expect("second call");
+        assert_eq!(second["choices"][0]["delta"]["tool_calls"][0]["index"], 1);
+        assert!(
+            translate_event(
+                &json!({"type": "response.function_call_arguments.delta", "item_id": "nope", "delta": "x"}),
+                &mut st
+            )
+            .is_none()
+        );
+        // Non-function items are not tool calls.
+        assert!(
+            translate_event(
+                &json!({"type": "response.output_item.added", "item": {"type": "message"}}),
+                &mut st
+            )
+            .is_none()
+        );
+    }
+
+    /// The terminal event carries usage and the finish reason; the client relies
+    /// on `tool_calls` to know it must run tools, and on `length` to know the
+    /// answer was cut off.
+    #[test]
+    fn the_terminal_event_reports_usage_and_the_right_finish_reason() {
+        let mut st = sse_state();
+        let done = translate_event(
+            &json!({
+                "type": "response.completed",
+                "response": {
+                    "usage": {"input_tokens": 11, "output_tokens": 7},
+                    "output": [{"type": "message"}]
+                }
+            }),
+            &mut st,
+        )
+        .expect("a final chunk");
+        assert_eq!(done["choices"][0]["finish_reason"], "stop");
+        assert_eq!(done["usage"]["prompt_tokens"], 11);
+        assert_eq!(done["usage"]["completion_tokens"], 7);
+        assert_eq!(done["usage"]["total_tokens"], 18);
+
+        let mut st = sse_state();
+        let with_tools = translate_event(
+            &json!({
+                "type": "response.completed",
+                "response": {"output": [{"type": "function_call"}]}
+            }),
+            &mut st,
+        )
+        .expect("a final chunk");
+        assert_eq!(with_tools["choices"][0]["finish_reason"], "tool_calls");
+
+        let mut st = sse_state();
+        let cut = translate_event(
+            &json!({"type": "response.incomplete", "response": {}}),
+            &mut st,
+        )
+        .expect("a final chunk");
+        assert_eq!(cut["choices"][0]["finish_reason"], "length");
+    }
+
+    /// A failed upstream response must surface as an error frame, not as a
+    /// silently empty successful stream.
+    #[test]
+    fn a_failed_response_becomes_an_error_frame() {
+        let mut st = sse_state();
+        let err = translate_event(
+            &json!({
+                "type": "response.failed",
+                "response": {"error": {"message": "model overloaded"}}
+            }),
+            &mut st,
+        )
+        .expect("an error frame");
+        assert_eq!(err["error"]["type"], "upstream_error");
+        assert_eq!(err["error"]["code"], "response_failed");
+        assert_eq!(err["error"]["message"], "model overloaded");
+
+        // No message at all still produces a usable frame.
+        let bare = translate_event(&json!({"type": "response.failed", "response": {}}), &mut st)
+            .expect("an error frame");
+        assert!(!bare["error"]["message"].as_str().unwrap_or("").is_empty());
+
+        // Unknown/uninteresting events produce nothing.
+        assert!(translate_event(&json!({"type": "response.created"}), &mut st).is_none());
     }
 }

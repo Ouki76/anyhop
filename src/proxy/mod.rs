@@ -398,3 +398,88 @@ mod tests {
         assert!(!std::sync::Arc::ptr_eq(&a, &c));
     }
 }
+
+/// The request feed and the label helper: what the dashboard shows *about* a
+/// credential without ever holding the credential.
+#[cfg(test)]
+mod feed_tests {
+    use super::*;
+
+    /// A Prometheus label, a log line and the Requests tab all show this string.
+    /// It must identify the key and never contain it.
+    #[test]
+    fn a_client_key_label_never_carries_the_secret() {
+        let name = client_key_label("sk-hop-super-secret", Some("tenant-a"));
+        assert_eq!(name, "tenant-a", "a configured name is used verbatim");
+
+        let derived = client_key_label("sk-hop-super-secret", None);
+        assert!(derived.starts_with("key-"), "{derived}");
+        assert_eq!(derived.len(), "key-".len() + 8);
+        assert_ne!(derived, "sk-hop-super-secret");
+        assert!(
+            !derived.contains("super-secret"),
+            "the label leaked the secret: {derived}"
+        );
+        // Stable for the same key, different for another one.
+        assert_eq!(derived, client_key_label("sk-hop-super-secret", None));
+        assert_ne!(derived, client_key_label("sk-hop-other-secret", None));
+    }
+
+    /// The Requests feed is a bounded ring; a long-running gateway must not grow
+    /// it without limit, and the newest attempt must be the one kept.
+    #[tokio::test]
+    async fn the_request_feed_is_a_bounded_ring_keeping_the_newest() {
+        let path = crate::api::server::test_support::temp_config(
+            crate::api::server::test_support::MINIMAL,
+        );
+        let st = crate::api::server::test_support::state(&path);
+        let cap = st.rt().requests_history;
+        assert!(cap > 0, "the fixture keeps a history");
+
+        for i in 0..(cap + 5) {
+            st.log_request(crate::events::RequestRecord {
+                ts: i as u64,
+                provider: "p".into(),
+                model: "m".into(),
+                key: "k".into(),
+                status: "200".into(),
+                latency_ms: i as u64,
+                stream: false,
+                client_key: None,
+            });
+        }
+        let log = st.request_log.lock().unwrap();
+        assert_eq!(log.len(), cap, "the feed must stay at its cap");
+        assert_eq!(log.front().expect("non-empty").ts, 5, "oldest dropped");
+        assert_eq!(
+            log.back().expect("non-empty").ts,
+            (cap + 4) as u64,
+            "the newest attempt is kept"
+        );
+        drop(log);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every error path in the gateway builds its body here. The envelope is a
+    /// client contract: status, `type`, human message and numeric `code`.
+    #[tokio::test]
+    async fn the_error_envelope_is_uniform() {
+        let resp = error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "slow down",
+            "rate_limit_error",
+        );
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["message"], "slow down");
+        assert_eq!(v["error"]["type"], "rate_limit_error");
+        assert_eq!(v["error"]["code"], 429);
+    }
+}

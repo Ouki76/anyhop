@@ -274,3 +274,66 @@ mod tests {
         }
     }
 }
+
+/// The static-file route is internet-facing, so the traversal guard is a
+/// security boundary: every path that could reach outside the embedded bundle
+/// must 404 before the asset lookup.
+#[cfg(test)]
+mod asset_tests {
+    use super::*;
+
+    async fn status_and_body(resp: Response) -> (StatusCode, Vec<u8>) {
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body")
+            .to_vec();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn traversal_paths_are_rejected_without_leaking_a_file() {
+        for path in [
+            "../Cargo.toml",
+            "../../etc/passwd",
+            "/etc/passwd",
+            "assets/../../anyhop.toml",
+            "..",
+        ] {
+            let resp = asset(Path(path.to_string())).await;
+            let (status, body) = status_and_body(resp).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "path {path:?} must 404");
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                !text.contains("[package]") && !text.contains("root:"),
+                "path {path:?} leaked a file: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_asset_is_a_404_and_the_index_is_served_with_a_policy() {
+        let (status, _) =
+            status_and_body(asset(Path("does-not-exist.bin".to_string())).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        if UiAssets::get("index.html").is_none() {
+            return; // a checkout without `trunk build`
+        }
+        let resp = asset(Path("index.html".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache",
+            "the entry point must not be cached"
+        );
+        assert!(
+            resp.headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .is_some(),
+            "serving index.html through the wildcard route must keep the CSP"
+        );
+        let (_, body) = status_and_body(resp).await;
+        assert!(!body.is_empty());
+    }
+}

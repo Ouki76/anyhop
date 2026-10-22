@@ -897,7 +897,11 @@ fn splice_model(body: &Bytes, span: &Range<usize>, model: &str) -> Bytes {
 /// every occurrence of `name="model"` a prompt can quote would make this
 /// O(occurrences × line length) — a megabyte of quoted field names would pin a
 /// core for minutes.
-fn multipart_field_span(body: &[u8], field: &str) -> Option<Range<usize>> {
+///
+/// Public (documentation-hidden) so `tests/fuzz_parsers.rs` can drive the scanner
+/// directly: it is the only part of the media path that looks at the raw body.
+#[doc(hidden)]
+pub fn multipart_field_span(body: &[u8], field: &str) -> Option<Range<usize>> {
     const DISPOSITION: &[u8] = b"content-disposition";
     let needle = format!("name=\"{field}\"");
     let needle = needle.as_bytes();

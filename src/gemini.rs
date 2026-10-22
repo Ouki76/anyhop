@@ -122,6 +122,57 @@ fn content_parts(content: Option<&Value>) -> Result<Vec<Value>, String> {
     }
 }
 
+/// Map an OpenAI `response_format` onto Gemini's structured-output fields.
+///
+/// Dropping the field silently was worse than rejecting it: a `json_schema`
+/// request came back as markdown prose with HTTP 200, so the caller believed its
+/// contract had been applied. Unknown shapes are therefore a local error.
+fn apply_response_format(
+    rf: &Value,
+    gen_cfg: &mut serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let obj = match rf {
+        // `null` is how some clients spell "no preference": not an error.
+        Value::Null => return Ok(()),
+        Value::Object(o) => o,
+        _ => return Err("'response_format' must be an object".into()),
+    };
+    match obj.get("type").and_then(|t| t.as_str()) {
+        // Plain text is the default: nothing to ask the upstream for.
+        Some("text") => return Ok(()),
+        Some("json_object") => {
+            gen_cfg.insert("responseMimeType".into(), json!("application/json"));
+            return Ok(());
+        }
+        Some("json_schema") => {}
+        // OpenAI always sends `type`, but `{"json_schema": …}` alone is
+        // unambiguous enough to accept.
+        None if obj.contains_key("json_schema") || obj.contains_key("schema") => {}
+        Some(other) => {
+            return Err(format!(
+                "unsupported 'response_format.type' \"{other}\": \
+                 expected \"text\", \"json_object\" or \"json_schema\""
+            ));
+        }
+        None => return Err("'response_format' is missing 'type'".into()),
+    }
+    // The schema normally sits under `json_schema.schema` (OpenAI's shape), but
+    // a bare `schema` beside the type is accepted too.
+    let schema = obj
+        .get("json_schema")
+        .and_then(|js| js.get("schema"))
+        .or_else(|| obj.get("schema"))
+        .filter(|s| !s.is_null())
+        .cloned()
+        .ok_or(
+            "'response_format' of type \"json_schema\" has no schema: \
+             expected 'response_format.json_schema.schema' or 'response_format.schema'",
+        )?;
+    gen_cfg.insert("responseMimeType".into(), json!("application/json"));
+    gen_cfg.insert("responseJsonSchema".into(), schema);
+    Ok(())
+}
+
 pub fn translate_request(body: &Value) -> Result<Value, String> {
     let messages = body
         .get("messages")
@@ -187,16 +238,22 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
                         if !id.is_empty() {
                             call_names.insert(id.to_string(), name.clone());
                         }
-                        let mut fc = json!({"name": name, "args": args});
-                        // Replay thoughtSignature if the client echoed it back
-                        // (required by Gemini 3 for function calls in history).
+                        // Gemini's `Part` schema puts `thoughtSignature` next to
+                        // `functionCall`, never inside it. Nesting it one level
+                        // too deep was rejected upstream with
+                        // `Unknown name "thoughtSignature" at
+                        // …parts[0].function_call`, and omitting it is rejected
+                        // as a missing signature — so the only accepted shape is
+                        // the sibling one. Required for replayed function calls
+                        // in history (Gemini 3, and 2.5 with dynamic thinking).
+                        let mut part = json!({"functionCall": {"name": name, "args": args}});
                         if let Some(sig) = tc
                             .pointer("/function/thought_signature")
                             .and_then(|s| s.as_str())
                         {
-                            fc["thoughtSignature"] = json!(sig);
+                            part["thoughtSignature"] = json!(sig);
                         }
-                        parts.push(json!({"functionCall": fc}));
+                        parts.push(part);
                     }
                 }
                 if parts.is_empty() {
@@ -315,6 +372,9 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
             json!({"includeThoughts": b > 0, "thinkingBudget": b}),
         );
     }
+    if let Some(rf) = body.get("response_format") {
+        apply_response_format(rf, &mut gen_cfg)?;
+    }
 
     let mut req = json!({"contents": merged});
     if !system_parts.is_empty() {
@@ -405,11 +465,21 @@ pub fn usage_pair(v: &Value) -> (u64, u64) {
 fn usage_of(v: &Value) -> Value {
     let um = v.get("usageMetadata").cloned().unwrap_or(json!({}));
     let get = |k: &str| um.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-    json!({
-        "prompt_tokens": get("promptTokenCount"),
-        "completion_tokens": get("candidatesTokenCount"),
-        "total_tokens": get("totalTokenCount"),
-    })
+    let prompt = get("promptTokenCount");
+    let completion = get("candidatesTokenCount");
+    // Upstream `totalTokenCount` includes `thoughtsTokenCount`, which
+    // `candidatesTokenCount` (our `completion_tokens`) does not: reusing it
+    // reported `total: 176` for `113 + 32` and broke the invariant every client
+    // derives cost and context fill from. Thinking is surfaced separately.
+    let mut usage = json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt.saturating_add(completion),
+    });
+    if let Some(thoughts) = um.get("thoughtsTokenCount").and_then(|x| x.as_u64()) {
+        usage["completion_tokens_details"] = json!({"reasoning_tokens": thoughts});
+    }
+    usage
 }
 
 /// Tool-call index/id allocator for one translation.
@@ -1248,5 +1318,237 @@ mod tests {
             endpoint("http://up", "models/gemini-2.5-flash", true),
             "http://up/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
         );
+    }
+
+    // ----- round trip: the gateway must accept its own output -----
+
+    /// A response replayed verbatim as history used to be rejected both ways:
+    /// the signature nested inside `functionCall` gives
+    /// `Unknown name "thoughtSignature" at …function_call`, and dropping it gives
+    /// `Function call is missing a thought_signature`. The signature belongs on
+    /// the Part, next to `functionCall` — the same place the response side reads
+    /// it from.
+    #[test]
+    fn a_replayed_tool_call_puts_the_signature_beside_the_function_call() {
+        // Response side: the upstream sends the signature on the Part.
+        let upstream = json!({"candidates": [{
+            "content": {"role": "model", "parts": [{
+                "functionCall": {"name": "get_weather", "args": {"city": "Paris"}},
+                "thoughtSignature": "SIG-abc",
+            }]},
+            "finishReason": "STOP",
+        }]});
+        let response = translate_response("gemini-x", &upstream);
+        let message = response["choices"][0]["message"].clone();
+        // The OpenAI-side carrier is unchanged: clients get it to echo back.
+        assert_eq!(
+            message["tool_calls"][0]["function"]["thought_signature"], "SIG-abc",
+            "{message}"
+        );
+
+        // Replay it exactly as an agent loop would.
+        let call_id = message["tool_calls"][0]["id"].clone();
+        let out = translate_request(&json!({
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                message,
+                {"role": "tool", "tool_call_id": call_id, "content": "{\"temp_c\":14}"},
+                {"role": "user", "content": "and tomorrow?"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        }))
+        .expect("the gateway must accept its own output");
+
+        let part = &out["contents"][1]["parts"][0];
+        assert_eq!(part["thoughtSignature"], "SIG-abc", "{out}");
+        assert!(
+            part["functionCall"].get("thoughtSignature").is_none(),
+            "the signature must not be nested inside functionCall: {out}"
+        );
+        assert_eq!(part["functionCall"]["name"], "get_weather");
+        assert_eq!(part["functionCall"]["args"]["city"], "Paris");
+    }
+
+    /// ...and the signature still goes back when the client does not echo one:
+    /// the replay must remain a plain `functionCall` part, not an invalid shape.
+    #[test]
+    fn a_replayed_tool_call_without_a_signature_has_no_stray_field() {
+        let out = translate_request(&json!({
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"},
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+            ],
+        }))
+        .expect("translates");
+        let part = &out["contents"][1]["parts"][0];
+        assert_eq!(
+            part,
+            &json!({"functionCall": {"name": "get_weather", "args": {}}})
+        );
+    }
+
+    // ----- response_format -> structured output -----
+
+    #[test]
+    fn response_format_json_object_asks_for_json_mime() {
+        let out = translate_request(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"},
+        }))
+        .expect("translates");
+        assert_eq!(
+            out["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert!(
+            out["generationConfig"].get("responseJsonSchema").is_none(),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn response_format_json_schema_maps_to_response_json_schema() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "legs": {"type": "integer"}},
+            "required": ["name", "legs"],
+            "additionalProperties": false,
+        });
+        let out = translate_request(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "cat", "strict": true, "schema": schema},
+            },
+        }))
+        .expect("translates");
+        assert_eq!(
+            out["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(out["generationConfig"]["responseJsonSchema"], schema);
+    }
+
+    /// `type` is what OpenAI sends, but `{"json_schema": {…}}` alone is accepted.
+    #[test]
+    fn response_format_json_schema_without_a_type_is_accepted() {
+        let schema = json!({"type": "object", "properties": {"ok": {"type": "boolean"}}});
+        let out = translate_request(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"json_schema": {"name": "r", "schema": schema}},
+        }))
+        .expect("translates");
+        assert_eq!(out["generationConfig"]["responseJsonSchema"], schema);
+    }
+
+    /// A bare `schema` beside the type is accepted as well.
+    #[test]
+    fn response_format_accepts_a_bare_schema() {
+        let schema = json!({"type": "object", "properties": {"n": {"type": "integer"}}});
+        let out = translate_request(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "schema": schema},
+        }))
+        .expect("translates");
+        assert_eq!(out["generationConfig"]["responseJsonSchema"], schema);
+    }
+
+    #[test]
+    fn response_format_text_asks_for_nothing() {
+        let out = translate_request(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "text"},
+        }))
+        .expect("translates");
+        assert!(
+            out.get("generationConfig").is_none(),
+            "text is the default: no generationConfig needed: {out}"
+        );
+    }
+
+    /// `null` means "no preference" for some clients and must not become a 400.
+    #[test]
+    fn response_format_null_is_ignored() {
+        let out = translate_request(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": null,
+        }))
+        .expect("null is not a structured-output request");
+        assert!(out.get("generationConfig").is_none(), "{out}");
+    }
+
+    /// A json_schema request with no schema used to be forwarded as if it had
+    /// one; silence let the caller believe the contract was applied.
+    #[test]
+    fn response_format_json_schema_without_a_schema_is_rejected() {
+        let err = translate_request(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "cat"}},
+        }))
+        .expect_err("a schema was promised but not sent");
+        assert!(
+            err.contains("response_format") && err.contains("schema"),
+            "{err}"
+        );
+
+        let err = translate_request(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema"},
+        }))
+        .expect_err("no schema at all");
+        assert!(err.contains("response_format"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_response_format_is_rejected_by_name() {
+        let err = translate_request(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "xml"},
+        }))
+        .expect_err("not a format we can map");
+        assert!(
+            err.contains("response_format.type") && err.contains("xml"),
+            "{err}"
+        );
+    }
+
+    // ----- usage invariant -----
+
+    /// `total_tokens` must be `prompt + completion`. It used to come from
+    /// `totalTokenCount`, which includes `thoughtsTokenCount`, so a thinking
+    /// response reported 176 for 113 + 32.
+    #[test]
+    fn total_tokens_is_the_sum_of_prompt_and_completion() {
+        let v = json!({
+            "candidates": [{"content": {"parts": [{"text": "hi"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {
+                "promptTokenCount": 113,
+                "candidatesTokenCount": 32,
+                "totalTokenCount": 176,
+                "thoughtsTokenCount": 31,
+            },
+        });
+        let out = translate_response("gemini-x", &v);
+        let usage = &out["usage"];
+        assert_eq!(usage["prompt_tokens"], 113);
+        assert_eq!(usage["completion_tokens"], 32);
+        assert_eq!(usage["total_tokens"], 145, "{usage}");
+        // The thought count is still visible, just not folded into the total.
+        assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 31);
+    }
+
+    #[test]
+    fn total_tokens_saturates_at_the_u64_boundary() {
+        let v = json!({"usageMetadata": {
+            "promptTokenCount": u64::MAX,
+            "candidatesTokenCount": 3,
+            "totalTokenCount": u64::MAX,
+        }});
+        let usage = usage_of(&v);
+        assert_eq!(usage["total_tokens"], json!(u64::MAX));
     }
 }

@@ -482,3 +482,173 @@ mod tests {
         assert!(check_max_concurrent(u32::MAX).is_err());
     }
 }
+
+/// Secret handling for client keys: what an operator is shown, and what a
+/// generated key looks like. Both are small functions with a big blast radius —
+/// a mask that leaks is a leaked credential in a screenshot.
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+    use crate::api::server::test_support::{MINIMAL, json, state, temp_config};
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    /// A mask must keep enough to recognise a key and never enough to use it.
+    #[test]
+    fn a_mask_never_reveals_the_middle_of_a_key() {
+        let key = "sk-hop-0123456789abcdef0123456789abcdef";
+        let masked = mask_key(key);
+        assert!(masked.contains("..."), "{masked}");
+        assert!(
+            masked.starts_with("sk-hop-"),
+            "the prefix identifies the key"
+        );
+        assert!(masked.ends_with("cdef"), "the tail identifies the key");
+        assert!(!masked.contains("456789abcdef012345"), "the middle leaked");
+        assert!(masked.len() < key.len());
+
+        // Anything short enough to be guessable is not shown at all.
+        for short in ["", "a", "abcd", "12345678"] {
+            assert_eq!(mask_key(short), "***", "short key {short:?} must be hidden");
+        }
+    }
+
+    /// A generated key must be unpredictable, correctly shaped, and unique.
+    #[test]
+    fn generated_keys_are_prefixed_random_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let k = generate_client_key().expect("the OS RNG works");
+            assert!(k.starts_with("sk-hop-"), "{k}");
+            let body = &k["sk-hop-".len()..];
+            assert_eq!(body.len(), 40, "20 random bytes, hex encoded: {k}");
+            assert!(
+                body.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "lowercase hex only: {k}"
+            );
+            assert!(seen.insert(k), "a generated key repeated");
+        }
+    }
+
+    /// `rpm = 0` / absent means "unlimited", and a burst is meaningless without a
+    /// sustained limit — the normalisation must drop both, not store a 0.
+    #[test]
+    fn limits_are_normalised_to_none_when_unlimited() {
+        assert_eq!(normalise_limit(Some(60), Some(10)), (Some(60), Some(10)));
+        assert_eq!(
+            normalise_limit(Some(60), Some(0)),
+            (Some(60), None),
+            "a zero burst means 'same as rpm'"
+        );
+        assert_eq!(normalise_limit(Some(0), Some(10)), (None, None));
+        assert_eq!(normalise_limit(None, Some(10)), (None, None));
+    }
+
+    /// Add and delete both rewrite `client_keys` in the TOML. The file is the
+    /// single source of truth (a restart reloads it), so a mutation the API
+    /// reports as successful must be on disk and still parse.
+    #[tokio::test]
+    async fn adding_and_deleting_a_key_keeps_the_config_loadable() {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+
+        let added = client_key_add(
+            State(st.clone()),
+            json(r#"{"key":"sk-hop-tenant-one","name":"tenant","models":["mock/one"],"max_concurrent":2}"#),
+        )
+        .await
+        .expect("added");
+        let dto = body_json(added).await;
+        assert_eq!(dto["key"], "sk-hop-tenant-one");
+        assert_eq!(dto["name"], "tenant");
+        assert_eq!(dto["models"][0], "mock/one");
+        assert_eq!(dto["max_concurrent"], 2);
+        assert_eq!(dto["masked"], mask_key("sk-hop-tenant-one"));
+
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let parsed: crate::config::Config = toml::from_str(&raw).expect("still a valid config");
+        assert_eq!(parsed.client_keys.len(), 1);
+        assert_eq!(parsed.client_keys[0].key, "sk-hop-tenant-one");
+        assert_eq!(parsed.client_keys[0].max_concurrent, Some(2));
+
+        // The same key cannot be added twice (the map is keyed by the secret).
+        let dup = client_key_add(State(st.clone()), json(r#"{"key":"sk-hop-tenant-one"}"#)).await;
+        assert!(dup.is_err(), "a duplicate key must be refused");
+
+        // Generated keys go down the same path.
+        let generated = client_key_add(State(st.clone()), json(r#"{"name":"second"}"#))
+            .await
+            .expect("generated");
+        let generated = body_json(generated).await;
+        assert!(
+            generated["key"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("sk-hop-"),
+            "{generated}"
+        );
+
+        // Delete removes it from the map and from the file.
+        client_key_delete(State(st.clone()), json(r#"{"key":"sk-hop-tenant-one"}"#))
+            .await
+            .expect("deleted");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let parsed: crate::config::Config = toml::from_str(&raw).expect("still a valid config");
+        assert_eq!(
+            parsed.client_keys.len(),
+            1,
+            "only the generated key is left"
+        );
+        assert_ne!(parsed.client_keys[0].key, "sk-hop-tenant-one");
+        assert!(!ck_read(&st).contains_key("sk-hop-tenant-one"));
+
+        // Deleting something that is not there is a 404, not a silent success.
+        assert!(
+            client_key_delete(State(st.clone()), json(r#"{"key":"sk-hop-nope"}"#))
+                .await
+                .is_err()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Input validation happens before anything is written: too-short keys, huge
+    /// secrets, and unusable names must be refused without touching the config.
+    #[tokio::test]
+    async fn invalid_keys_are_refused_before_the_config_is_written() {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+        let before = std::fs::read_to_string(&path).expect("read");
+
+        let too_many_models = format!(
+            r#"{{"key":"sk-hop-ok","models":[{}]}}"#,
+            vec!["\"m\""; MAX_KEY_MODELS + 1].join(",")
+        );
+        for body in [
+            r#"{"key":"abc"}"#.to_string(),
+            r#"{"key":"sk-hop-ok","name":"bad/name"}"#.to_string(),
+            too_many_models,
+            r#"{"key":"sk-hop-ok","max_concurrent":10001}"#.to_string(),
+        ] {
+            let parsed: AddClientKey = serde_json::from_str(&body).expect("the case is valid JSON");
+            assert!(
+                client_key_add(State(st.clone()), Json(parsed))
+                    .await
+                    .is_err(),
+                "{body} must be rejected"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            before,
+            "a rejected add must not rewrite the config"
+        );
+        assert!(ck_read(&st).is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+}
