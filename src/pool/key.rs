@@ -154,17 +154,58 @@ impl KeyState {
         self.status.store(STATUS_COOLDOWN, Ordering::Relaxed);
     }
 
+    /// Everything about this key that must survive a restart or a config reload.
     pub(super) fn health(&self) -> HealthRecord {
+        // The map is empty for almost every key, so the common case costs one
+        // relaxed load and no lock.
+        let model_cooldowns = if self.has_model_cooldowns.load(Ordering::Relaxed) {
+            lock(&self.model_cooldowns).clone()
+        } else {
+            HashMap::new()
+        };
         HealthRecord {
             status: self.status.load(Ordering::Relaxed),
             cooldown_until_ms: self.cooldown_until_ms.load(Ordering::Relaxed),
+            model_cooldowns,
         }
     }
 
-    pub(super) fn restore_health(&self, rec: &HealthRecord) {
-        self.status.store(rec.status, Ordering::Relaxed);
-        self.cooldown_until_ms
-            .store(rec.cooldown_until_ms, Ordering::Relaxed);
+    /// Restore a persisted record, clamped to the configured maximum cooldown.
+    ///
+    /// The record was written by another process at another time: a state file
+    /// with a wrong clock used to bench a key for ~10 years (`u64` epoch millis
+    /// from a bad clock), and a forward clock step silently wiped every cooldown.
+    /// Anything already expired is active — never "cooldown until 1970".
+    pub(super) fn restore_health(&self, rec: &HealthRecord, max: Duration) {
+        let now = now_ms();
+        let horizon = now.saturating_add(max.as_millis() as u64);
+        let until = rec.cooldown_until_ms.min(horizon);
+        let status = match rec.status {
+            // A dead key stays dead regardless of the clock: it was disabled or
+            // rejected, which no deadline can undo.
+            STATUS_DEAD => STATUS_DEAD,
+            STATUS_COOLDOWN if until > now => STATUS_COOLDOWN,
+            // Unknown status values, and cooldowns that already ran out, mean
+            // "active" — the bytes on disk must not invent a longer outage.
+            _ => STATUS_ACTIVE,
+        };
+        self.status.store(status, Ordering::Relaxed);
+        self.cooldown_until_ms.store(
+            if status == STATUS_COOLDOWN { until } else { 0 },
+            Ordering::Relaxed,
+        );
+
+        if !rec.model_cooldowns.is_empty() {
+            let mut mc = lock(&self.model_cooldowns);
+            for (model, &until) in &rec.model_cooldowns {
+                let until = until.min(horizon);
+                if until > now {
+                    mc.insert(model.clone(), until);
+                }
+            }
+            self.has_model_cooldowns
+                .store(!mc.is_empty(), Ordering::Relaxed);
+        }
     }
 }
 

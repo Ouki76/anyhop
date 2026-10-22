@@ -31,23 +31,15 @@ pub async fn put_config(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ConfigUpdate>,
 ) -> ApiResult {
-    // Validate through the SAME rules as startup load — a saved config must
-    // never brick the next process start.
-    let parsed: crate::config::Config = match toml::from_str(&body.toml) {
-        Ok(c) => c,
-        Err(e) => return Err(ApiError::bad_request(format!("invalid config: {e}"))),
-    };
-    if let Err(e) = parsed.validate() {
-        return Err(ApiError::bad_request(format!("invalid config: {e}")));
-    }
-    {
-        // Don't interleave with other config writers mid-write.
+    // Don't interleave with other config writers mid-write. Validate, build the
+    // router, write and swap all happen inside `commit_config_text` (in that
+    // order): a config that validates but cannot be built is refused while the
+    // previous file is still the one on disk.
+    let result = {
         let _guard = state.config_lock.lock().await;
-        if let Err(e) = crate::config::write_atomic(&state.config_path, &body.toml) {
-            return Err(ApiError::internal(format!("cannot write config: {e}")));
-        }
-    }
-    match crate::reload_config(&state) {
+        super::persist::commit_config_text(&state, &body.toml).await
+    };
+    match result {
         Ok(n) => {
             state.events.emit_simple(
                 "config",
@@ -57,9 +49,8 @@ pub async fn put_config(
             );
             Ok(StatusCode::OK.into_response())
         }
-        Err(e) => Err(ApiError::bad_request(format!(
-            "config saved but reload failed: {e}"
-        ))),
+        // The response already carries the right status (400 / 500) and message.
+        Err(resp) => Ok(*resp),
     }
 }
 

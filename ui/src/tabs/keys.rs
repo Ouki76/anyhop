@@ -31,6 +31,7 @@ pub fn ApiKeysTab(
     let confirm_delete = create_signal(Option::<String>::None);
     let edit_rpm = create_signal(String::new());
     let edit_burst = create_signal(String::new());
+    let edit_max_concurrent = create_signal(String::new());
     let edit_models = create_signal(std::collections::HashSet::<String>::new());
     let edit_search = create_signal(String::new());
 
@@ -305,6 +306,9 @@ pub fn ApiKeysTab(
                                 let k_key_btn_cp = k.key.clone();
                                 let k_key_btn_ed = k.key.clone();
                                 let k_models_btn_ed = k.models.clone();
+                                let k_lim_btn_ed = k.rpm;
+                                let k_burst_btn_ed = k.burst;
+                                let k_conc_btn_ed = k.max_concurrent;
                                 let k_name = k.name.clone();
                                 let k_created_at = k.created_at;
                                 let k_rpm = k.rpm;
@@ -406,19 +410,29 @@ pub fn ApiKeysTab(
                                                     bind:value=edit_burst,
                                                     value=if k_edit_burst > 0 { k_edit_burst.to_string() } else { String::new() },
                                                 )
+                                                input(
+                                                    class="input input-w200", r#type="number", min="0",
+                                                    placeholder="max concurrent (empty = default)",
+                                                    bind:value=edit_max_concurrent,
+                                                )
                                             }
                                             div(class="row mt-10") {
                                                 button(class="btn btn-primary btn-sm", on:click=move |_| {
                                                     let key = k_save_key.clone();
                                                     let m_list: Vec<String> = edit_models.get_clone().into_iter().collect();
-                                                    let rpm = edit_rpm.get_clone().trim().parse::<u32>().unwrap_or(0);
-                                                    let burst = edit_burst.get_clone().trim().parse::<u32>().unwrap_or(0);
+                                                    // Empty means "unchanged": sending 0 would clear
+                                                    // the limit, which is not what an untouched
+                                                    // field means.
+                                                    let rpm: Option<u32> = edit_rpm.get_clone().trim().parse().ok();
+                                                    let burst: Option<u32> = edit_burst.get_clone().trim().parse().ok();
+                                                    let conc: Option<u32> = edit_max_concurrent.get_clone().trim().parse().ok();
                                                     spawn_local(async move {
                                                         let body = serde_json::json!({
                                                             "key": key,
                                                             "models": m_list,
                                                             "rpm": rpm,
                                                             "burst": burst,
+                                                            "max_concurrent": conc,
                                                         });
                                                         post_json("/api/client-keys/update", &body).await;
                                                         reload_client_keys(client_keys).await;
@@ -475,6 +489,11 @@ pub fn ApiKeysTab(
                                                         editing_key.set(None);
                                                     } else {
                                                         edit_models.set(k_models_btn_ed.iter().cloned().collect());
+                                                        // Seed the limit fields too, otherwise an
+                                                        // untouched input sends 0 and wipes the limit.
+                                                        edit_rpm.set(if k_lim_btn_ed > 0 { k_lim_btn_ed.to_string() } else { String::new() });
+                                                        edit_burst.set(if k_burst_btn_ed > 0 { k_burst_btn_ed.to_string() } else { String::new() });
+                                                        edit_max_concurrent.set(k_conc_btn_ed.map(|n| n.to_string()).unwrap_or_default());
                                                         editing_key.set(Some(k_key_btn_ed.clone()));
                                                     }
                                                 }) { "Models" }

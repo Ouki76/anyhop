@@ -38,13 +38,23 @@ pub async fn index() -> Response {
     // policy allows exactly those scripts by hash instead of falling back to
     // 'unsafe-inline' (which would let any injected <script> run and steal the
     // admin key from localStorage).
-    if let Some(policy) = csp_for(&html)
+    apply_csp(&mut resp, &html);
+    resp
+}
+
+/// Attach the hashed CSP a dashboard document needs.
+///
+/// Applied to *every* copy of index.html: `/dashboard`, `/dashboard/` and the
+/// wildcard route (`/dashboard/index.html`), which reaches the same bytes.
+/// Without it, an injected script on the wildcard URL can read the admin key out
+/// of `localStorage` — the policy is the whole defence against that.
+fn apply_csp(resp: &mut Response, html: &[u8]) {
+    if let Some(policy) = csp_for(html)
         && let Ok(v) = HeaderValue::from_str(&policy)
     {
         resp.headers_mut()
             .insert(header::CONTENT_SECURITY_POLICY, v);
     }
-    resp
 }
 
 pub async fn asset(Path(path): Path<String>) -> Response {
@@ -61,19 +71,25 @@ fn serve_file(path: &str) -> Response {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
             // index.html — no cache; hashed assets can be cached for a long time.
-            let cache = if path == "index.html" {
+            let is_index = path == "index.html";
+            let cache = if is_index {
                 "no-cache"
             } else {
                 "public, max-age=31536000, immutable"
             };
-            (
+            let data = content.data.to_vec();
+            let mut resp = (
                 [
                     (header::CONTENT_TYPE, mime.as_ref()),
                     (header::CACHE_CONTROL, cache),
                 ],
-                content.data.to_vec(),
+                data.clone(),
             )
-                .into_response()
+                .into_response();
+            if is_index {
+                apply_csp(&mut resp, &data);
+            }
+            resp
         }
         None => (
             StatusCode::NOT_FOUND,
@@ -140,6 +156,46 @@ fn inline_scripts(html: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn csp_of(resp: &Response) -> Option<String> {
+        resp.headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    /// `/dashboard/index.html` (the wildcard route) used to be served with no
+    /// policy at all, while `/dashboard` had one. The CSP is what stops an
+    /// injected script from reading the admin key out of `localStorage`, so both
+    /// URLs must carry it.
+    #[tokio::test]
+    async fn both_index_urls_carry_the_policy() {
+        if UiAssets::get("index.html").is_none() {
+            // A source checkout without `trunk build`; nothing to serve.
+            return;
+        }
+        let direct = index().await;
+        let policy = csp_of(&direct).expect("/dashboard must set a CSP");
+        assert!(policy.contains("default-src 'none'"), "{policy}");
+
+        let wildcard = serve_file("index.html");
+        assert_eq!(wildcard.status(), StatusCode::OK);
+        let policy = csp_of(&wildcard).expect("/dashboard/index.html must set the same CSP");
+        assert!(policy.contains("script-src"), "{policy}");
+        assert!(
+            !policy.contains("script-src 'self' 'unsafe-inline'"),
+            "inline scripts must stay hash-pinned: {policy}"
+        );
+        // The hashed asset keeps its long cache and needs no policy.
+        let wasm = UiAssets::iter()
+            .find(|p| p.ends_with(".wasm"))
+            .map(|p| p.to_string());
+        if let Some(path) = wasm {
+            let resp = serve_file(&path);
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(csp_of(&resp), None, "a binary asset needs no CSP");
+        }
+    }
 
     #[test]
     fn inline_scripts_are_collected_and_external_ones_skipped() {

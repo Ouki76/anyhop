@@ -68,9 +68,6 @@ pub struct AppState {
     /// Channel the authorization code is delivered through (loopback socket,
     /// public callback route or a pasted URL).
     pub auth_code_tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<(String, String)>>>,
-    /// OAuth `state` of the pending flow, so the public callback can reject
-    /// foreign/expired redirects itself instead of failing later.
-    pub auth_state_token: std::sync::Mutex<Option<String>>,
     /// Failed authentication attempts per client IP (window + count), so a
     /// credential-stuffing loop cannot hammer the key comparison for free.
     pub auth_fails: std::sync::Mutex<crate::middleware::AuthFailures>,
@@ -94,7 +91,12 @@ pub struct AppState {
     /// (dashboard handlers + the OAuth callback all rewrite it).
     pub config_lock: tokio::sync::Mutex<()>,
     /// Configurable timings/limits (see `config::Tuning`).
-    pub tuning: std::sync::Arc<crate::config::Tuning>,
+    ///
+    /// Swappable in place: `POST /api/server/update` reports a `[tuning]` change
+    /// as applied (no restart), so a reload has to publish a new value here —
+    /// while pools, OAuth accounts and request handlers keep their handles.
+    /// Read it through [`AppState::tuning`].
+    pub tuning: arc_swap::ArcSwap<crate::config::Tuning>,
 }
 
 /// A client key at runtime: its config plus the live rate-limiter bucket.
@@ -112,7 +114,12 @@ pub struct ClientKeyRuntime {
     /// Requests rejected by the rate limiter (exposed via /metrics).
     pub limited: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// In-flight requests for this key, and the cap (0 = unlimited).
-    pub in_flight: std::sync::atomic::AtomicU32,
+    ///
+    /// Shared across [`ClientKeyRuntime::rebind`]: the guards of requests already
+    /// in progress hold the old `Arc` and decrement *it* on drop, so replacing
+    /// the counter with a copy of its value leaked one permit per reload — a key
+    /// under load went permanently over its cap and got 429 forever.
+    pub in_flight: std::sync::Arc<std::sync::atomic::AtomicU32>,
     pub max_concurrent: u32,
     /// Requests rejected because the key was already at its concurrency cap.
     pub saturated: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -138,7 +145,7 @@ impl ClientKeyRuntime {
             limiter,
             shared,
             limited: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            in_flight: std::sync::atomic::AtomicU32::new(0),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             max_concurrent,
             saturated: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -166,11 +173,10 @@ impl ClientKeyRuntime {
                 limiter,
                 shared,
                 limited: self.limited.clone(),
-                // Keep the live in-flight counter across a config reload, otherwise
-                // requests already in progress would be counted twice.
-                in_flight: std::sync::atomic::AtomicU32::new(
-                    self.in_flight.load(std::sync::atomic::Ordering::Relaxed),
-                ),
+                // Share the live counter, do not copy its value: the guards of
+                // requests in progress decrement the old one when they finish, so
+                // a copy would keep the reloaded key permanently "busy".
+                in_flight: self.in_flight.clone(),
                 max_concurrent,
                 saturated: self.saturated.clone(),
             }
@@ -229,6 +235,14 @@ impl AppState {
             log.pop_front();
         }
         log.push_back(rec);
+    }
+
+    /// The tuning every component must honour right now.
+    ///
+    /// Hands out a shared handle so a caller can use several values
+    /// consistently even if a reload swaps the cell in between.
+    pub fn tuning(&self) -> std::sync::Arc<crate::config::Tuning> {
+        self.tuning.load_full()
     }
 
     pub fn rt(&self) -> RtConfig {
@@ -303,6 +317,53 @@ mod tests {
             }
             other => panic!("expected a redis limiter, got {other:?}"),
         }
+    }
+
+    /// E: `rebind` used to copy `in_flight` into a *new* counter, while the
+    /// guards of live requests kept decrementing the old one. A handful of
+    /// reloads under load left the live counter permanently above the cap, so the
+    /// tenant got 429 forever.
+    #[test]
+    fn rebind_shares_the_live_in_flight_counter() {
+        let before = ClientKeyRuntime::new(key(Some(60), Some(2)));
+        let after = before.rebind(
+            key(Some(60), Some(2)),
+            &crate::config::RateLimitConfig::default(),
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&before.in_flight, &after.in_flight),
+            "a reload must keep one counter, not copy its value"
+        );
+
+        // A request in progress across two reloads: two permits are taken, the
+        // key is reloaded twice, then the requests finish — the counter must be
+        // back at zero rather than stuck at two.
+        let live = std::sync::Arc::new(before);
+        // Two requests in flight (what ClientKeyGuard does on the way in).
+        let order = std::sync::atomic::Ordering::Relaxed;
+        live.in_flight.fetch_add(1, order);
+        live.in_flight.fetch_add(1, order);
+        let reloaded1 = std::sync::Arc::new(live.rebind(
+            key(Some(60), Some(2)),
+            &crate::config::RateLimitConfig::default(),
+        ));
+        let reloaded2 = std::sync::Arc::new(reloaded1.rebind(
+            key(Some(60), Some(2)),
+            &crate::config::RateLimitConfig::default(),
+        ));
+        assert_eq!(
+            reloaded2.in_flight.load(order),
+            2,
+            "the live count must be visible through the reloaded runtime"
+        );
+        // …and finishing (what the guard does on drop) via the *old* handle.
+        live.in_flight.fetch_sub(1, order);
+        live.in_flight.fetch_sub(1, order);
+        assert_eq!(
+            reloaded2.in_flight.load(order),
+            0,
+            "guards dropped the old counter while the live one stayed above the cap"
+        );
     }
 
     #[test]

@@ -51,33 +51,19 @@ pub struct KeyPool {
     storage: Option<Storage>,
     events: Option<crate::events::EventBus>,
     sticky: StickySessions,
-    tuning: std::sync::Arc<crate::config::Tuning>,
+    /// Shared with the sticky sessions and swappable in place: `[tuning]` edits
+    /// are hot-reloaded, and a pool that a reload reused keeps serving with the
+    /// new values instead of the ones it was built with.
+    tuning: std::sync::Arc<arc_swap::ArcSwap<crate::config::Tuning>>,
 }
 
 impl KeyPool {
-    pub fn new(
-        name: String,
-        secrets: Vec<String>,
-        strategy: Strategy,
-        max_concurrent: u32,
-        storage: Option<Storage>,
-        events: Option<crate::events::EventBus>,
-    ) -> Self {
-        // Tests and simple call sites get the defaults; production goes through
-        // `new_with_tuning` so the config file is authoritative.
-        Self::new_with_tuning(
-            name,
-            secrets,
-            strategy,
-            max_concurrent,
-            storage,
-            events,
-            std::sync::Arc::new(crate::config::Tuning::default()),
-        )
-    }
-
+    /// The one and only constructor: it always takes the tuning the pool must
+    /// honour. (There used to be a `new` that silently substituted
+    /// `Tuning::default()`, which made every `[tuning]` knob dead config for
+    /// the production call site.)
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_tuning(
+    pub fn new(
         name: String,
         secrets: Vec<String>,
         strategy: Strategy,
@@ -86,45 +72,78 @@ impl KeyPool {
         events: Option<crate::events::EventBus>,
         tuning: std::sync::Arc<crate::config::Tuning>,
     ) -> Self {
-        let sticky = StickySessions::new(tuning.clone());
+        let live = std::sync::Arc::new(arc_swap::ArcSwap::from(tuning));
+        let sticky = StickySessions::new(live.clone());
+        // Two identical secrets would share an id_hash: stats count them twice
+        // while rendezvous hashing can only ever score one of them.
+        let mut seen = std::collections::HashSet::new();
+        let keys = secrets
+            .into_iter()
+            .filter(|s| seen.insert(s.clone()))
+            .map(|s| Arc::new(KeyState::new(s, max_concurrent)))
+            .collect();
         let pool = Self {
             name,
             strategy,
             max_concurrent,
-            keys: Mutex::new(
-                secrets
-                    .into_iter()
-                    .map(|s| Arc::new(KeyState::new(s, max_concurrent)))
-                    .collect(),
-            ),
+            keys: Mutex::new(keys),
             cursor: AtomicUsize::new(0),
             storage,
             events,
             sticky,
-            tuning,
+            tuning: live,
         };
         pool.restore();
         pool
     }
 
-    /// Restore health and stats persisted from previous runs.
-    fn restore(&self) {
-        let Some(storage) = &self.storage else { return };
-        for key in lock(&self.keys).iter() {
-            Self::restore_key(storage, &self.name, key);
-        }
+    /// The tuning this pool currently honours.
+    pub fn tuning(&self) -> std::sync::Arc<crate::config::Tuning> {
+        self.tuning.load_full()
     }
 
-    fn restore_key(storage: &Storage, name: &str, key: &Arc<KeyState>) {
-        if let Some(h) = storage.load_health(name, &key.secret) {
-            key.restore_health(&h);
+    /// Apply a hot `[tuning]` reload to this pool.
+    pub fn set_tuning(&self, tuning: std::sync::Arc<crate::config::Tuning>) {
+        self.sticky.set_tuning(tuning.clone());
+        self.tuning.store(tuning);
+    }
+
+    /// Everything that makes two pools interchangeable: the credential set (by
+    /// hashed id), the strategy and the admission limit.
+    ///
+    /// A config reload compares this with the live pool's signature and reuses
+    /// the pool when they match — rebuilding it would throw away cooldowns,
+    /// per-model quotas and counters that have nothing to do with the edit.
+    pub fn signature(&self) -> (Vec<String>, Strategy, u32) {
+        let mut ids: Vec<String> = lock(&self.keys).iter().map(|k| k.id_hash.clone()).collect();
+        ids.sort();
+        (ids, self.strategy, self.max_concurrent)
+    }
+
+    /// Restore health and stats persisted from previous runs.
+    ///
+    /// One read transaction for the whole pool: this runs for every key of every
+    /// provider on every reload.
+    fn restore(&self) {
+        let Some(storage) = &self.storage else { return };
+        let keys = lock(&self.keys);
+        if keys.is_empty() {
+            return;
         }
-        if let Some(s) = storage.load_stats(name, &key.secret) {
-            key.requests.store(s.requests, Ordering::Relaxed);
-            key.failures.store(s.failures, Ordering::Relaxed);
-            key.prompt_tokens.store(s.prompt_tokens, Ordering::Relaxed);
-            key.completion_tokens
-                .store(s.completion_tokens, Ordering::Relaxed);
+        let secrets: Vec<String> = keys.iter().map(|k| k.secret.clone()).collect();
+        let records = storage.load_pool_records(&self.name, &secrets);
+        let max = self.tuning().max_cooldown();
+        for (key, rec) in keys.iter().zip(records) {
+            if let Some(h) = rec.health {
+                key.restore_health(&h, max);
+            }
+            if let Some(s) = rec.stats {
+                key.requests.store(s.requests, Ordering::Relaxed);
+                key.failures.store(s.failures, Ordering::Relaxed);
+                key.prompt_tokens.store(s.prompt_tokens, Ordering::Relaxed);
+                key.completion_tokens
+                    .store(s.completion_tokens, Ordering::Relaxed);
+            }
         }
     }
 
@@ -235,7 +254,7 @@ impl KeyPool {
 
     /// Proactively cool a key down before it hits the limit (rate-limit headers).
     pub fn drain(&self, key: &KeyState, d: Duration) {
-        let max = self.tuning.max_cooldown();
+        let max = self.tuning().max_cooldown();
         key.set_cooldown(d, max);
         self.persist_health(key);
         self.emit(key, "drain", format!("proactive cooldown {}s", d.as_secs()));
@@ -256,6 +275,10 @@ impl KeyPool {
             }
             FailKind::ModelQuota { until_ms } => {
                 key.consecutive_failures.store(0, Ordering::Relaxed);
+                let max = self.tuning().max_cooldown();
+                // A reset time from upstream is a hint, not a promise: clamp it to
+                // the configured maximum like every other cooldown.
+                let until_ms = until_ms.min(now_ms().saturating_add(max.as_millis() as u64));
                 let secs = until_ms.saturating_sub(now_ms()) / 1000;
                 lock(&key.model_cooldowns).insert(model.to_string(), until_ms);
                 key.has_model_cooldowns.store(true, Ordering::Relaxed);
@@ -264,24 +287,28 @@ impl KeyPool {
                     "rate_limited",
                     format!("model '{model}' quota, cooldown {secs}s"),
                 );
-                return; // per-model only, nothing global to persist
+                // Persist it: a reload that rebuilds this pool must not forget
+                // that this model is exhausted (it did — that is how a reload
+                // turned a per-model 429 into another doomed attempt).
             }
             FailKind::RateLimited { retry_after_secs } => {
                 // Rate limit is a quota signal, not instability — no exponential backoff.
                 key.consecutive_failures.store(0, Ordering::Relaxed);
+                let tuning = self.tuning();
+                let max = tuning.max_cooldown();
                 let d = retry_after_secs
                     .map(Duration::from_secs)
-                    .unwrap_or_else(|| self.tuning.rate_limit_cooldown())
-                    .min(self.tuning.max_cooldown());
-                let max = self.tuning.max_cooldown();
+                    .unwrap_or_else(|| tuning.rate_limit_cooldown())
+                    .min(max);
                 key.set_cooldown(d, max);
                 self.emit(key, "rate_limited", format!("cooldown {}s", d.as_secs()));
             }
             FailKind::Server | FailKind::Network => {
                 let n = key.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
                 let shift = (n - 1).min(6) as u32;
-                let max = self.tuning.max_cooldown();
-                let d = (self.tuning.base_backoff() * 2u32.pow(shift)).min(max);
+                let tuning = self.tuning();
+                let max = tuning.max_cooldown();
+                let d = (tuning.base_backoff() * 2u32.pow(shift)).min(max);
                 key.set_cooldown(d, max);
                 self.emit(key, "backoff", format!("cooldown {}s", d.as_secs()));
             }
@@ -354,12 +381,33 @@ impl KeyPool {
     }
 
     /// Add a key at runtime (dashboard). Restores persisted health/stats.
+    ///
+    /// A credential already in the pool is a no-op: two `KeyState`s for the same
+    /// secret share an id hash, so rotation would count it twice while sticky
+    /// rendezvous could only ever score one of them.
     pub fn add_key(&self, secret: String) {
+        let mut keys = lock(&self.keys);
+        if keys.iter().any(|k| k.secret == secret) {
+            return;
+        }
         let key = Arc::new(KeyState::new(secret, self.max_concurrent));
         if let Some(storage) = &self.storage {
-            Self::restore_key(storage, &self.name, &key);
+            let recs = storage.load_pool_records(&self.name, std::slice::from_ref(&key.secret));
+            if let Some(rec) = recs.into_iter().next() {
+                let max = self.tuning().max_cooldown();
+                if let Some(h) = rec.health {
+                    key.restore_health(&h, max);
+                }
+                if let Some(s) = rec.stats {
+                    key.requests.store(s.requests, Ordering::Relaxed);
+                    key.failures.store(s.failures, Ordering::Relaxed);
+                    key.prompt_tokens.store(s.prompt_tokens, Ordering::Relaxed);
+                    key.completion_tokens
+                        .store(s.completion_tokens, Ordering::Relaxed);
+                }
+            }
         }
-        lock(&self.keys).push(key);
+        keys.push(key);
     }
 
     /// How long until at least one key could serve `model` again.
@@ -367,29 +415,61 @@ impl KeyPool {
     /// Used for `Retry-After` when every key is cooling down: a cooldown is a
     /// temporary state, and telling the client "503 forever" would be a lie.
     /// Returns None when no key will ever recover (all dead / pool empty).
+    ///
+    /// `model` must be the *upstream* model id, because that is how cooldowns are
+    /// keyed. Callers that only know the client-facing name should use
+    /// [`KeyPool::wake_after_any`].
     pub fn wake_after(&self, model: &str) -> Option<Duration> {
+        self.wake_after_names(&[model])
+    }
+
+    /// Like [`KeyPool::wake_after`], but tolerant of the caller's naming.
+    ///
+    /// A 503 handler usually has the client-facing model id: `provider/model` for
+    /// a routed model, a bare id, or a combo name. Cooldowns are recorded under
+    /// the upstream id, so this looks up every plausible spelling (the name as
+    /// given, its bare form, and this provider's `<provider>/<bare>` form) — a
+    /// naming mismatch must not silence `Retry-After`.
+    pub fn wake_after_any(&self, model: &str) -> Option<Duration> {
+        let bare = model.rsplit_once('/').map_or(model, |(_, rest)| rest);
+        let qualified = format!("{}/{}", self.name, bare);
+        let mut names: Vec<&str> = vec![model, bare];
+        if names.iter().all(|n| *n != qualified) {
+            names.push(&qualified);
+        }
+        self.wake_after_names(&names)
+    }
+
+    fn wake_after_names(&self, names: &[&str]) -> Option<Duration> {
         let keys = lock(&self.keys);
         let now = now_ms();
         let mut best: Option<u64> = None;
         for k in keys.iter() {
-            match k.status.load(Ordering::Relaxed) {
-                STATUS_DEAD => continue, // never recovers on its own
-                STATUS_COOLDOWN => {
-                    let until = k.cooldown_until_ms.load(Ordering::Relaxed);
-                    if until > now {
-                        best = Some(best.map_or(until, |b: u64| b.min(until)));
-                        continue;
+            // Dead never recovers on its own — nothing to promise for it.
+            if k.status.load(Ordering::Relaxed) == STATUS_DEAD {
+                continue;
+            }
+            // A key can be blocked by its global cooldown *and* a per-model one:
+            // the real wait is the later of the two. Reporting only the global
+            // one told the client to retry straight into the model quota.
+            let mut blocker = 0u64;
+            if k.status.load(Ordering::Relaxed) == STATUS_COOLDOWN {
+                blocker = blocker.max(k.cooldown_until_ms.load(Ordering::Relaxed));
+            }
+            if k.has_model_cooldowns.load(Ordering::Relaxed) {
+                let mc = lock(&k.model_cooldowns);
+                for name in names {
+                    if let Some(until) = mc.get(*name) {
+                        blocker = blocker.max(*until);
                     }
                 }
-                _ => {}
             }
-            // Per-model cooldown is the only thing left that could block it.
-            let until = lock(&k.model_cooldowns).get(model).copied().unwrap_or(0);
-            if until > now {
-                best = Some(best.map_or(until, |b: u64| b.min(until)));
-            } else {
-                return None; // a healthy key exists but was busy — retry immediately
+            if blocker <= now {
+                // This key can serve the model right now; the 503 was a busy
+                // pool, not a cooldown — retry immediately.
+                return None;
             }
+            best = Some(best.map_or(blocker, |b: u64| b.min(blocker)));
         }
         best.map(|until| Duration::from_millis(until.saturating_sub(now)))
     }
@@ -433,6 +513,14 @@ mod tests {
     use super::*;
 
     fn pool(strategy: Strategy, secrets: &[&str]) -> KeyPool {
+        pooled(
+            strategy,
+            secrets,
+            Arc::new(crate::config::Tuning::default()),
+        )
+    }
+
+    fn pooled(strategy: Strategy, secrets: &[&str], tuning: Arc<crate::config::Tuning>) -> KeyPool {
         KeyPool::new(
             "test".into(),
             secrets.iter().map(|s| s.to_string()).collect(),
@@ -440,6 +528,7 @@ mod tests {
             0,
             None,
             None,
+            tuning,
         )
     }
 
@@ -601,6 +690,7 @@ mod tests {
             1,
             None,
             None,
+            Arc::new(crate::config::Tuning::default()),
         );
         let k = p.pick("m", None).unwrap();
         let guard = k.try_acquire().expect("first slot");
@@ -745,11 +835,297 @@ mod tests {
             1,
             None,
             None,
+            Arc::new(crate::config::Tuning::default()),
         );
         let k = p.pick("m", None).unwrap();
         let _busy = k.try_acquire().expect("slot");
         // Busy is not cooling: the client should retry immediately, so no header.
         assert!(p.wake_after("m").is_none());
+    }
+
+    // ----- B: the pool must honour the tuning it is given -----
+
+    /// `KeyPool::new` used to substitute `Tuning::default()` for the tuning it
+    /// was handed, so every `[tuning]` value was dead config: a configured 1 s
+    /// cooldown still benched the key for the default 60 s.
+    #[test]
+    fn the_configured_rate_limit_cooldown_is_used() {
+        let tuning = Arc::new(crate::config::Tuning {
+            rate_limit_cooldown_secs: 1,
+            ..crate::config::Tuning::default()
+        });
+        let p = pooled(Strategy::RoundRobin, &["k1"], tuning);
+        let k = p.pick("m", None).unwrap();
+        p.report_failure(
+            &k,
+            FailKind::RateLimited {
+                retry_after_secs: None,
+            },
+            "m",
+        );
+        let secs = p.snapshot()[0].cooldown_remaining_secs;
+        assert!(
+            secs <= 1,
+            "configured rate_limit_cooldown_secs = 1, pool benched for {secs}s"
+        );
+
+        // base_backoff_secs drives the 5xx path the same way.
+        let tuning = Arc::new(crate::config::Tuning {
+            base_backoff_secs: 1,
+            max_cooldown_secs: 2,
+            ..crate::config::Tuning::default()
+        });
+        let p = pooled(Strategy::RoundRobin, &["k1"], tuning);
+        let k = p.pick("m", None).unwrap();
+        p.report_failure(&k, FailKind::Server, "m");
+        assert!(
+            p.snapshot()[0].cooldown_remaining_secs <= 2,
+            "base_backoff/max_cooldown from the config were ignored"
+        );
+    }
+
+    /// The same for `sticky_mode`: `map` used to be ignored (the pool always
+    /// built its session map with the default `hash` tuning).
+    #[test]
+    fn the_configured_sticky_mode_is_used() {
+        let map = Arc::new(crate::config::Tuning {
+            sticky_mode: "map".to_string(),
+            ..crate::config::Tuning::default()
+        });
+        let p = pooled(Strategy::RoundRobin, &["a", "b"], map);
+        assert!(
+            !p.sticky.is_hashed(),
+            "sticky_mode = \"map\" must be honoured"
+        );
+        assert!(p.sticky_enabled());
+        // map mode really binds: the same session keeps the same key even after
+        // the round-robin cursor moved on.
+        let first = p.pick("m", Some(5)).unwrap().secret.clone();
+        for _ in 0..5 {
+            assert_eq!(p.pick("m", Some(5)).unwrap().secret, first);
+        }
+
+        let hash = Arc::new(crate::config::Tuning::default());
+        let p = pooled(Strategy::RoundRobin, &["a", "b"], hash);
+        assert!(p.sticky.is_hashed(), "hash is the default mode");
+    }
+
+    /// A `[tuning]` reload must reach a pool that was reused rather than rebuilt.
+    #[test]
+    fn set_tuning_changes_the_live_behaviour() {
+        let p = pool(Strategy::RoundRobin, &["k1"]);
+        p.set_tuning(Arc::new(crate::config::Tuning {
+            max_cooldown_secs: 2,
+            base_backoff_secs: 1,
+            ..crate::config::Tuning::default()
+        }));
+        assert_eq!(p.tuning().max_cooldown_secs, 2);
+        let k = p.pick("m", None).unwrap();
+        for _ in 0..5 {
+            p.report_failure(&k, FailKind::Server, "m");
+        }
+        assert!(
+            p.snapshot()[0].cooldown_remaining_secs <= 2,
+            "the swapped-in max_cooldown must cap the backoff"
+        );
+    }
+
+    // ----- G: wake_after must report the real block -----
+
+    /// A model cooldown and a global cooldown can overlap; the honest answer is
+    /// the later of the two. This used to report only the global one.
+    #[test]
+    fn wake_after_reports_the_longer_of_global_and_model_cooldown() {
+        let p = pool(Strategy::RoundRobin, &["k1"]);
+        let k = p.pick("m1", None).unwrap();
+        // 10 s global, then a 120 s per-model quota.
+        p.report_failure(
+            &k,
+            FailKind::RateLimited {
+                retry_after_secs: Some(10),
+            },
+            "m1",
+        );
+        p.report_failure(
+            &k,
+            FailKind::ModelQuota {
+                until_ms: now_ms() + 120_000,
+            },
+            "m1",
+        );
+        let d = p
+            .wake_after("m1")
+            .expect("a blocked pool must report a wait");
+        assert!(
+            d.as_secs() >= 100,
+            "reported {d:?}: the model quota outlasts the global cooldown"
+        );
+    }
+
+    /// The caller often has the client-facing name (`provider/model`) while the
+    /// cooldown is keyed by the upstream id — `wake_after_any` must see both.
+    #[test]
+    fn wake_after_any_matches_the_callers_naming() {
+        let p = pool(Strategy::RoundRobin, &["k1"]);
+        let k = p.pick("m1", None).unwrap();
+        p.report_failure(
+            &k,
+            FailKind::ModelQuota {
+                until_ms: now_ms() + 60_000,
+            },
+            "test/m1",
+        );
+        assert!(
+            p.wake_after("m1").is_none(),
+            "the plain name does not match a prefixed cooldown key"
+        );
+        let d = p
+            .wake_after_any("m1")
+            .expect("the provider-qualified name must be found");
+        assert!((50..=60).contains(&d.as_secs()), "unexpected {d:?}");
+        // The already-qualified spelling works too.
+        assert!(p.wake_after_any("test/m1").is_some());
+        // And a bare upstream id stays a match for the qualified call.
+        assert!(p.wake_after("test/m1").is_some());
+    }
+
+    // ----- H: a restored cooldown is clamped -----
+
+    #[test]
+    fn a_restored_cooldown_is_clamped_and_expired_ones_are_dropped() {
+        let max = Duration::from_secs(60);
+        let k = KeyState::new("k1".into(), 0);
+        // A state file written with a wildly wrong clock: ~10 years out.
+        let absurd = now_ms() + 10 * 365 * 24 * 3600 * 1000;
+        k.restore_health(
+            &crate::storage::HealthRecord {
+                status: STATUS_COOLDOWN,
+                cooldown_until_ms: absurd,
+                ..Default::default()
+            },
+            max,
+        );
+        let until = k.cooldown_until_ms.load(Ordering::Relaxed);
+        assert!(
+            until <= now_ms() + 60_000 + 1_000,
+            "restored cooldown was not clamped to max_cooldown"
+        );
+
+        // Already expired (or a forward clock step) means "active", not "cooldown".
+        let k = KeyState::new("k2".into(), 0);
+        k.restore_health(
+            &crate::storage::HealthRecord {
+                status: STATUS_COOLDOWN,
+                cooldown_until_ms: now_ms().saturating_sub(5_000),
+                ..Default::default()
+            },
+            max,
+        );
+        assert_eq!(
+            k.status.load(Ordering::Relaxed),
+            STATUS_ACTIVE,
+            "an expired cooldown must not bench the key"
+        );
+        assert_eq!(k.cooldown_until_ms.load(Ordering::Relaxed), 0);
+
+        // A dead key stays dead: no deadline can undo an auth rejection.
+        let k = KeyState::new("k3".into(), 0);
+        k.restore_health(
+            &crate::storage::HealthRecord {
+                status: STATUS_DEAD,
+                cooldown_until_ms: 0,
+                ..Default::default()
+            },
+            max,
+        );
+        assert_eq!(k.status.load(Ordering::Relaxed), STATUS_DEAD);
+    }
+
+    #[test]
+    fn restored_per_model_cooldowns_are_kept_and_clamped() {
+        let max = Duration::from_secs(60);
+        let k = KeyState::new("k1".into(), 0);
+        let mut record = crate::storage::HealthRecord {
+            status: STATUS_ACTIVE,
+            cooldown_until_ms: 0,
+            ..Default::default()
+        };
+        record
+            .model_cooldowns
+            .insert("m1".into(), now_ms() + 30_000);
+        record
+            .model_cooldowns
+            .insert("m2".into(), now_ms() + 10 * 365 * 24 * 3600 * 1000);
+        record
+            .model_cooldowns
+            .insert("m3".into(), now_ms().saturating_sub(1_000));
+        k.restore_health(&record, max);
+
+        let mc = lock(&k.model_cooldowns);
+        assert!(mc.contains_key("m1"), "a live model cooldown must survive");
+        assert!(
+            mc.get("m2").is_some_and(|u| *u <= now_ms() + 61_000),
+            "an absurd model cooldown must be clamped"
+        );
+        assert!(
+            !mc.contains_key("m3"),
+            "an expired model cooldown must be dropped"
+        );
+    }
+
+    // ----- L: duplicate credentials -----
+
+    #[test]
+    fn duplicate_secrets_never_enter_the_pool() {
+        // add_key had no dedupe: the second copy shared an id hash with the
+        // first, so rendezvous hashing could only ever pick one of them.
+        let p = pool(Strategy::RoundRobin, &["k1"]);
+        p.add_key("k1".into());
+        assert_eq!(p.len(), 1, "add_key duplicated an existing credential");
+        assert_eq!(p.signature().0.len(), 1);
+
+        // The constructor dedupes as well (a config file can list one twice —
+        // validate() rejects it, a hand-built pool does not go through validate).
+        let p = KeyPool::new(
+            "test".into(),
+            vec!["k1".into(), "k1".into(), "k2".into()],
+            Strategy::RoundRobin,
+            0,
+            None,
+            None,
+            Arc::new(crate::config::Tuning::default()),
+        );
+        assert_eq!(p.len(), 2);
+    }
+
+    // ----- D: the pool identity a reload compares -----
+
+    #[test]
+    fn the_signature_tracks_credentials_strategy_and_limit() {
+        let a = pool(Strategy::RoundRobin, &["k1", "k2"]);
+        let b = pool(Strategy::RoundRobin, &["k2", "k1"]);
+        assert_eq!(a.signature(), b.signature(), "order must not matter");
+
+        let changed = pool(Strategy::LeastUsed, &["k1", "k2"]);
+        assert_ne!(a.signature(), changed.signature(), "strategy is part of it");
+
+        let more = pool(Strategy::RoundRobin, &["k1", "k2", "k3"]);
+        assert_ne!(a.signature(), more.signature(), "keys are part of it");
+
+        let limited = KeyPool::new(
+            "test".into(),
+            vec!["k1".into(), "k2".into()],
+            Strategy::RoundRobin,
+            3,
+            None,
+            None,
+            Arc::new(crate::config::Tuning::default()),
+        );
+        assert_ne!(
+            a.signature(),
+            limited.signature(),
+            "the concurrency limit is part of it"
+        );
     }
 
     #[test]

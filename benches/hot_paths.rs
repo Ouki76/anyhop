@@ -131,6 +131,7 @@ fn main() {
         0,
         None,
         None,
+        std::sync::Arc::new(anyhop::config::Tuning::default()),
     );
     bench("pool::pick round_robin, no cooldowns", 1_000_000, 0, || {
         black_box(

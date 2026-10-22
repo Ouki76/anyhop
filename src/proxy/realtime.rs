@@ -2887,7 +2887,6 @@ mod tests {
             auth_state: Mutex::new(None),
             auth_task: Mutex::new(None),
             auth_code_tx: Mutex::new(None),
-            auth_state_token: Mutex::new(None),
             auth_fails: Mutex::new(crate::middleware::AuthFailures::default()),
             catalog_epoch: AtomicU64::new(0),
             tls_enabled_flag: std::sync::atomic::AtomicBool::new(false),
@@ -2896,7 +2895,7 @@ mod tests {
             client_keys: RwLock::new(HashMap::new()),
             disabled_models: RwLock::new(HashSet::new()),
             config_lock: tokio::sync::Mutex::new(()),
-            tuning: Arc::new(Tuning::default()),
+            tuning: arc_swap::ArcSwap::from_pointee(Tuning::default()),
         })
     }
 

@@ -204,6 +204,152 @@ pub fn frame(v: &serde_json::Value) -> Bytes {
 
 pub const DONE_FRAME: &[u8] = b"data: [DONE]\n\n";
 
+/// Test plumbing that drives the real streaming translators.
+///
+/// The translators take a `reqwest::Response` — the only way to exercise the
+/// production path (and the only way to see how the bytes are *framed*, which is
+/// where the interesting bugs live) is to speak HTTP to a loopback socket. Each
+/// `Vec<u8>` in `chunks` is written as its own TCP write, so tests can split one
+/// event across reads on purpose.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::io;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use futures::{Stream, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serve `chunks` as one `text/event-stream` response on a loopback port and
+    /// return the client-side response.
+    pub(crate) async fn sse_response(chunks: Vec<Vec<u8>>) -> reqwest::Response {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("local address");
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            // The request head is irrelevant; the body never is (all GET).
+            let mut head = [0u8; 2048];
+            let _ = sock.read(&mut head).await;
+            let header =
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+            if sock.write_all(header).await.is_err() {
+                return;
+            }
+            for chunk in chunks {
+                if sock.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                let _ = sock.flush().await;
+                // Let the client read this write as a chunk of its own: the
+                // fragmentation tests depend on the split being observable.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = sock.shutdown().await;
+        });
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("build a test client")
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("the loopback upstream answers")
+    }
+
+    /// Drain a translated stream into its raw frames.
+    pub(crate) async fn frames<S>(stream: S) -> Vec<String>
+    where
+        S: Stream<Item = Result<Bytes, io::Error>>,
+    {
+        futures::pin_mut!(stream);
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let bytes = item.expect("a translated frame");
+            out.push(String::from_utf8(bytes.to_vec()).expect("frames are UTF-8"));
+        }
+        out
+    }
+
+    /// Drain frames until the stream ends *or fails*: the error is returned
+    /// instead of panicking, for the tests that expect a stall.
+    pub(crate) async fn frames_or_error<S>(stream: S) -> (Vec<String>, Option<String>)
+    where
+        S: Stream<Item = Result<Bytes, io::Error>>,
+    {
+        futures::pin_mut!(stream);
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(bytes) => out.push(String::from_utf8(bytes.to_vec()).expect("frames are UTF-8")),
+                Err(e) => return (out, Some(e.to_string())),
+            }
+        }
+        (out, None)
+    }
+
+    /// Parse one frame's JSON body; `[DONE]` (and anything unparsable) is None.
+    pub(crate) fn data(frame: &str) -> Option<serde_json::Value> {
+        let body = frame.trim().strip_prefix("data:")?.trim();
+        if body == "[DONE]" {
+            return None;
+        }
+        serde_json::from_str(body).ok()
+    }
+
+    /// Headers arrive, the body never does: the "200 then silence" upstream the
+    /// first-byte deadline exists for. The socket stays open for `hold`.
+    pub(crate) async fn silent_body(content_type: &str, hold: Duration) -> reqwest::Response {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("local address");
+        let content_type = content_type.to_string();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut head = [0u8; 2048];
+            let _ = sock.read(&mut head).await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\nconnection: close\r\n\r\n"
+            );
+            if sock.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = sock.flush().await;
+            // Silence, on purpose.
+            tokio::time::sleep(hold).await;
+            let _ = sock.shutdown().await;
+        });
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("build a test client")
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("the loopback upstream answers the headers")
+    }
+
+    /// A one-key pool entry, for the per-key usage counters.
+    pub(crate) fn key_state() -> std::sync::Arc<crate::pool::KeyState> {
+        let pool = crate::pool::KeyPool::new(
+            "test".into(),
+            vec!["k-test".into()],
+            crate::config::Strategy::FillFirst,
+            4,
+            None,
+            None,
+            std::sync::Arc::new(crate::config::Tuning::default()),
+        );
+        pool.pick("m", None).expect("the pool holds one key")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

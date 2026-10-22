@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
@@ -70,10 +70,17 @@ pub fn key_id(provider: &str, secret: &str) -> String {
     format!("{provider}:{}", secret_hash(secret))
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// Health of one credential as persisted between restarts and across reloads.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HealthRecord {
     pub status: u8, // 0 active, 1 cooldown, 2 dead
     pub cooldown_until_ms: u64,
+    /// Per-model cooldowns (upstream model id -> until unix ms). A pool that is
+    /// rebuilt by a config reload must not forget that one model is exhausted —
+    /// that is exactly how a reload used to turn a per-model 429 back into a
+    /// request that hits the same quota again.
+    #[serde(default)]
+    pub model_cooldowns: std::collections::HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -94,6 +101,14 @@ pub struct StatsRecord {
     pub prompt_tokens: u64,
     #[serde(default)]
     pub completion_tokens: u64,
+}
+
+/// What a rebuilt key pool restores for one credential (see
+/// [`Storage::load_pool_records`]).
+#[derive(Debug, Clone, Default)]
+pub struct RestoredKey {
+    pub health: Option<HealthRecord>,
+    pub stats: Option<StatsRecord>,
 }
 
 /// One completed Responses API reply, kept so a follow-up can continue the
@@ -213,6 +228,24 @@ pub struct Storage {
     /// Bounded by both entry count and approximate bytes: it is a cache for one
     /// flush window, not a second copy of the store.
     recent: Arc<Mutex<HashMap<String, RecentEntry>>>,
+    /// The batch not committed yet, shared with the writer task.
+    ///
+    /// Health and stats are queued here directly (rather than through the
+    /// channel) so a reader always sees the value this process wrote last: a
+    /// config reload rebuilds pools from storage, and one that missed a `dead`
+    /// record still sitting in the 2 s batch would resurrect the key. It also lets
+    /// [`Storage::flush_blocking`] flush everything, in order, from any thread.
+    pending: Arc<Mutex<HashMap<String, StorageMsg>>>,
+    /// The runtime-key list this process wrote last.
+    ///
+    /// `set_extra_keys` is written to disk immediately by the writer task, but the
+    /// *next* read (a config reload merging extras) must see the new list even if
+    /// the writer has not run yet — the deletion path clears it right before the
+    /// reload, and reading the stale list resurrected the key being deleted.
+    extras_now: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Read transactions started (test-only, for the batching assertions).
+    #[cfg(test)]
+    read_txs: Arc<AtomicUsize>,
 }
 
 /// One entry of the immediate-read window: the record plus the serialized size it
@@ -245,14 +278,22 @@ impl Storage {
 
         let response_max = Arc::new(AtomicUsize::new(DEFAULT_RESPONSE_MAX));
         let recent: Arc<Mutex<HashMap<String, RecentEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<HashMap<String, StorageMsg>>> = Arc::new(Mutex::new(HashMap::new()));
         let writer_max = response_max.clone();
         let writer_recent = recent.clone();
+        let writer_pending = pending.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StorageMsg>();
         let writer_db = db.clone();
         tokio::spawn(async move {
-            let mut pending: HashMap<String, StorageMsg> = HashMap::new();
             let mut interval = tokio::time::interval(Duration::from_secs(2));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The batch lives behind a mutex so `flush_blocking` can drain it from
+            // the caller's thread; the writer is the only other user and never
+            // holds it across an await.
+            let locked = || match writer_pending.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
             loop {
                 // The cap can change on a config reload; read it per batch so the
                 // writer always evicts against the current value.
@@ -260,17 +301,22 @@ impl Storage {
                 tokio::select! {
                     msg = rx.recv() => match msg {
                         Some(m) => {
-                            dispatch(&writer_db, &mut pending, m, cap(), &writer_recent);
+                            let mut batch = locked();
+                            dispatch(&writer_db, &mut batch, m, cap(), &writer_recent);
                             while let Ok(m) = rx.try_recv() {
-                                dispatch(&writer_db, &mut pending, m, cap(), &writer_recent);
+                                dispatch(&writer_db, &mut batch, m, cap(), &writer_recent);
                             }
                         }
                         None => {
-                            flush(&writer_db, &mut pending, cap(), &writer_recent);
+                            let mut batch = locked();
+                            flush(&writer_db, &mut batch, cap(), &writer_recent);
                             break;
                         }
                     },
-                    _ = interval.tick() => flush(&writer_db, &mut pending, cap(), &writer_recent),
+                    _ = interval.tick() => {
+                        let mut batch = locked();
+                        flush(&writer_db, &mut batch, cap(), &writer_recent);
+                    }
                 }
             }
         });
@@ -279,7 +325,24 @@ impl Storage {
             tx,
             response_max,
             recent,
+            pending,
+            extras_now: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            read_txs: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Start a read transaction, counting it for the batching tests.
+    fn begin_read(&self) -> Option<redb::ReadTransaction> {
+        #[cfg(test)]
+        self.read_txs.fetch_add(1, Ordering::Relaxed);
+        self.db.begin_read().ok()
+    }
+
+    /// How many read transactions this instance has started (test-only).
+    #[cfg(test)]
+    fn read_tx_count(&self) -> usize {
+        self.read_txs.load(Ordering::Relaxed)
     }
 
     fn read_json<T: for<'de> Deserialize<'de>>(
@@ -287,21 +350,42 @@ impl Storage {
         table: TableDefinition<&str, &[u8]>,
         key: &str,
     ) -> Option<T> {
-        let rtx = self.db.begin_read().ok()?;
+        let rtx = self.begin_read()?;
         let t = rtx.open_table(table).ok()?;
         let v = t.get(key).ok()??;
         serde_json::from_slice(v.value()).ok()
     }
 
+    /// Queue a record for the next commit, in the shared batch.
+    ///
+    /// Used for the records a reload reads back (health/stats): going through the
+    /// batch means the read is exact, ordered, and flushable synchronously.
+    fn enqueue(&self, m: StorageMsg) {
+        let key = m.key();
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, m);
+    }
+
     pub fn save_health(&self, provider: &str, secret: &str, rec: HealthRecord) {
-        let _ = self.tx.send(StorageMsg::Health {
+        self.enqueue(StorageMsg::Health {
             key: key_id(provider, secret),
             rec,
         });
     }
 
     pub fn load_health(&self, provider: &str, secret: &str) -> Option<HealthRecord> {
-        self.read_json(HEALTH, &key_id(provider, secret))
+        let key = key_id(provider, secret);
+        // The batch may not have reached the file yet; it always holds the value
+        // this process wrote last.
+        if let Some(rec) = queued_message(&self.pending, &format!("h:{key}"), |m| match m {
+            StorageMsg::Health { rec, .. } => Some(rec.clone()),
+            _ => None,
+        }) {
+            return Some(rec);
+        }
+        self.read_json(HEALTH, &key)
     }
 
     pub fn save_oauth(&self, provider: &str, secret: &str, rec: OAuthRecord) {
@@ -316,14 +400,72 @@ impl Storage {
     }
 
     pub fn save_stats(&self, provider: &str, secret: &str, rec: StatsRecord) {
-        let _ = self.tx.send(StorageMsg::Stats {
+        self.enqueue(StorageMsg::Stats {
             key: key_id(provider, secret),
             rec,
         });
     }
 
     pub fn load_stats(&self, provider: &str, secret: &str) -> Option<StatsRecord> {
-        self.read_json(STATS, &key_id(provider, secret))
+        let key = key_id(provider, secret);
+        // Same reason as `load_health`: a pool rebuilt right after a stats save
+        // must see the value this process just wrote, not the last commit.
+        if let Some(rec) = queued_message(&self.pending, &format!("s:{key}"), |m| match m {
+            StorageMsg::Stats { rec, .. } => Some(*rec),
+            _ => None,
+        }) {
+            return Some(rec);
+        }
+        self.read_json(STATS, &key)
+    }
+
+    /// Health and stats of every credential of one provider, in a single read
+    /// transaction.
+    ///
+    /// A reload restores every key of every provider; doing that one table read
+    /// per key per table meant `2 × keys` transactions each time. The result is
+    /// index-aligned with `secrets`.
+    pub fn load_pool_records(&self, provider: &str, secrets: &[String]) -> Vec<RestoredKey> {
+        let mut out: Vec<RestoredKey> = secrets.iter().map(|_| RestoredKey::default()).collect();
+        {
+            // The batch may hold a value the file does not have yet.
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            for (i, secret) in secrets.iter().enumerate() {
+                let key = key_id(provider, secret);
+                if let Some(StorageMsg::Health { rec, .. }) = pending.get(&format!("h:{key}")) {
+                    out[i].health = Some(rec.clone());
+                }
+                if let Some(StorageMsg::Stats { rec, .. }) = pending.get(&format!("s:{key}")) {
+                    out[i].stats = Some(*rec);
+                }
+            }
+        }
+        let Some(rtx) = self.begin_read() else {
+            return out;
+        };
+        if let Ok(health) = rtx.open_table(HEALTH) {
+            for (i, secret) in secrets.iter().enumerate() {
+                if out[i].health.is_some() {
+                    continue; // the mirror is newer
+                }
+                let key = key_id(provider, secret);
+                if let Ok(Some(v)) = health.get(key.as_str()) {
+                    out[i].health = serde_json::from_slice(v.value()).ok();
+                }
+            }
+        }
+        if let Ok(stats) = rtx.open_table(STATS) {
+            for (i, secret) in secrets.iter().enumerate() {
+                if out[i].stats.is_some() {
+                    continue;
+                }
+                let key = key_id(provider, secret);
+                if let Ok(Some(v)) = stats.get(key.as_str()) {
+                    out[i].stats = serde_json::from_slice(v.value()).ok();
+                }
+            }
+        }
+        out
     }
 
     /// Persist a runtime-added key (survives restarts).
@@ -346,6 +488,10 @@ impl Storage {
 
     /// Replace the whole runtime-key list for a provider (empty = clear).
     pub fn set_extra_keys(&self, provider: &str, secrets: Vec<String>) {
+        self.extras_now
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(provider.to_string(), secrets.clone());
         let _ = self.tx.send(StorageMsg::ExtraKeys {
             provider: provider.to_string(),
             secrets,
@@ -353,6 +499,17 @@ impl Storage {
     }
 
     pub fn list_extra_keys(&self, provider: &str) -> Vec<String> {
+        // What this process wrote last wins over the table: the write is queued
+        // for the writer task and a read in between (the reload that follows a
+        // key deletion) must not see the previous list.
+        if let Some(list) = self
+            .extras_now
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(provider)
+        {
+            return list.clone();
+        }
         self.read_json(EXTRAS, &format!("extra:{provider}"))
             .unwrap_or_default()
     }
@@ -530,6 +687,25 @@ impl Storage {
             let _ = rx.await;
         }
     }
+
+    /// Commit the current batch from the calling thread, without an async round
+    /// trip.
+    ///
+    /// Used by a config reload: it rebuilds pools, which restores their health
+    /// from this store, and a write sitting in the 2 s batch would otherwise be
+    /// read as "no such state" — a key that just returned 401 would come back
+    /// alive, a model cooldown would be forgotten. Blocking here is deliberate
+    /// (reloads are rare admin actions) and safe to call from a worker thread:
+    /// the batch is behind a mutex the writer task never holds across an await.
+    pub fn flush_blocking(&self) {
+        let mut batch = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        flush(
+            &self.db,
+            &mut batch,
+            self.response_max.load(Ordering::Relaxed),
+            &self.recent,
+        );
+    }
 }
 
 /// Apply one message: the rare admin writes go to disk immediately, everything
@@ -589,56 +765,72 @@ fn delete_response_now(db: &Arc<Database>, id: &str) {
 /// none, which is what a disabled store means).
 ///
 /// Runs inside the writer's write transaction right after new records were
-/// inserted, so the request path never scans or deletes. A full pass per flush
-/// that actually wrote a response is cheaper than maintaining a second index for
-/// a table of KB-scale records.
+/// inserted, so the request path never scans or deletes. The caller only calls
+/// this when the batch grew the store *and* the row count exceeds the cap
+/// ([`needs_eviction`]), so the common flush pays nothing at all.
+///
+/// The scan keeps a bounded candidate list of the `excess` oldest rows instead
+/// of collecting and sorting every row: with a 100 k-row store, one inserted
+/// record used to mean deserialising 100 k `created_at` values and sorting them
+/// all inside the single write transaction.
 fn evict_responses(
     t: &mut redb::Table<'_, &'static str, &'static [u8]>,
     max: usize,
 ) -> Vec<String> {
-    if max == 0 {
-        // Disabled: drop whatever is left over from a larger cap.
-        let doomed: Vec<String> = match t.iter() {
-            Ok(iter) => iter
-                .filter_map(|e| e.ok().map(|(k, _)| k.value().to_string()))
-                .collect(),
-            Err(_) => return Vec::new(),
-        };
-        for id in &doomed {
-            let _ = t.remove(id.as_str());
+    let rows = match t.len() {
+        Ok(n) => n as usize,
+        Err(e) => {
+            tracing::warn!("storage: cannot count responses for eviction: {e}");
+            return Vec::new();
         }
-        return doomed;
+    };
+    if rows <= max {
+        // Nothing to do — including the disabled store with no leftovers.
+        return Vec::new();
     }
-    let mut rows: Vec<(u64, String)> = Vec::new();
-    match t.iter() {
-        Ok(iter) => {
-            for entry in iter {
-                let Ok((key, value)) = entry else { continue };
-                // Only `created_at` matters here; serde skips the rest.
-                let created = serde_json::from_slice::<ResponseCreatedAt>(value.value())
-                    .map(|r| r.created_at)
-                    .unwrap_or(0);
-                rows.push((created, key.value().to_string()));
-            }
-        }
+    let excess = rows - max;
+    // Max-heap of the candidates: the largest (newest) of the current victims is
+    // on top, so a row older than it replaces it. Ordering is (created_at, id),
+    // which makes eviction deterministic for equal timestamps and identical to
+    // the full sort this replaces.
+    let mut victims: std::collections::BinaryHeap<(u64, String)> =
+        std::collections::BinaryHeap::with_capacity(excess.min(1024));
+    let iter = match t.iter() {
+        Ok(iter) => iter,
         Err(e) => {
             tracing::warn!("storage: cannot scan responses for eviction: {e}");
             return Vec::new();
         }
+    };
+    for entry in iter {
+        let Ok((key, value)) = entry else { continue };
+        // Only `created_at` matters here; serde skips the rest.
+        let created = serde_json::from_slice::<ResponseCreatedAt>(value.value())
+            .map(|r| r.created_at)
+            .unwrap_or(0);
+        let cand = (created, key.value().to_string());
+        if victims.len() < excess {
+            victims.push(cand);
+        } else if victims.peek().is_some_and(|worst| &cand < worst) {
+            victims.pop();
+            victims.push(cand);
+        }
     }
-    if rows.len() <= max {
-        return Vec::new();
-    }
-    // Oldest first; the id breaks ties so eviction is deterministic when several
-    // responses share a timestamp.
-    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let excess = rows.len() - max;
-    let mut removed = Vec::new();
-    for (_, id) in rows.into_iter().take(excess) {
+    let mut removed = Vec::with_capacity(victims.len());
+    for (_, id) in victims.into_iter() {
         let _ = t.remove(id.as_str());
         removed.push(id);
     }
     removed
+}
+
+/// Whether an eviction pass can possibly have work to do.
+///
+/// The row count is O(1) in redb (the table tracks its length); the scan is
+/// O(rows). Skipping it whenever the batch did not grow the store — or the store
+/// is still under its cap — keeps a normal flush free of response-table work.
+fn needs_eviction(rows: usize, inserted: usize, max: usize) -> bool {
+    inserted > 0 && rows > max
 }
 
 /// The single field eviction needs from a [`StoredResponse`]; unknown fields are
@@ -739,21 +931,32 @@ fn flush(
             }
         }
         if let Ok(mut t) = wtx.open_table(RESPONSES) {
+            let mut inserted = 0usize;
             for m in &msgs {
                 if let StorageMsg::Response { id, data } = m
                     && t.insert(id.as_str(), data.as_slice()).is_ok()
                 {
+                    inserted += 1;
                     flushed.push(id.clone());
                 }
             }
-            // Only pay for the cap check when this batch actually grew the store.
-            if !flushed.is_empty() {
+            // Cheap guard first: only a batch that grew the store can push it over
+            // the cap, and the count is O(1) while the scan is O(rows).
+            let rows = t.len().map(|n| n as usize).unwrap_or(0);
+            if needs_eviction(rows, inserted, response_max) {
                 flushed.extend(evict_responses(&mut t, response_max));
             }
         }
     }
     if let Err(e) = wtx.commit() {
-        tracing::warn!("storage: commit failed: {e}");
+        // `pending` was drained above, so the batch is in `msgs` now. Re-queue it:
+        // dropping it would silently lose health/stat/feed writes (a dead key would
+        // come back active after the next reload), and the batch is the only copy.
+        tracing::warn!(
+            "storage: commit failed ({e}), re-queuing {} msgs",
+            msgs.len()
+        );
+        requeue(pending, msgs);
         return;
     }
     // These records are on disk now (or were just evicted), so the immediate-read
@@ -761,6 +964,38 @@ fn flush(
     let mut cache = recent.lock().unwrap_or_else(|e| e.into_inner());
     for id in &flushed {
         cache.remove(id);
+    }
+}
+
+/// Look a record up in the not-yet-committed batch.
+fn queued_message<T>(
+    pending: &Mutex<HashMap<String, StorageMsg>>,
+    key: &str,
+    pick: impl Fn(&StorageMsg) -> Option<T>,
+) -> Option<T> {
+    let pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+    pending.get(key).and_then(pick)
+}
+
+/// Cap on the batch kept after a failed commit.
+///
+/// A commit that keeps failing (a full or read-only state file) would otherwise
+/// re-queue the same batch forever and grow it with every new write. Dropping the
+/// overflow is the least-bad option: the records are best-effort telemetry, while
+/// an unbounded map would take the process down.
+const MAX_PENDING_REQUEUE: usize = 50_000;
+
+/// Put a drained batch back so the next tick retries it (bug: a failed commit
+/// used to return with the batch already consumed, silently losing it).
+fn requeue(pending: &mut HashMap<String, StorageMsg>, msgs: Vec<StorageMsg>) {
+    for m in msgs {
+        let key = m.key();
+        if pending.len() >= MAX_PENDING_REQUEUE && !pending.contains_key(&key) {
+            tracing::warn!("storage: batch is full, dropping a record that failed to commit");
+            continue;
+        }
+        // A newer message for the same record may already be queued again.
+        pending.entry(key).or_insert(m);
     }
 }
 
@@ -1024,6 +1259,7 @@ mod tests {
             HealthRecord {
                 status: 1,
                 cooldown_until_ms: 42,
+                ..Default::default()
             },
         );
         store.save_response("resp_1", rec("resp_1", 1));
@@ -1039,6 +1275,228 @@ mod tests {
         );
         assert!(store.load_response("resp_1").is_some());
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- D: health written this second must be readable before the batch -----
+
+    /// `save_health` is batched for two seconds. A config reload reads the health
+    /// of every key back to rebuild its pool, so reading the *table* at that
+    /// moment used to miss the just-written record: a key that returned 401 came
+    /// back active. The write-through mirror closes that window.
+    #[tokio::test]
+    async fn a_health_write_is_readable_before_the_batch_flushes() {
+        let (store, path) = open_scratch("health-now").await;
+        let dead = HealthRecord {
+            status: 2,
+            cooldown_until_ms: 0,
+            ..Default::default()
+        };
+        store.save_health("mock", "sk-dead", dead.clone());
+
+        let got = store
+            .load_health("mock", "sk-dead")
+            .expect("a record written this instant must be readable");
+        assert_eq!(got.status, 2, "the dead key must not come back active");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Per-model cooldowns travel with the record: a reload that rebuilt a pool
+    /// used to forget that one model is exhausted.
+    #[tokio::test]
+    async fn per_model_cooldowns_survive_the_round_trip() {
+        let (store, path) = open_scratch("model-cd").await;
+        let mut rec = HealthRecord {
+            status: 0,
+            cooldown_until_ms: 0,
+            ..Default::default()
+        };
+        rec.model_cooldowns.insert("m-1".into(), 4_102_444_800_000);
+        store.save_health("mock", "sk-1", rec);
+        store.flush_async().await;
+
+        let got = store.load_health("mock", "sk-1").expect("record");
+        assert_eq!(
+            got.model_cooldowns.get("m-1").copied(),
+            Some(4_102_444_800_000),
+            "the model cooldown must be persisted, not just the key status"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The config reload path needs a *synchronous* flush: it rebuilds pools right
+    /// after, and must not read a stale store. This must work off the tokio
+    /// runtime too, so it cannot be an `async fn`.
+    #[tokio::test]
+    async fn flush_blocking_writes_the_batch_without_awaiting() {
+        let (store, path) = open_scratch("flush-blocking").await;
+        store.save_health(
+            "mock",
+            "sk-1",
+            HealthRecord {
+                status: 2,
+                cooldown_until_ms: 0,
+                ..Default::default()
+            },
+        );
+        store.flush_blocking();
+
+        // Read the *table*, not the mirror, to prove the bytes reached the file.
+        let on_disk: HealthRecord = store
+            .read_json(HEALTH, &key_id("mock", "sk-1"))
+            .expect("the record must be committed by flush_blocking");
+        assert_eq!(on_disk.status, 2);
+
+        // Flushing an empty batch is a no-op, not an error.
+        store.flush_blocking();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- L: one read transaction per pool, not two per key -----
+
+    #[tokio::test]
+    async fn a_pool_restore_reads_every_key_in_one_transaction() {
+        let (store, path) = open_scratch("batch-restore").await;
+        let secrets: Vec<String> = (0..3).map(|i| format!("sk-{i}")).collect();
+        for (i, s) in secrets.iter().enumerate() {
+            store.save_health(
+                "mock",
+                s,
+                HealthRecord {
+                    status: 2,
+                    cooldown_until_ms: 0,
+                    ..Default::default()
+                },
+            );
+            store.save_stats(
+                "mock",
+                s,
+                StatsRecord {
+                    requests: i as u64,
+                    ..Default::default()
+                },
+            );
+        }
+        store.flush_async().await;
+
+        let before = store.read_tx_count();
+        let recs = store.load_pool_records("mock", &secrets);
+        assert_eq!(
+            store.read_tx_count() - before,
+            1,
+            "three keys used to cost six read transactions"
+        );
+        assert_eq!(recs.len(), 3);
+        for (i, r) in recs.iter().enumerate() {
+            assert_eq!(r.health.as_ref().map(|h| h.status), Some(2));
+            assert_eq!(r.stats.as_ref().map(|s| s.requests), Some(i as u64));
+        }
+        // An unknown key is simply absent, never invented.
+        let missing = store.load_pool_records("mock", &["nope".to_string()]);
+        assert!(missing[0].health.is_none() && missing[0].stats.is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- J: a failed commit must not eat the batch -----
+
+    /// `key` is the raw record id ("a"), the message key is "h:a".
+    fn health_msg(key: &str, status: u8) -> StorageMsg {
+        StorageMsg::Health {
+            key: key.to_string(),
+            rec: HealthRecord {
+                status,
+                cooldown_until_ms: 0,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_failed_commit_requeues_every_record() {
+        let mut pending = HashMap::new();
+        let msgs = vec![health_msg("a", 2), health_msg("b", 1)];
+        requeue(&mut pending, msgs);
+        assert_eq!(
+            pending.len(),
+            2,
+            "flush() drained the batch before the commit; a failure used to drop it"
+        );
+        assert!(matches!(
+            pending.get("h:a"),
+            Some(StorageMsg::Health { rec, .. }) if rec.status == 2
+        ));
+    }
+
+    #[test]
+    fn requeue_keeps_a_newer_record_and_stays_bounded() {
+        let mut pending = HashMap::new();
+        pending.insert("h:a".to_string(), health_msg("a", 2));
+        // A retried older copy must not overwrite the newer queued value.
+        requeue(&mut pending, vec![health_msg("a", 0)]);
+        assert!(matches!(
+            pending.get("h:a"),
+            Some(StorageMsg::Health { rec, .. }) if rec.status == 2
+        ));
+
+        // A permanently failing state file must not grow memory without bound.
+        let mut full = HashMap::new();
+        for i in 0..MAX_PENDING_REQUEUE {
+            full.insert(format!("h:k{i}"), health_msg(&format!("k{i}"), 0));
+        }
+        requeue(&mut full, vec![health_msg("overflow", 0)]);
+        assert_eq!(full.len(), MAX_PENDING_REQUEUE);
+        assert!(!full.contains_key("h:overflow"));
+    }
+
+    // ----- K: eviction only scans when it can have work, and never sorts -----
+
+    #[test]
+    fn eviction_is_skipped_when_it_cannot_have_work() {
+        // The common flush: writes do not touch the response table at all.
+        assert!(!needs_eviction(100_000, 0, 100_000));
+        // A response was written but the store is still under the cap.
+        assert!(!needs_eviction(99_999, 1, 100_000));
+        // Over the cap after inserting.
+        assert!(needs_eviction(100_001, 1, 100_000));
+        // Over the cap, but this batch did not insert: nothing new to evict.
+        assert!(!needs_eviction(100_001, 0, 100_000));
+        // A disabled store with leftovers must still be emptied.
+        assert!(needs_eviction(1, 1, 0));
+    }
+
+    /// Lowering the cap evicts exactly the globally oldest rows, even though the
+    /// scan sees them in key order — the bounded candidate list must not settle
+    /// for the first `excess` rows it meets.
+    #[tokio::test]
+    async fn a_lowered_cap_evicts_the_globally_oldest_rows() {
+        let (store, path) = open_scratch("evict-bounded").await;
+        store.set_response_max(10);
+        // Insert newest-first so key order is the opposite of age order.
+        let ages = [60u64, 50, 40, 30, 20, 10];
+        for (i, created) in ages.iter().enumerate() {
+            let id = format!("resp_{i:02}");
+            store.save_response(&id, rec(&id, *created));
+        }
+        // Give resp_00 the smallest id but the newest timestamp: a naive
+        // "keep the first rows" scan would keep it and drop a newer one.
+        store.flush_async().await;
+        assert_eq!(store.list_responses().len(), 6);
+
+        store.set_response_max(3);
+        store.save_response("resp_new", rec("resp_new", 100));
+        store.flush_async().await;
+
+        let left = sorted(store.list_responses());
+        assert_eq!(
+            left,
+            vec![
+                "resp_00".to_string(),  // created_at 60
+                "resp_01".to_string(),  // 50
+                "resp_new".to_string()  // 100
+            ],
+            "eviction kept the wrong rows: {left:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

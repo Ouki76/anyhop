@@ -52,6 +52,8 @@ pub fn SettingsTab() -> View {
     let t_sse_keepalive = create_signal(String::new());
     let t_quota_ttl = create_signal(String::new());
     let t_resp_store = create_signal(String::new());
+    let t_body_timeout = create_signal(String::new());
+    let t_shutdown_grace = create_signal(String::new());
     let api_key_set = create_signal(false);
     let admin_key_set = create_signal(false);
     let status = create_signal(String::new());
@@ -97,6 +99,8 @@ pub fn SettingsTab() -> View {
             t_sse_keepalive.set(t.sse_keepalive_secs.to_string());
             t_quota_ttl.set(t.quota_cache_ttl_secs.to_string());
             t_resp_store.set(t.response_store_max.to_string());
+            t_body_timeout.set(t.client_body_timeout_secs.to_string());
+            t_shutdown_grace.set(t.shutdown_grace_secs.to_string());
             api_key_set.set(s.api_key_set);
             admin_key_set.set(s.admin_key_set);
             loaded.set(true);
@@ -261,6 +265,8 @@ pub fn SettingsTab() -> View {
                             "sse_keepalive_secs": int_of(&t_sse_keepalive.get_clone()),
                             "quota_cache_ttl_secs": int_of(&t_quota_ttl.get_clone()),
                             "response_store_max": int_of(&t_resp_store.get_clone()) as usize,
+                            "client_body_timeout_secs": int_of(&t_body_timeout.get_clone()),
+                            "shutdown_grace_secs": int_of(&t_shutdown_grace.get_clone()),
                         },
                     });
                     // Secrets: only send what the admin actually typed.
@@ -338,7 +344,14 @@ pub fn SettingsTab() -> View {
                             t_sse_keepalive.set(t.sse_keepalive_secs.to_string());
                             t_quota_ttl.set(t.quota_cache_ttl_secs.to_string());
                             t_resp_store.set(t.response_store_max.to_string());
+                            t_body_timeout.set(t.client_body_timeout_secs.to_string());
+                            t_shutdown_grace.set(t.shutdown_grace_secs.to_string());
+            t_shutdown_grace.set(t.shutdown_grace_secs.to_string());
+            t_body_timeout.set(t.client_body_timeout_secs.to_string());
+            t_shutdown_grace.set(t.shutdown_grace_secs.to_string());
             t_resp_store.set(t.response_store_max.to_string());
+            t_body_timeout.set(t.client_body_timeout_secs.to_string());
+            t_shutdown_grace.set(t.shutdown_grace_secs.to_string());
                             api_key.set(String::new());
                             admin_key.set(String::new());
                             if status.is_alive() {
@@ -452,6 +465,16 @@ pub fn SettingsTab() -> View {
                     label(class="form-label") { "Quota cache, s" }
                     input(class="input", r#type="number", min="1", bind:value=t_quota_ttl)
                     div(class="form-hint") { "How long a per-account quota snapshot is reused." }
+                }
+                div(class="form-group") {
+                    label(class="form-label") { "Request body timeout, s" }
+                    input(class="input", r#type="number", min="1", max="300", bind:value=t_body_timeout)
+                    div(class="form-hint") { "Per-chunk read deadline; bounds slowloris." }
+                }
+                div(class="form-group") {
+                    label(class="form-label") { "Shutdown grace, s" }
+                    input(class="input", r#type="number", min="1", max="120", bind:value=t_shutdown_grace)
+                    div(class="form-hint") { "How long SIGTERM waits for open streams before aborting them." }
                 }
                 div(class="form-group") {
                     label(class="form-label") { "Response store" }

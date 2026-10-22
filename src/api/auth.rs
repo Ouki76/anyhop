@@ -20,11 +20,12 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use super::{ApiError, ApiResult, ok_json};
+use crate::middleware::{ClientIp, token_eq};
 use crate::proxy::AppState;
 
 #[derive(Clone, serde::Serialize)]
@@ -37,6 +38,26 @@ pub struct AuthStateDto {
     /// "loopback" (localhost port) or "public" (redirect back to this gateway).
     mode: String,
     message: String,
+    /// The OAuth `state` this flow is waiting for — stored *with* the flow, so
+    /// "is this callback ours?" is one lookup under one lock.
+    ///
+    /// Never serialized: `POST /api/auth/start` already returns it once for the
+    /// paste fallback, and `/api/auth/status` is polled every few seconds — an
+    /// echoed bearer secret would only widen the exposure.
+    #[serde(skip)]
+    state_token: String,
+    /// When `state_token` stops being accepted. A delivery is single-use
+    /// anyway; the deadline is what makes an *abandoned* flow unreplayable.
+    #[serde(skip)]
+    expires_at: std::time::Instant,
+}
+
+/// How long a `state` token stays valid: exactly the window the flow itself
+/// waits for the code (`oauth_http_timeout_secs` × 10, see `auth_start`), so a
+/// slow consent screen is not rejected while an abandoned flow stops being
+/// sweepable when its task times out.
+fn state_ttl(tuning: &crate::config::Tuning) -> std::time::Duration {
+    tuning.oauth_http_timeout() * 10
 }
 
 #[derive(Deserialize)]
@@ -218,14 +239,14 @@ pub async fn auth_start(
     *state.auth_code_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(code_tx);
 
     let pending = if is_ag {
-        match crate::antigravity::start_auth_with(None, &state.tuning, redirect_uri.as_deref())
+        match crate::antigravity::start_auth_with(None, &state.tuning(), redirect_uri.as_deref())
             .await
         {
             Ok(p) => Flow::Antigravity(p),
             Err(e) => return Err(ApiError::conflict(e.to_string())),
         }
     } else {
-        match crate::codex::start_auth_with(None, &state.tuning, redirect_uri.as_deref()).await {
+        match crate::codex::start_auth_with(None, &state.tuning(), redirect_uri.as_deref()).await {
             Ok(p) => Flow::Codex(p),
             Err(e) => return Err(ApiError::conflict(e.to_string())),
         }
@@ -233,11 +254,6 @@ pub async fn auth_start(
     let url = pending.url().to_string();
     let state_token = pending.state().to_string();
     let headless_now = pending.is_headless();
-    *state
-        .auth_state_token
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(state_token.clone());
-
     *state.auth_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(AuthStateDto {
         kind: kind.clone(),
         provider: provider_name.clone(),
@@ -252,12 +268,14 @@ pub async fn auth_start(
         } else {
             "waiting for the browser callback (or paste the redirected URL below)".to_string()
         },
+        state_token: state_token.clone(),
+        expires_at: std::time::Instant::now() + state_ttl(&state.tuning()),
     });
 
     let st = state.clone();
     let handle = tokio::spawn(async move {
         let outcome = tokio::time::timeout(
-            st.tuning.oauth_http_timeout() * 10,
+            st.tuning().oauth_http_timeout() * 10,
             complete_flow(pending, &mut code_rx),
         )
         .await;
@@ -327,10 +345,9 @@ async fn cancel_flow(state: &Arc<AppState>, kind: &str) {
             Some(a) if a.status == "waiting" && (kind.is_empty() || a.kind == kind) => {
                 a.status = "cancelled".into();
                 a.message = "cancelled".into();
-                *state
-                    .auth_state_token
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = None;
+                // Retire the state too: a callback that arrives now must not
+                // restart the flow the operator just cancelled.
+                a.state_token.clear();
                 state
                     .auth_task
                     .lock()
@@ -363,31 +380,78 @@ pub async fn auth_cancel(State(state): State<Arc<AppState>>) -> ApiResult {
     ok_json(serde_json::json!({"cancelled": true, "kind": kind}))
 }
 
+/// Outcome of a code delivery, so each transport can answer in its own language
+/// (an HTML page for the browser, an `ApiError` for the panel).
+#[derive(Debug, PartialEq, Eq)]
+enum Delivery {
+    Delivered,
+    /// Nothing is waiting: no flow, one that already finished, or one whose
+    /// state token expired.
+    NotPending,
+    /// The token does not belong to the pending flow. This is a *failed
+    /// credential* and must be counted as one.
+    WrongState,
+    /// The provider sent no usable code.
+    EmptyCode,
+}
+
 /// Push a code into the pending flow. Shared by the public callback and the
 /// "paste the URL" endpoint.
-async fn deliver_code(state: &AppState, code: &str, state_token: &str) -> bool {
-    // Reject a callback that does not belong to the flow we are waiting for.
-    let expected = state
-        .auth_state_token
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    match expected {
-        Some(exp) if !state_token.is_empty() && state_token != exp => return false,
-        None => return false, // nothing pending
-        _ => {}
+///
+/// The `state` is a bearer secret in a URL: an attacker who can reach the
+/// callback can guess a timestamp, so the checks are strict — a token must be
+/// present, must match in constant time, must not be expired, and is consumed on
+/// the first successful delivery.
+async fn deliver_code(state: &AppState, code: &str, state_token: &str) -> Delivery {
+    if code.trim().is_empty() {
+        return Delivery::EmptyCode;
     }
-    let tx = state
-        .auth_code_tx
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    match tx {
-        Some(tx) => tx
-            .send((code.to_string(), state_token.to_string()))
-            .await
-            .is_ok(),
-        None => false,
+    if state_token.is_empty() {
+        // An empty state used to be accepted here, which let a bare
+        // `?code=…` kill the pending flow (and, before the token was random,
+        // finish it with the attacker's account).
+        return Delivery::WrongState;
+    }
+    let tx = {
+        let mut g = state.auth_state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(a) = g.as_mut() else {
+            return Delivery::NotPending;
+        };
+        if a.status != "waiting" {
+            return Delivery::NotPending;
+        }
+        if std::time::Instant::now() >= a.expires_at {
+            // Retire the flow: it can no longer be completed, and saying so is
+            // more useful than a generic "no sign-in is waiting".
+            a.status = "error".into();
+            a.message = "authorization timed out".into();
+            a.state_token.clear();
+            return Delivery::NotPending;
+        }
+        if !token_eq(state_token, &a.state_token) {
+            return Delivery::WrongState;
+        }
+        // Single use: a replayed callback (or a second browser tab) must not
+        // reach the token exchange twice.
+        a.state_token.clear();
+        state
+            .auth_code_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    };
+    let Some(tx) = tx else {
+        return Delivery::NotPending;
+    };
+    if tx
+        .send((code.to_string(), state_token.to_string()))
+        .await
+        .is_ok()
+    {
+        Delivery::Delivered
+    } else {
+        // The flow task is gone (cancelled or timed out).
+        Delivery::NotPending
     }
 }
 
@@ -426,6 +490,7 @@ fn parse_callback_input(input: &str) -> (Option<String>, Option<String>) {
 /// redirect cannot carry the key): the OAuth `state` protects it.
 pub async fn auth_callback(
     State(state): State<Arc<AppState>>,
+    ip: ClientIp,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let code = q.get("code").cloned().unwrap_or_default();
@@ -445,19 +510,46 @@ pub async fn auth_callback(
             "No code in the callback. Close this tab and start over.",
         );
     }
-    if !deliver_code(&state, &code, &st).await {
-        return html_page(
+    match deliver_code(&state, &code, &st).await {
+        Delivery::Delivered => {
+            crate::middleware::clear_failures(&state, &ip.0);
+            html_page(
+                StatusCode::OK,
+                "anyhop: authorized",
+                "You can close this tab and return to the dashboard.",
+            )
+        }
+        Delivery::WrongState => {
+            // A wrong `state` is a wrong credential, and this route carries no
+            // admin key: run it through the same limiter as /v1 and /api so the
+            // token cannot be swept from the internet at full speed.
+            if let Some(gate) = crate::middleware::gate_failed_credential(&state, &ip.0) {
+                let retry = gate.headers().get(header::RETRY_AFTER).cloned();
+                let mut resp = html_page(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Too many rejected sign-ins",
+                    "This address sent too many callbacks that did not belong to a pending \
+                     sign-in. Wait a minute, then start again from the panel.",
+                );
+                if let Some(v) = retry {
+                    resp.headers_mut().insert(header::RETRY_AFTER, v);
+                }
+                return resp;
+            }
+            html_page(
+                StatusCode::BAD_REQUEST,
+                "Sign-in rejected",
+                "This link does not belong to the pending sign-in (wrong or expired `state`). \
+                 Close this tab and start again from the panel.",
+            )
+        }
+        Delivery::NotPending | Delivery::EmptyCode => html_page(
             StatusCode::BAD_REQUEST,
             "Sign-in rejected",
             "This link does not belong to the pending sign-in (wrong or expired `state`). \
              Close this tab and start again from the panel.",
-        );
+        ),
     }
-    html_page(
-        StatusCode::OK,
-        "anyhop: authorized",
-        "You can close this tab and return to the dashboard.",
-    )
 }
 
 /// POST /api/auth/complete — `{"url": "<the address your browser ended up on>"}`
@@ -465,6 +557,7 @@ pub async fn auth_callback(
 /// loopback redirect and the browser cannot reach the gateway.
 pub async fn auth_complete(
     State(state): State<Arc<AppState>>,
+    ip: ClientIp,
     Json(body): Json<serde_json::Value>,
 ) -> ApiResult {
     let input = body
@@ -477,21 +570,51 @@ pub async fn auth_complete(
     let Some(code) = code else {
         return Err(ApiError::bad_request("paste the callback URL or the code"));
     };
-    // Prefer the state from the pasted URL; fall back to the pending flow's own.
-    let state_token = st.or_else(|| {
-        state
+    // Prefer the state from the pasted URL; a bare code (the common copy-paste of
+    // the provider's `?code=…`) falls back to the pending flow's own token.
+    //
+    // The fallback used to be `a.kind` — a value that is never a real state, so
+    // `{"code": "..."}` could only ever answer 409. This route is behind the
+    // admin key, i.e. the caller is already allowed to *start* the flow, so
+    // using the pending token here grants nothing that `/api/auth/start` would
+    // not (and the host that owns the flow is the one that gets the account).
+    let state_token = match st {
+        Some(s) => s,
+        None => state
             .auth_state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .map(|a| a.kind.clone())
-    });
-    if !deliver_code(&state, &code, state_token.as_deref().unwrap_or("")).await {
-        return Err(ApiError::conflict(
+            .filter(|a| a.status == "waiting")
+            .map(|a| a.state_token.clone())
+            .unwrap_or_default(),
+    };
+    match deliver_code(&state, &code, &state_token).await {
+        Delivery::Delivered => {
+            crate::middleware::clear_failures(&state, &ip.0);
+            ok_json(serde_json::json!({"ok": true}))
+        }
+        Delivery::WrongState => {
+            if let Some(gate) = crate::middleware::gate_failed_credential(&state, &ip.0) {
+                let retry = gate
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse().ok());
+                return Err(ApiError::TooManyRequests {
+                    message: "too many rejected callbacks from this address".into(),
+                    retry_after_secs: retry,
+                });
+            }
+            Err(ApiError::conflict(
+                "this code does not belong to the pending sign-in — restart it from the panel",
+            ))
+        }
+        Delivery::EmptyCode => Err(ApiError::bad_request("the code is empty")),
+        Delivery::NotPending => Err(ApiError::conflict(
             "no sign-in is waiting — start it again from the panel",
-        ));
+        )),
     }
-    ok_json(serde_json::json!({"ok": true}))
 }
 
 pub async fn auth_status(State(state): State<Arc<AppState>>) -> ApiResult {
@@ -503,7 +626,30 @@ pub async fn auth_status(State(state): State<Arc<AppState>>) -> ApiResult {
     ok_json(g)
 }
 
+/// Escape text that is interpolated into the OAuth callback pages.
+///
+/// `body` can carry the provider's `error` query parameter straight from the
+/// URL, so a crafted link (`?error=<script>…`) must not become markup on our
+/// origin. The pages are tiny, so escaping everything is cheaper than tracking
+/// which fragment is trusted.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn html_page(status: StatusCode, title: &str, body: &str) -> Response {
+    let title = html_escape(title);
+    let body = html_escape(body);
     let html = format!(
         "<!doctype html><meta charset=utf-8><title>{title}</title>\
          <style>body{{font:15px/1.5 system-ui,sans-serif;margin:12vh auto;max-width:32rem;padding:0 1.5rem}}</style>\
@@ -593,8 +739,245 @@ fn append_account(
         accounts.push(acc);
     }
 
-    crate::config::write_atomic(path, &doc.to_string())?;
-    Ok(())
+    // Validated + private write: a concurrent edit that left the document
+    // invalid must not be overwritten with something the next start cannot load,
+    // and the file must keep its 0600 mode (see `server::write_config_checked`).
+    super::server::write_config_checked(path, &doc.to_string())
+}
+
+#[cfg(test)]
+mod oauth_state_tests {
+    use super::*;
+    use crate::api::server::test_support::state;
+    use std::time::Duration;
+
+    fn pending(state_token: &str, ttl: Duration) -> AuthStateDto {
+        AuthStateDto {
+            kind: "antigravity".into(),
+            provider: "ag".into(),
+            status: "waiting".into(),
+            url: "https://provider.example/auth".into(),
+            mode: "public".into(),
+            message: String::new(),
+            state_token: state_token.to_string(),
+            expires_at: std::time::Instant::now() + ttl,
+        }
+    }
+
+    /// A state with a pending flow on the code channel, plus the receiver the
+    /// real flow task would consume.
+    fn with_flow(
+        token: &str,
+        ttl: Duration,
+    ) -> (Arc<AppState>, tokio::sync::mpsc::Receiver<(String, String)>) {
+        let st = state(std::path::Path::new(
+            "/tmp/anyhop-oauth-test-not-a-file.toml",
+        ));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        *st.auth_state.lock().unwrap_or_else(|e| e.into_inner()) = Some(pending(token, ttl));
+        *st.auth_code_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        (st, rx)
+    }
+
+    fn flow_status(st: &AppState) -> String {
+        st.auth_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|a| a.status.clone())
+            .unwrap_or_default()
+    }
+
+    fn query(
+        pairs: &[(&str, &str)],
+    ) -> axum::extract::Query<std::collections::HashMap<String, String>> {
+        axum::extract::Query(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    fn token() -> String {
+        "a".repeat(64)
+    }
+
+    /// The callback is unauthenticated, so an empty `state` used to be treated
+    /// as "matches": `?code=attacker-code` killed the pending flow (the flow task
+    /// then failed with "state mismatch").
+    #[tokio::test]
+    async fn a_missing_state_is_never_accepted() {
+        let (st, mut rx) = with_flow(&token(), Duration::from_secs(60));
+        assert_eq!(
+            deliver_code(&st, "attacker-code", "").await,
+            Delivery::WrongState
+        );
+        assert!(rx.try_recv().is_err(), "nothing may reach the flow");
+        assert_eq!(flow_status(&st), "waiting", "the flow must survive");
+    }
+
+    #[tokio::test]
+    async fn a_foreign_state_is_rejected_without_disturbing_the_flow() {
+        let (st, mut rx) = with_flow(&token(), Duration::from_secs(60));
+        let wrong = "b".repeat(64);
+        assert_eq!(
+            deliver_code(&st, "attacker-code", &wrong).await,
+            Delivery::WrongState
+        );
+        assert!(rx.try_recv().is_err());
+        // The real token still works afterwards.
+        assert_eq!(
+            deliver_code(&st, "real-code", &token()).await,
+            Delivery::Delivered
+        );
+        assert_eq!(rx.try_recv().unwrap(), ("real-code".to_string(), token()));
+    }
+
+    /// Replaying a callback must not reach the token exchange twice.
+    #[tokio::test]
+    async fn a_state_is_single_use() {
+        let (st, mut rx) = with_flow(&token(), Duration::from_secs(60));
+        assert_eq!(
+            deliver_code(&st, "code-1", &token()).await,
+            Delivery::Delivered
+        );
+        assert_eq!(
+            deliver_code(&st, "code-2", &token()).await,
+            Delivery::WrongState,
+            "the token must be consumed by the first delivery"
+        );
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err(), "the replay must not be forwarded");
+    }
+
+    /// An abandoned flow must stop accepting callbacks even though its task is
+    /// still parked on the channel.
+    #[tokio::test]
+    async fn an_expired_state_is_refused() {
+        let (st, mut rx) = with_flow(&token(), Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            deliver_code(&st, "late-code", &token()).await,
+            Delivery::NotPending
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(flow_status(&st), "error", "the flow is retired");
+    }
+
+    /// `/api/auth/complete` with a bare code: the fallback used to be the provider
+    /// *kind*, a value that can never equal a state, so the route always answered
+    /// 409 even for the admin who owns the flow.
+    #[tokio::test]
+    async fn a_bare_code_completes_the_pending_flow() {
+        let (st, mut rx) = with_flow(&token(), Duration::from_secs(60));
+        let resp = auth_complete(
+            State(st.clone()),
+            ClientIp("127.0.0.1".into()),
+            Json(serde_json::json!({"code": "4/0Abc-def"})),
+        )
+        .await
+        .expect("a bare code must complete the pending flow");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(rx.recv().await.unwrap().0, "4/0Abc-def");
+
+        // With no flow waiting it still says so honestly.
+        *st.auth_state.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let err = auth_complete(
+            State(st.clone()),
+            ClientIp("127.0.0.1".into()),
+            Json(serde_json::json!({"code": "4/0Abc-def"})),
+        )
+        .await
+        .expect_err("nothing is pending");
+        assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
+    }
+
+    /// The callback route carries no admin key, so a state sweep must be as
+    /// expensive as a key sweep: the shared limiter applies, and `Retry-After`
+    /// tells the truth.
+    #[tokio::test]
+    async fn the_callback_is_rate_limited_like_a_credential() {
+        let (st, mut rx) = with_flow(&token(), Duration::from_secs(60));
+        let ip = ClientIp("203.0.113.9".into());
+        let wrong = "c".repeat(64);
+
+        // `test_support` sets burst = 3: the first two rejections are 400.
+        for _ in 0..2 {
+            let resp = auth_callback(
+                State(st.clone()),
+                ClientIp(ip.0.clone()),
+                query(&[("code", "x"), ("state", wrong.as_str())]),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "text/html; charset=utf-8",
+                "the browser must still get a page"
+            );
+        }
+        let resp = auth_callback(
+            State(st.clone()),
+            ClientIp(ip.0.clone()),
+            query(&[("code", "x"), ("state", &wrong)]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("60"),
+            "the remaining window, not a static 5"
+        );
+
+        // The lockout did not consume the flow: the real state still works.
+        assert!(rx.try_recv().is_err());
+        assert_eq!(deliver_code(&st, "ok", &token()).await, Delivery::Delivered);
+    }
+
+    /// `?error=` is attacker-controlled text that lands on our origin.
+    #[tokio::test]
+    async fn the_provider_error_text_is_escaped() {
+        let (st, _rx) = with_flow(&token(), Duration::from_secs(60));
+        let resp = auth_callback(
+            State(st.clone()),
+            ClientIp("127.0.0.1".into()),
+            query(&[("error", "<script>alert(1)</script>")]),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&bytes);
+        assert!(!html.contains("<script>"), "injected markup: {html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn html_is_escaped() {
+        assert_eq!(
+            html_escape("<b>&\"'</b>"),
+            "&lt;b&gt;&amp;&quot;&#39;&lt;/b&gt;"
+        );
+    }
+
+    /// The state returned by `start` must not be derivable from the clock.
+    #[test]
+    fn a_state_is_not_the_wall_clock_in_hex() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let first = crate::antigravity::random_oauth_state().expect("csprng");
+        let second = crate::antigravity::random_oauth_state().expect("csprng");
+        assert_ne!(first, second, "two flows must not share a state");
+        assert_ne!(first, format!("{now:x}"), "the state must not be the clock");
+        assert_eq!(first.len(), 64, "32 bytes, hex");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }
 
 #[cfg(test)]
@@ -682,6 +1065,75 @@ keys = ["sk-x"]
         let work = cfg.providers.iter().find(|p| p.name == "ag-work").unwrap();
         assert_eq!(work.accounts.len(), 1);
         assert_eq!(work.accounts[0].refresh_token, "1//work");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `append_account` used `write_atomic` directly, bypassing the validation
+    /// every other writer does: a document that the next start cannot load could
+    /// be written over a good config.
+    #[test]
+    fn an_unloadable_document_is_never_written() {
+        let body = r#"[[providers]]
+name = "ag-work"
+type = "antigravity"
+
+[[providers.accounts]]
+email = "work@example.com"
+refresh_token = "1//work"
+
+[[combos]]
+name = "fast"
+chain = ["ghost/model"]
+"#;
+        let path = temp_config(body);
+        let err = append_account(
+            path.to_str().unwrap(),
+            "antigravity",
+            "ag-home",
+            "1//home",
+            Some("home@example.com"),
+            None,
+            None,
+        )
+        .expect_err("a combo pointing at a missing provider is invalid");
+        assert!(format!("{err}").contains("invalid config"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            body,
+            "the file must be left exactly as it was"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same write must keep the file private: it holds refresh tokens.
+    #[cfg(unix)]
+    #[test]
+    fn appending_an_account_keeps_the_file_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_config(
+            r#"[[providers]]
+name = "ag-work"
+type = "antigravity"
+
+[[providers.accounts]]
+email = "work@example.com"
+refresh_token = "1//work"
+"#,
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        append_account(
+            path.to_str().unwrap(),
+            "antigravity",
+            "ag-work",
+            "1//rotated",
+            Some("work@example.com"),
+            None,
+            None,
+        )
+        .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the refresh token file must stay 0600");
         let _ = std::fs::remove_file(&path);
     }
 

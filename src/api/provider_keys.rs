@@ -11,6 +11,33 @@ use super::{ApiError, ApiResult, ok_json};
 use crate::config::ProviderKind;
 use crate::proxy::AppState;
 
+/// The one `base_url` rule, applied by `provider_add` *and* `provider_update`.
+///
+/// Update used to accept anything that fit in the field, so
+/// `base_url = "file:///etc/passwd"` (or `gopher://169.254.169.254:80/`, a
+/// metadata-service probe) could be written by the edit path even though add
+/// rejected it — and the request builder then treated the value as an upstream
+/// URL. http(s) only, bounded length.
+fn validate_base_url(url: &str) -> Result<(), String> {
+    let u = url.trim();
+    if u.is_empty() {
+        return Err("base_url must not be empty".to_string());
+    }
+    if !(u.starts_with("http://") || u.starts_with("https://")) || u.len() > 2048 {
+        return Err("base_url must be an http(s) URL of at most 2048 characters".to_string());
+    }
+    Ok(())
+}
+
+/// In-flight cap per key: `0` is documented as "unlimited", everything else is a
+/// real limit. `4294967295` and `1` are both nonsense for a gateway.
+fn validate_provider_max_concurrent(n: u32) -> Result<(), String> {
+    if n > 10_000 {
+        return Err("max_concurrent must be 0 (unlimited) or 1..10000".to_string());
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub struct AddProvider {
     kind: String,
@@ -71,11 +98,9 @@ pub async fn provider_add(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        && (!u.starts_with("http://") && !u.starts_with("https://") || u.len() > 2048)
+        && let Err(msg) = validate_base_url(u)
     {
-        return Err(ApiError::bad_request(
-            "base_url must be an http(s) URL of at most 2048 characters",
-        ));
+        return Err(ApiError::bad_request(msg));
     }
     if let Some(k) = body.key.as_deref()
         && let Err((_, msg)) = super::validate_secret_len("key", k)
@@ -234,6 +259,18 @@ pub async fn provider_update(
             "max_retries must be between 1 and 32",
         ));
     }
+    // Same rules as add: an update must not be able to install a value the
+    // create path rejects (a non-http base_url, an absurd concurrency cap).
+    if let Some(u) = body.base_url.as_deref()
+        && let Err(msg) = validate_base_url(u)
+    {
+        return Err(ApiError::bad_request(msg));
+    }
+    if let Some(n) = body.max_concurrent
+        && let Err(msg) = validate_provider_max_concurrent(n)
+    {
+        return Err(ApiError::bad_request(msg));
+    }
 
     let _guard = state.config_lock.lock().await;
     let raw = match std::fs::read_to_string(&state.config_path) {
@@ -262,11 +299,8 @@ pub async fn provider_update(
     };
 
     if let Some(b) = body.base_url.as_deref() {
-        let b = b.trim();
-        if b.is_empty() {
-            return Err(ApiError::bad_request("base_url must not be empty"));
-        }
-        p["base_url"] = toml_edit::value(b);
+        // Validated above (empty, scheme, length) before the file is touched.
+        p["base_url"] = toml_edit::value(b.trim());
     }
     if let Some(s) = &body.strategy {
         p["strategy"] = toml_edit::value(s.clone());
@@ -597,13 +631,26 @@ pub async fn key_delete(State(state): State<Arc<AppState>>, Json(a): Json<KeyAct
         }
     }
 
-    if let Err(resp) = write_validated(&state, &doc).await {
-        return Ok(*resp);
-    }
-    // The runtime list is now redundant (its keys are in the file).
+    // Clear the runtime copy *before* the reload. The reload merges every secret
+    // the state file still lists back into the pool, so clearing it afterwards
+    // kept the deleted key alive until the *next* reload. The list is restored
+    // below if the config write is refused, so a rejected edit cannot drop
+    // runtime-added keys.
+    let extras_before = state
+        .storage
+        .as_ref()
+        .map(|s| s.list_extra_keys(&provider_name))
+        .unwrap_or_default();
     if let Some(s) = &state.storage {
         s.delete_extra_key(&provider_name, &secret);
         s.set_extra_keys(&provider_name, Vec::new());
+    }
+
+    if let Err(resp) = write_validated(&state, &doc).await {
+        if let Some(s) = &state.storage {
+            s.set_extra_keys(&provider_name, extras_before);
+        }
+        return Ok(*resp);
     }
     state.events.emit_simple(
         "config",
@@ -686,4 +733,103 @@ pub async fn key_add(State(state): State<Arc<AppState>>, Json(a): Json<AddKey>) 
         format!("key added to provider '{provider_name}'"),
     );
     Ok(StatusCode::OK.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::server::test_support::{MINIMAL, state, temp_config};
+
+    /// The edit path accepted URLs the create path rejects: a `file://` upstream
+    /// (local file exfiltration) or a `gopher://` probe at the cloud metadata
+    /// service can be written into the config and then fetched by the gateway.
+    #[test]
+    fn base_urls_must_be_http_or_https() {
+        for ok in [
+            "http://127.0.0.1:8080/v1",
+            "https://api.example.com/v1",
+            " https://api.example.com/v1 ",
+        ] {
+            assert!(validate_base_url(ok).is_ok(), "{ok} must be accepted");
+        }
+        for bad in [
+            "file:///etc/passwd",
+            "gopher://169.254.169.254:80/",
+            "ftp://example.com/v1",
+            "example.com/v1",
+            "",
+            "  ",
+        ] {
+            assert!(validate_base_url(bad).is_err(), "{bad} must be rejected");
+        }
+        let long = format!("https://example.com/{}", "x".repeat(2100));
+        assert!(validate_base_url(&long).is_err(), "length must be bounded");
+    }
+
+    #[test]
+    fn provider_concurrency_is_bounded() {
+        assert!(validate_provider_max_concurrent(0).is_ok(), "0 = unlimited");
+        assert!(validate_provider_max_concurrent(1).is_ok());
+        assert!(validate_provider_max_concurrent(10_000).is_ok());
+        assert!(validate_provider_max_concurrent(10_001).is_err());
+        assert!(
+            validate_provider_max_concurrent(u32::MAX).is_err(),
+            "4 billion in-flight requests is not a limit"
+        );
+    }
+
+    /// The handler must apply those rules, not just the helpers.
+    #[tokio::test]
+    async fn provider_update_shares_the_add_path_validation() {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let body: UpdateProvider =
+            serde_json::from_str(r#"{"name":"mock","base_url":"file:///etc/passwd"}"#)
+                .expect("deserialize");
+        let err = provider_update(State(st.clone()), Json(body))
+            .await
+            .expect_err("file:// must be rejected");
+        assert!(format!("{err:?}").contains("http"), "{err:?}");
+
+        let body: UpdateProvider =
+            serde_json::from_str(r#"{"name":"mock","base_url":"gopher://169.254.169.254:80/"}"#)
+                .expect("deserialize");
+        assert!(
+            provider_update(State(st.clone()), Json(body))
+                .await
+                .is_err(),
+            "gopher:// must be rejected"
+        );
+
+        let body: UpdateProvider =
+            serde_json::from_str(r#"{"name":"mock","max_concurrent":4294967295}"#)
+                .expect("deserialize");
+        assert!(
+            provider_update(State(st.clone()), Json(body))
+                .await
+                .is_err(),
+            "a 4-billion concurrency cap must be rejected"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a rejected update must not touch the file"
+        );
+
+        // A valid update still goes through.
+        let body: UpdateProvider = serde_json::from_str(
+            r#"{"name":"mock","base_url":"https://api.example.com/v1","max_concurrent":8}"#,
+        )
+        .expect("deserialize");
+        provider_update(State(st.clone()), Json(body))
+            .await
+            .expect("valid update");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("https://api.example.com/v1"), "{raw}");
+        assert!(raw.contains("max_concurrent = 8"), "{raw}");
+        let _ = std::fs::remove_file(&path);
+    }
 }

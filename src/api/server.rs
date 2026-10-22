@@ -29,13 +29,15 @@ pub struct ServerDto {
     models_refresh_secs: u64,
     dashboard: bool,
     proxy: Option<String>,
+    /// File *name* only (see [`basename`]): the dashboard needs to know a state
+    /// file is configured, not where the operator keeps it.
     state_file: String,
     /// Secrets are never sent to the browser — only whether they are configured.
     api_key_set: bool,
     admin_key_set: bool,
     /// Public base URL for OAuth redirects (empty = loopback only).
     public_url: Option<String>,
-    /// In-process TLS (both set, or neither).
+    /// In-process TLS (both set, or neither). File names only, like `state_file`.
     tls_cert: Option<String>,
     tls_key: Option<String>,
     log_format: String,
@@ -58,9 +60,18 @@ pub struct ServerUpdate {
     dashboard: Option<bool>,
     /// Empty string clears the proxy.
     proxy: Option<String>,
-    /// `None` = leave unchanged, `Some("")` = clear, `Some(x)` = set.
+    /// `None`/`""` = leave unchanged, `Some(x)` = rotate to `x`.
+    ///
+    /// An empty field used to *delete* the key — with the dashboard form (which
+    /// posts every field) that silently opened `/api/*`, so clearing is now an
+    /// explicit request.
     api_key: Option<String>,
     admin_key: Option<String>,
+    /// Remove `admin_key`/`api_key`. Refused when `listen` is not loopback.
+    #[serde(default)]
+    clear_api_key: bool,
+    #[serde(default)]
+    clear_admin_key: bool,
     state_file: Option<String>,
     /// Empty string clears it (back to the loopback OAuth flow).
     public_url: Option<String>,
@@ -95,6 +106,8 @@ pub struct TuningUpdate {
     token_refresh_window_secs: Option<u64>,
     ui_refresh_secs: Option<u64>,
     sse_keepalive_secs: Option<u64>,
+    client_body_timeout_secs: Option<u64>,
+    shutdown_grace_secs: Option<u64>,
     quota_cache_ttl_secs: Option<u64>,
     response_store_max: Option<usize>,
 }
@@ -135,12 +148,12 @@ pub async fn get_server(State(state): State<Arc<AppState>>) -> ApiResult {
         models_refresh_secs: s.models_refresh_secs,
         dashboard: s.dashboard,
         proxy: s.proxy.as_deref().map(super::mask_proxy),
-        state_file: s.state_file.clone(),
+        state_file: basename(&s.state_file),
         api_key_set: s.api_key.is_some(),
         admin_key_set: s.admin_key.is_some(),
         public_url: s.public_url.clone(),
-        tls_cert: s.tls_cert.clone(),
-        tls_key: s.tls_key.clone(),
+        tls_cert: s.tls_cert.as_deref().map(basename),
+        tls_key: s.tls_key.as_deref().map(basename),
         log_format: s.log_format.clone(),
         client_key_max_concurrent: s.client_key_max_concurrent,
         auth_fail_burst: s.auth_fail_burst,
@@ -289,11 +302,15 @@ pub async fn update_server(
         server["dashboard"] = toml_edit::value(v);
         changed.push("dashboard");
     }
-    if let Some(v) = body.state_file.as_deref()
-        && v.trim() != cur.state_file
-    {
-        server["state_file"] = toml_edit::value(v.trim());
-        changed.push("state_file");
+    if let Some(v) = body.state_file.as_deref() {
+        let v = v.trim();
+        // The dashboard only ever sees the basename, so posting it back must not
+        // rewrite the path (that would move the state file on the next start).
+        let unchanged = v == cur.state_file || basename(&cur.state_file) == v;
+        if !unchanged {
+            server["state_file"] = toml_edit::value(v);
+            changed.push("state_file");
+        }
     }
     if let Some(v) = &body.log_format {
         let v = v.trim();
@@ -346,7 +363,9 @@ pub async fn update_server(
     ] {
         let Some(v) = value else { continue };
         let v = v.trim();
-        if v == current.unwrap_or("") {
+        // Basenames are what `get_server` reports, so a round-tripped value is
+        // "unchanged" — writing it would point TLS at a file that does not exist.
+        if v == current.unwrap_or("") || current.is_some_and(|c| basename(c) == v) {
             continue;
         }
         if v.is_empty() {
@@ -390,32 +409,59 @@ pub async fn update_server(
         }
         changed.push("proxy");
     }
-    for (name, incoming, current_set) in [
-        ("api_key", &body.api_key, cur.api_key.is_some()),
-        ("admin_key", &body.admin_key, cur.admin_key.is_some()),
+    // Dropping the last credential makes `/api/*` (raw config editor, provider
+    // keys, OAuth flows) and `/v1/*` world-open. That is a deliberate choice for a
+    // localhost gateway and never for a listening one.
+    if body.clear_api_key || body.clear_admin_key {
+        let listen = body
+            .listen
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or(cur.listen.as_str());
+        if !listen_is_loopback(listen) {
+            return Err(ApiError::bad_request(format!(
+                "refusing to clear a key while listen = '{listen}' is reachable from the \
+                 network: bind a loopback address (127.0.0.1) first, or rotate the key instead"
+            )));
+        }
+    }
+    for (name, clear, clear_field, incoming, current) in [
+        (
+            "api_key",
+            body.clear_api_key,
+            "clear_api_key",
+            body.api_key.as_deref(),
+            cur.api_key.as_deref(),
+        ),
+        (
+            "admin_key",
+            body.clear_admin_key,
+            "clear_admin_key",
+            body.admin_key.as_deref(),
+            cur.admin_key.as_deref(),
+        ),
     ] {
-        let Some(v) = incoming else { continue };
-        let v = v.trim();
-        // Compare against "is set" only: the current secret is never sent to the
-        // browser, so an identical value still looks like a change — but a secret
-        // resend is harmless, and an empty field means "leave it alone".
-        if v.is_empty() || current_set {
-            if v.is_empty() && current_set {
+        let incoming = incoming.map(str::trim).filter(|v| !v.is_empty());
+        if clear {
+            if incoming.is_some() {
+                return Err(ApiError::bad_request(format!(
+                    "{name}: send a new value or {clear_field}, not both"
+                )));
+            }
+            if current.is_some() {
                 server.remove(name);
-                changed.push(if name == "api_key" {
-                    "api_key"
-                } else {
-                    "admin_key"
-                });
+                changed.push(name);
             }
             continue;
         }
-        server[name] = toml_edit::value(v);
-        changed.push(if name == "api_key" {
-            "api_key"
-        } else {
-            "admin_key"
-        });
+        // A non-empty value always wins: the dashboard cannot show the current
+        // secret (it is never sent to the browser), so *any* value it sends is a
+        // new one. Resending the same secret is harmless and reported as a no-op.
+        let Some(v) = incoming else { continue };
+        if current != Some(v) {
+            server[name] = toml_edit::value(v);
+            changed.push(name);
+        }
     }
 
     // `[tuning]`: every field is optional and only written when it really differs.
@@ -451,6 +497,8 @@ pub async fn update_server(
         sync_num!(token_refresh_window_secs, "token_refresh_window_secs");
         sync_num!(ui_refresh_secs, "ui_refresh_secs");
         sync_num!(sse_keepalive_secs, "sse_keepalive_secs");
+        sync_num!(client_body_timeout_secs, "client_body_timeout_secs");
+        sync_num!(shutdown_grace_secs, "shutdown_grace_secs");
         sync_num!(quota_cache_ttl_secs, "quota_cache_ttl_secs");
         sync_num!(response_store_max, "response_store_max");
         if !table.is_empty() {
@@ -477,6 +525,12 @@ pub async fn update_server(
     if let Err(resp) = write_validated(&state, &doc).await {
         return Ok(*resp);
     }
+    if changed
+        .iter()
+        .any(|c| matches!(*c, "api_key" | "admin_key"))
+    {
+        warn_if_unauthenticated(&state);
+    }
     state.events.emit_simple(
         "config",
         "",
@@ -489,6 +543,149 @@ pub async fn update_server(
         .filter(|c| RESTART_ONLY.contains(c))
         .collect();
     ok_json(serde_json::json!({"changed": changed, "restart_required": restart}))
+}
+
+/// The last path component of `path` ("", when there is none).
+///
+/// Paths in `GET /api/server` are reported as basenames: the file *name* tells
+/// the operator what is configured, while the full path hands anyone who reaches
+/// the endpoint a map of the host (`/home/<user>/…`, `/etc/letsencrypt/…`).
+/// `update_server` treats a value equal to the current basename as "unchanged".
+fn basename(path: &str) -> String {
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+}
+
+/// Whether `host:port` can only be reached from this machine.
+///
+/// Used as the gate on "clear the only credential": on a public listener that
+/// turns the whole admin API into an unauthenticated one.
+fn listen_is_loopback(listen: &str) -> bool {
+    let host = listen
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(listen)
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    host == "localhost" || host == "::1" || host == "0:0:0:0:0:0:0:1" || host.starts_with("127.")
+}
+
+/// Loud warning whenever a save leaves the gateway without any credential.
+///
+/// `lib.rs` warns at startup; this covers the hot path — someone clearing the key
+/// from the dashboard must see *why* the next `curl /api/providers` works
+/// unauthenticated.
+fn warn_if_unauthenticated(state: &Arc<AppState>) {
+    let Ok(cfg) = crate::config::Config::load(&state.config_path) else {
+        return;
+    };
+    if cfg.server.api_key.is_none() && cfg.server.admin_key.is_none() {
+        tracing::warn!(
+            "no api_key/admin_key configured: /v1/* and /api/* (raw config editor, provider \
+             keys, OAuth) accept unauthenticated requests — set one unless this port is loopback-only"
+        );
+    }
+}
+
+/// Validate a config document, then write it — no reload.
+///
+/// For writers that reload themselves (the OAuth account append, which holds
+/// `config_lock` across the whole read-modify-write, then reloads) and for unit
+/// tests that only have a path. Rejecting an invalid document *before* the write
+/// is what keeps a bad edit from leaving behind a file the next start cannot load
+/// — the bug `append_account` had, since it wrote the document unconditionally.
+///
+/// The file mode is `config::write_atomic`'s job (it writes a 0600 temp file and
+/// renames it over the config, so a save cannot leave the secrets file
+/// group/world-readable).
+pub(crate) fn write_config_checked(path: &str, text: &str) -> anyhow::Result<()> {
+    let parsed: crate::config::Config = toml::from_str(text)
+        .map_err(|e| anyhow::anyhow!("invalid config (refusing to write): {e}"))?;
+    parsed
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid config (refusing to write): {e}"))?;
+    crate::config::write_atomic(path, text).map_err(|e| anyhow::anyhow!("cannot write {path}: {e}"))
+}
+
+/// A minimal `AppState` plus temp config files, for tests that drive a handler.
+///
+/// `AppState` lives in `proxy/mod.rs` (not this change's file), so the tests build
+/// the struct field by field here instead of adding a test-only constructor to it.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::{Arc, Mutex, RwLock};
+
+    use crate::proxy::AppState;
+
+    /// Write `body` to a fresh file under the temp dir and hand back the path.
+    pub(crate) fn temp_config(body: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "anyhop-api-test-{}-{:?}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// The smallest config that loads: one key-based provider and one client key.
+    pub(crate) const MINIMAL: &str = r#"[[providers]]
+name = "mock"
+type = "openai_compat"
+base_url = "http://127.0.0.1:1/v1"
+keys = ["sk-test-key"]
+
+[server]
+listen = "127.0.0.1:18080"
+api_key = "test-gw-key"
+"#;
+
+    pub(crate) fn state(path: &std::path::Path) -> Arc<AppState> {
+        Arc::new(AppState {
+            router: arc_swap::ArcSwap::from_pointee(crate::providers::ProviderRouter {
+                providers: Vec::new(),
+                combos: Vec::new(),
+            }),
+            cfg: RwLock::new(crate::proxy::RtConfig {
+                max_retries: 2,
+                attempt_timeout: std::time::Duration::from_secs(30),
+                api_key: Some("test-gw-key".to_string()),
+                admin_key: Some("test-gw-key".to_string()),
+                events_history: 8,
+                requests_history: 8,
+                auth_fail_burst: 3,
+                auth_fail_window: std::time::Duration::from_secs(60),
+                client_key_max_concurrent: 0,
+                tls_enabled: false,
+                ratelimit: crate::config::RateLimitConfig::default(),
+            }),
+            storage: None,
+            config_path: path.to_string_lossy().into_owned(),
+            events: crate::events::EventBus::new(8),
+            auth_state: Mutex::new(None),
+            auth_task: Mutex::new(None),
+            auth_code_tx: Mutex::new(None),
+            auth_fails: Mutex::new(crate::middleware::AuthFailures::default()),
+            catalog_epoch: AtomicU64::new(0),
+            tls_enabled_flag: AtomicBool::new(false),
+            models_cache: Mutex::new(None),
+            request_log: Mutex::new(VecDeque::new()),
+            client_keys: RwLock::new(HashMap::new()),
+            disabled_models: RwLock::new(HashSet::new()),
+            config_lock: tokio::sync::Mutex::new(()),
+            tuning: arc_swap::ArcSwap::from_pointee(crate::config::Tuning::default()),
+        })
+    }
+
+    /// A body-carrying helper: `Json(body)` from a JSON string, so tests exercise
+    /// the same serde contract the dashboard's `fetch` does.
+    pub(crate) fn json<T: serde::de::DeserializeOwned>(raw: &str) -> axum::Json<T> {
+        axum::Json(serde_json::from_str(raw).unwrap())
+    }
 }
 
 #[cfg(test)]
@@ -505,5 +702,230 @@ mod tests {
         for f in ["max_retries", "api_key", "proxy", "models_refresh_secs"] {
             assert!(!RESTART_ONLY.contains(&f), "{f} must apply on reload");
         }
+    }
+
+    // ---------- credentials, paths, file mode ----------
+
+    use crate::api::server::test_support::{MINIMAL, state, temp_config};
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Use the same serde contract the dashboard's `fetch` uses.
+    fn update(raw: &str) -> ServerUpdate {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    /// Rotation was impossible: any non-empty secret was dropped whenever one was
+    /// already configured, so a leaked key could only be replaced by hand-editing
+    /// the TOML.
+    #[tokio::test]
+    async fn rotating_the_api_key_rewrites_the_config() {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+        let resp = update_server(
+            State(st.clone()),
+            Json(update(r#"{"api_key":"rotated-key-abcdef"}"#)),
+        )
+        .await
+        .expect("rotation must be accepted");
+        let body = body_json(resp).await;
+        assert_eq!(body["changed"], serde_json::json!(["api_key"]), "{body}");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("rotated-key-abcdef"), "{raw}");
+        assert!(
+            !raw.contains("test-gw-key"),
+            "old secret must be gone: {raw}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Resending the same secret is harmless and reported as a no-op (otherwise
+    /// every dashboard save would claim a change).
+    #[tokio::test]
+    async fn resending_the_same_secret_is_a_noop() {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+        let resp = update_server(
+            State(st.clone()),
+            Json(update(r#"{"api_key":"test-gw-key"}"#)),
+        )
+        .await
+        .expect("resend must be accepted");
+        let body = body_json(resp).await;
+        assert_eq!(body["changed"], serde_json::json!([]), "{body}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `api_key: ""` used to delete the key — i.e. the dashboard form (which posts
+    /// every field) could open `/api/*` and `/v1/*` on a public listener.
+    #[tokio::test]
+    async fn an_empty_secret_field_does_not_clear_the_key() {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+        let resp = update_server(
+            State(st.clone()),
+            Json(update(r#"{"api_key":"","admin_key":""}"#)),
+        )
+        .await
+        .expect("an empty field is just no change");
+        let body = body_json(resp).await;
+        assert_eq!(body["changed"], serde_json::json!([]), "{body}");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("test-gw-key"), "the key must survive: {raw}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Clearing is allowed, but only as an explicit request — and never on a
+    /// listener the network can reach.
+    #[tokio::test]
+    async fn clearing_a_key_needs_the_explicit_flag_and_a_loopback_listener() {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+        let err = update_server(
+            State(st.clone()),
+            Json(update(r#"{"clear_api_key":true,"listen":"0.0.0.0:18080"}"#)),
+        )
+        .await
+        .expect_err("clearing on a public listener must be refused");
+        assert!(format!("{err:?}").contains("loopback"), "{err:?}");
+
+        let resp = update_server(
+            State(st.clone()),
+            Json(update(
+                r#"{"clear_api_key":true,"listen":"127.0.0.1:18080"}"#,
+            )),
+        )
+        .await
+        .expect("clearing on loopback is allowed");
+        let body = body_json(resp).await;
+        assert_eq!(body["changed"], serde_json::json!(["api_key"]), "{body}");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("api_key"), "the key must be gone: {raw}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A value *and* `clear_*` in the same request is ambiguous — refuse it
+    /// instead of guessing which one the operator meant.
+    #[tokio::test]
+    async fn a_new_secret_and_a_clear_flag_together_are_rejected() {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+        let err = update_server(
+            State(st.clone()),
+            Json(update(
+                r#"{"api_key":"rotated-key-abcdef","clear_api_key":true}"#,
+            )),
+        )
+        .await
+        .expect_err("ambiguous request");
+        assert!(format!("{err:?}").contains("not both"), "{err:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The config holds provider keys and OAuth refresh tokens; the atomic write
+    /// created its temp file with the process umask, so the first save downgraded
+    /// 0600 to 0644.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_config_save_keeps_the_file_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for original in [0o600, 0o644] {
+            let path = temp_config(MINIMAL);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(original)).unwrap();
+            let st = state(&path);
+            let resp = update_server(State(st.clone()), Json(update(r#"{"max_retries":5}"#)))
+                .await
+                .expect("save");
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "mode {original:o} became {mode:o}: the secrets file must stay private"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// File paths are a map of the host; the dashboard only needs the names.
+    #[tokio::test]
+    async fn server_settings_report_basenames_not_paths() {
+        let path = temp_config(&format!(
+            "{MINIMAL}state_file = \"/var/lib/anyhop/state.redb\"
+tls_cert = \"/etc/letsencrypt/live/gw/fullchain.pem\"
+tls_key = \"/etc/letsencrypt/live/gw/privkey.pem\"
+"
+        ));
+        let st = state(&path);
+        let resp = get_server(State(st.clone())).await.expect("dto");
+        let body = body_json(resp).await;
+        assert_eq!(body["state_file"], "state.redb", "{body}");
+        assert_eq!(body["tls_cert"], "fullchain.pem", "{body}");
+        assert_eq!(body["tls_key"], "privkey.pem", "{body}");
+        let text = body.to_string();
+        assert!(!text.contains("/etc/"), "path leaked: {text}");
+        assert!(!text.contains("/var/lib/"), "path leaked: {text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ... and posting a basename back (what the settings form does) must not
+    /// overwrite the configured path with a name that does not resolve.
+    #[tokio::test]
+    async fn a_round_tripped_basename_is_not_written_back() {
+        let path = temp_config(&format!(
+            "{MINIMAL}tls_cert = \"/etc/letsencrypt/live/gw/fullchain.pem\"
+state_file = \"/var/lib/anyhop/state.redb\"
+"
+        ));
+        let st = state(&path);
+        let resp = update_server(
+            State(st.clone()),
+            Json(update(
+                r#"{"tls_cert":"fullchain.pem","state_file":"state.redb"}"#,
+            )),
+        )
+        .await
+        .expect("save");
+        let body = body_json(resp).await;
+        assert_eq!(body["changed"], serde_json::json!([]), "{body}");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("/etc/letsencrypt/live/gw/fullchain.pem"),
+            "{raw}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn only_loopback_listeners_count_as_local() {
+        for local in [
+            "127.0.0.1:8080",
+            "127.0.0.2:1",
+            "localhost:8080",
+            "[::1]:8080",
+        ] {
+            assert!(listen_is_loopback(local), "{local} is loopback");
+        }
+        for remote in [
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "10.0.0.5:8080",
+            "gw.example.com:443",
+        ] {
+            assert!(!listen_is_loopback(remote), "{remote} is reachable");
+        }
+    }
+
+    #[test]
+    fn basenames_are_the_last_component_only() {
+        assert_eq!(basename("/etc/x/cert.pem"), "cert.pem");
+        assert_eq!(basename("cert.pem"), "cert.pem");
+        assert_eq!(basename("C:\\certs\\cert.pem"), "cert.pem");
+        assert_eq!(basename(""), "");
     }
 }

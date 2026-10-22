@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
+use axum::extract::{FromRequestParts, Request, State};
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -11,7 +12,10 @@ use crate::proxy;
 
 /// Constant-time token comparison (auth checks shouldn't leak length-prefix
 /// timing via early-exit string equality).
-fn token_eq(a: &str, b: &str) -> bool {
+///
+/// `pub(crate)` because the OAuth callback compares its `state` with it too: a
+/// byte-by-byte early exit would leak the prefix of a live state token.
+pub(crate) fn token_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;
@@ -154,7 +158,7 @@ pub async fn require_api_key(
         // fallback when no shared limiter could be built.
         let limited: Option<u64> = match (&ck.shared, &ck.limiter) {
             (Some(shared), _) => shared.try_acquire().await.err(),
-            (None, Some(local)) => local.try_take().err().map(|d| d.as_secs().max(1)),
+            (None, Some(local)) => local.try_take().err().map(retry_after_secs_of),
             (None, None) => None,
         };
         if let Some(secs) = limited {
@@ -229,8 +233,8 @@ pub async fn require_api_key(
     // out (behind a reverse proxy all of them share the proxy's address). The
     // cost of the check is one constant-time comparison, which is cheap enough
     // that an attacker gains nothing by hammering it.
-    if failed_attempt(&state, &ip) {
-        return too_many_failures();
+    if let Some(resp) = gate_failed_credential(&state, &ip) {
+        return resp;
     }
     proxy::error_response(
         StatusCode::UNAUTHORIZED,
@@ -253,16 +257,51 @@ fn failed_attempt(state: &Arc<proxy::AppState>, ip: &str) -> bool {
         .note(ip, burst, window)
 }
 
-fn too_many_failures() -> Response {
+/// The shared "a credential was wrong" gate: count the failure and hand back the
+/// 429 to send once the address has used up its budget.
+///
+/// Every surface that compares a secret uses this — the gateway and admin
+/// middlewares below, and the OAuth callback (whose `state` is a bearer secret in
+/// a URL an attacker can sweep).
+pub(crate) fn gate_failed_credential(state: &Arc<proxy::AppState>, ip: &str) -> Option<Response> {
+    if failed_attempt(state, ip) {
+        Some(too_many_failures(state, ip))
+    } else {
+        None
+    }
+}
+
+/// Forget an address's failures after a successful authentication.
+pub(crate) fn clear_failures(state: &Arc<proxy::AppState>, ip: &str) {
+    state
+        .auth_fails
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear(ip);
+}
+
+/// 429 for an address that is over its failure budget.
+///
+/// `Retry-After` is the *remaining* window: a static value shorter than the
+/// window makes an obedient client retry straight back into another 429 (the
+/// block lasts up to `auth_fail_window_secs`, default 60).
+fn too_many_failures(state: &Arc<proxy::AppState>, ip: &str) -> Response {
+    let secs = {
+        let window = state.rt().auth_fail_window;
+        state
+            .auth_fails
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retry_after_secs(ip, window)
+    };
     let mut resp = proxy::error_response(
         StatusCode::TOO_MANY_REQUESTS,
-        "too many failed authentication attempts from this address",
+        format!("too many failed authentication attempts from this address (retry in {secs}s)"),
         "rate_limit_exceeded",
     );
-    resp.headers_mut().insert(
-        header::RETRY_AFTER,
-        axum::http::HeaderValue::from_static("5"),
-    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+        resp.headers_mut().insert(header::RETRY_AFTER, v);
+    }
     resp
 }
 
@@ -281,8 +320,8 @@ pub async fn require_admin_key(
     if let Some(expected) = rt.admin_key.or(rt.api_key) {
         if !bearer_ok(&req, &expected) {
             // Same rule as /v1: count the failure, throttle only the failures.
-            if failed_attempt(&state, &ip) {
-                return too_many_failures();
+            if let Some(resp) = gate_failed_credential(&state, &ip) {
+                return resp;
             }
             return proxy::error_response(
                 StatusCode::UNAUTHORIZED,
@@ -299,9 +338,39 @@ pub async fn require_admin_key(
     next.run(req).await
 }
 
+/// RFC 7235 requires a `WWW-Authenticate` challenge on every 401, and the
+/// dashboard/CLI clients use it to tell "wrong key" from "no key at all".
+///
+/// Applied here, in the outermost layer, so it also covers the 401s that
+/// `proxy::error_response` produces all over the gateway — that helper sets no
+/// header of its own, and touching it is another file's change; the challenge
+/// belongs on the response either way.
+fn add_bearer_challenge(resp: &mut Response) {
+    if resp.status() != StatusCode::UNAUTHORIZED {
+        return;
+    }
+    if resp.headers().contains_key(header::WWW_AUTHENTICATE) {
+        return;
+    }
+    resp.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        header::HeaderValue::from_static("Bearer"),
+    );
+}
+
 /// Response hardening applied to every route.
 ///
 /// The admin UI keeps its key in `localStorage`, so an injected script would own
+/// Seconds to advertise in `Retry-After` for a wait of `d`.
+///
+/// Rounds **up** and never returns 0: a client that sleeps exactly the advertised
+/// time must find the limit cleared, and `Duration::as_secs()` truncation makes
+/// 2.4 s look like 2 s — retry at 2 s, get 429 again.
+pub fn retry_after_secs_of(d: std::time::Duration) -> u64 {
+    let ms = d.as_millis();
+    u64::try_from(ms.div_ceil(1000)).unwrap_or(u64::MAX).max(1)
+}
+
 /// Failed-auth counter per client IP.
 ///
 /// A wrong key costs one comparison; without a limit an attacker can try
@@ -333,6 +402,19 @@ impl AuthFailures {
     pub fn clear(&mut self, ip: &str) {
         self.seen.remove(ip);
     }
+
+    /// Seconds left in the current lockout window for `ip`, rounded up.
+    ///
+    /// `Retry-After` used to be a hard-coded 5 s while the block lasts the whole
+    /// `auth_fail_window_secs`: a client that obeyed the header retried into
+    /// another ~55 s of 429s. 1 is the floor — "retry now" would be a lie.
+    pub fn retry_after_secs(&self, ip: &str, window: std::time::Duration) -> u64 {
+        let Some((_, first)) = self.seen.get(ip) else {
+            return retry_after_secs_of(window);
+        };
+        let left = window.saturating_sub(std::time::Instant::now().duration_since(*first));
+        ((left.as_millis() as u64).div_ceil(1000)).max(1)
+    }
 }
 
 /// Whether the request asks for a connection upgrade (websocket) or is a plain
@@ -359,20 +441,42 @@ impl Drop for ClientKeyGuard {
 
 /// Where the request came from: the socket peer, else the first X-Forwarded-For
 /// hop (reverse proxies), else "unknown" so the guard still has a bucket.
-fn client_ip(req: &Request) -> String {
-    if let Some(axum::extract::ConnectInfo(addr)) = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+fn ip_of(headers: &axum::http::HeaderMap, extensions: &axum::http::Extensions) -> String {
+    if let Some(axum::extract::ConnectInfo(addr)) =
+        extensions.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
     {
         return addr.ip().to_string();
     }
-    req.headers()
+    headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(',').next())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn client_ip(req: &Request) -> String {
+    ip_of(req.headers(), req.extensions())
+}
+
+/// The same address as [`client_ip`], as an extractor, for handlers whose
+/// signature has no `Request` (the OAuth callback needs the peer address for the
+/// shared failure limiter).
+///
+/// Never rejects: without `ConnectInfo` (and without a forwarding header) the
+/// bucket is "unknown", exactly like the middlewares.
+pub struct ClientIp(pub String);
+
+impl<S> FromRequestParts<S> for ClientIp
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(ClientIp(ip_of(&parts.headers, &parts.extensions)))
+    }
 }
 
 /// Record request latency for `/metrics` (histograms, not just counters).
@@ -390,6 +494,24 @@ pub async fn record_metrics(req: Request, next: Next) -> Response {
     resp
 }
 
+/// Should `json_errors` replace this response body with the JSON envelope?
+///
+/// Only error responses under `/api/*` \/ `/v1/*` whose body is not already JSON
+/// and not an HTML page: the OAuth callback answers the *browser* with
+/// `text/html`, and rewriting that into JSON turned "you can close this tab" into
+/// a wall of JSON for the one flow that is meant to be read by a human.
+fn should_rewrite_json_errors(path: &str, status: StatusCode, content_type: Option<&str>) -> bool {
+    let is_api = path.starts_with("/api/") || path.starts_with("/v1/");
+    if !is_api || !(status.is_client_error() || status.is_server_error()) {
+        return false;
+    }
+    match content_type {
+        Some(v) if v.starts_with("application/json") => false,
+        Some(v) if v.starts_with("text/html") => false,
+        _ => true,
+    }
+}
+
 /// Every API error should look the same to a client. Axum's built-in rejections
 /// (bad JSON, missing field, wrong method) answer with `text/plain`, which breaks
 /// clients that parse the `{"error": {...}}` envelope everywhere else.
@@ -401,16 +523,13 @@ pub async fn json_errors(req: Request, next: Next) -> Response {
 
     let path = req.uri().path().to_string();
     let resp = next.run(req).await;
-    let is_api = path.starts_with("/api/") || path.starts_with("/v1/");
-    if !is_api || !(resp.status().is_client_error() || resp.status().is_server_error()) {
-        return resp;
-    }
-    let is_json = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("application/json"));
-    if is_json {
+    if !should_rewrite_json_errors(
+        &path,
+        resp.status(),
+        resp.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+    ) {
         return resp;
     }
     let (parts, body) = resp.into_parts();
@@ -486,6 +605,7 @@ pub async fn security_headers(
             .is_some_and(|v| v.eq_ignore_ascii_case("https"))
     };
     let mut resp = next.run(req).await;
+    add_bearer_challenge(&mut resp);
     let h = resp.headers_mut();
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -514,6 +634,131 @@ pub async fn security_headers(
 #[cfg(test)]
 mod json_error_tests {
     use super::*;
+
+    /// The lockout used to answer a static `Retry-After: 5` while the block
+    /// lasts `auth_fail_window_secs` (60 by default): a client that obeyed it
+    /// walked straight back into another 55 s of 429s.
+    #[test]
+    fn retry_after_reports_the_rest_of_the_window() {
+        let window = std::time::Duration::from_secs(60);
+        let mut fails = AuthFailures::default();
+        assert!(!fails.note("10.0.0.1", 2, window), "first failure");
+        assert!(fails.note("10.0.0.1", 2, window), "second locks out");
+        let secs = fails.retry_after_secs("10.0.0.1", window);
+        assert!(
+            (59..=60).contains(&secs),
+            "Retry-After must be the remaining window, got {secs}"
+        );
+        // A different address is not locked out and may retry at once.
+        assert_eq!(fails.retry_after_secs("10.0.0.2", window), 60);
+        // Clearing (a successful auth) resets it to the full window.
+        fails.clear("10.0.0.1");
+        assert_eq!(fails.retry_after_secs("10.0.0.1", window), 60);
+    }
+
+    /// The 429 a locked-out client actually receives must carry the *remaining*
+    /// window, not a static value that sends it straight back into a 429.
+    #[tokio::test]
+    async fn the_lockout_response_reports_the_remaining_window() {
+        let st = crate::api::server::test_support::state(std::path::Path::new(
+            "/tmp/anyhop-middleware-test-not-a-file.toml",
+        ));
+        let ip = "198.51.100.7";
+        // `test_support` sets burst = 3.
+        assert!(gate_failed_credential(&st, ip).is_none(), "1st failure");
+        assert!(gate_failed_credential(&st, ip).is_none(), "2nd failure");
+        let resp = gate_failed_credential(&st, ip).expect("the 3rd locks out");
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let secs: u64 = resp
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("Retry-After");
+        assert!(
+            (55..=60).contains(&secs),
+            "Retry-After must be the remaining window (60 s), got {secs}"
+        );
+        // The envelope is unchanged: clients parse it.
+        let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "rate_limit_exceeded", "{v}");
+        assert_eq!(v["error"]["code"], 429, "{v}");
+    }
+
+    /// The OAuth callback answers the browser with an HTML page. `json_errors`
+    /// used to rewrite it into the JSON envelope because it only exempted
+    /// `application/json`.
+    #[test]
+    fn html_error_pages_are_left_alone() {
+        let s = StatusCode::BAD_REQUEST;
+        assert!(!should_rewrite_json_errors(
+            "/api/auth/callback",
+            s,
+            Some("text/html; charset=utf-8")
+        ));
+        assert!(!should_rewrite_json_errors(
+            "/api/providers",
+            s,
+            Some("application/json")
+        ));
+        assert!(
+            should_rewrite_json_errors("/api/providers", s, Some("text/plain; charset=utf-8")),
+            "axum's plain-text rejections still become the envelope"
+        );
+        assert!(
+            should_rewrite_json_errors("/api/providers", s, None),
+            "a body with no content type is still rewritten"
+        );
+        // Successes and non-API paths are never touched.
+        assert!(!should_rewrite_json_errors(
+            "/api/providers",
+            StatusCode::OK,
+            Some("text/plain")
+        ));
+        assert!(!should_rewrite_json_errors(
+            "/dashboard",
+            s,
+            Some("text/plain")
+        ));
+    }
+
+    /// RFC 7235: a 401 must carry a challenge. The gateway's 401s all come from
+    /// `proxy::error_response`, which sets no header.
+    #[test]
+    fn unauthorized_responses_get_a_bearer_challenge() {
+        let mut resp = proxy::error_response(
+            StatusCode::UNAUTHORIZED,
+            "missing gateway API key",
+            "authentication_error",
+        );
+        add_bearer_challenge(&mut resp);
+        assert_eq!(
+            resp.headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer")
+        );
+
+        // A handler that sets its own challenge keeps it.
+        let mut resp = proxy::error_response(StatusCode::UNAUTHORIZED, "x", "authentication_error");
+        resp.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            header::HeaderValue::from_static("Basic realm=\"x\""),
+        );
+        add_bearer_challenge(&mut resp);
+        assert_eq!(
+            resp.headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Basic realm=\"x\"")
+        );
+
+        // Other statuses are untouched.
+        let mut resp = proxy::error_response(StatusCode::NOT_FOUND, "x", "not_found_error");
+        add_bearer_challenge(&mut resp);
+        assert!(!resp.headers().contains_key(header::WWW_AUTHENTICATE));
+    }
 
     #[test]
     fn error_types_match_the_openai_vocabulary() {

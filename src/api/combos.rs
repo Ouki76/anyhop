@@ -44,9 +44,10 @@ fn clean_name(name: &str) -> Result<String, String> {
     if n.contains('/') {
         return Err("combo name must not contain '/'".into());
     }
-    if n.len() > 64 {
-        return Err("combo name must be at most 64 characters".into());
-    }
+    // Same alphabet as provider and client-key names: a combo name is a model id
+    // (`combo/…`) and a TOML value, so a newline or another control character
+    // would end up in log lines, in the dashboard's DOM and in response headers.
+    super::validate_name("combo", n).map_err(|(_, msg)| msg)?;
     Ok(n.to_string())
 }
 
@@ -262,6 +263,28 @@ async fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Names reach log lines, the dashboard DOM and model ids: control
+    /// characters (a newline, a tab) must not get through. The old check only
+    /// looked at length and '/'.
+    #[test]
+    fn names_must_be_printable() {
+        for bad in [
+            "bad\nname",
+            "bad\tname",
+            "bad\u{0}name",
+            "bad name",
+            "caf\u{e9}",
+        ] {
+            assert!(
+                clean_name(bad).is_err(),
+                "{bad:?} must be rejected like a provider name"
+            );
+        }
+        for ok in ["fast", "fast-2", "ag_work", "v1.2"] {
+            assert_eq!(clean_name(ok).unwrap(), ok);
+        }
+    }
 
     #[test]
     fn names_must_be_addressable() {

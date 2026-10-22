@@ -141,6 +141,13 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             "# HELP anyhop_client_key_rate_limited_total Requests rejected by the per-key rate limit.\n\
              # TYPE anyhop_client_key_rate_limited_total counter\n",
         );
+        // Both families must be declared before any sample is written: a strict
+        // exposition parser (promtool, the Prometheus server itself) rejects a
+        // scrape whose # TYPE appears after a sample of that metric.
+        out.push_str(
+            "# HELP anyhop_client_key_rate_limit_tokens Tokens left in the key's bucket.\n\
+             # TYPE anyhop_client_key_rate_limit_tokens gauge\n",
+        );
         for rt in keys.values() {
             let Some(limiter) = &rt.limiter else { continue };
             let name = esc(&crate::proxy::client_key_label(
@@ -158,11 +165,6 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                 limiter.available()
             );
         }
-        let _ = writeln!(
-            out,
-            "# HELP anyhop_client_key_rate_limit_tokens Tokens left in the key's bucket.\n\
-             # TYPE anyhop_client_key_rate_limit_tokens gauge"
-        );
     }
     drop(keys);
 

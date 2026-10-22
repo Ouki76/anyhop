@@ -48,7 +48,9 @@ pub struct Provider {
     pub proxy: Option<String>,
     pub base_url: String,
     pub client: reqwest::Client,
-    pub pool: KeyPool,
+    /// Shared with the router: a config reload reuses the live pool (and with it
+    /// the cooldowns and counters) when nothing about the credentials changed.
+    pub pool: Arc<KeyPool>,
     pub models: Arc<Vec<String>>,
     pub extra_headers: Vec<(String, String)>,
     /// Pass-through capabilities declared in the config ("images", "audio",
@@ -61,7 +63,13 @@ pub struct Provider {
     ag_accounts: Vec<Arc<Account>>,
     /// Codex (ChatGPT) OAuth accounts.
     codex_accounts: Vec<Arc<crate::codex::CodexAccount>>,
-    models_cache: Mutex<Option<(Instant, Arc<Vec<String>>)>>,
+    /// Upstream model list plus its fetch time.
+    ///
+    /// An `ArcSwap` rather than a `Mutex`: `resolve_single` reads it for every
+    /// provider on every request (to see whether a model belongs to it), and a
+    /// lock there contended with the periodic refresh for no benefit. Loading is
+    /// a single atomic read, and a refresh publishes a whole new snapshot.
+    models_cache: arc_swap::ArcSwap<Option<(Instant, Arc<Vec<String>>)>>,
     quota_cache: Mutex<Option<(Instant, AccountQuotas)>>,
 }
 
@@ -150,6 +158,9 @@ impl Provider {
         } else {
             base_url
         };
+        // The tuning the config asked for. Passing it here (rather than letting
+        // the pool default) is what makes max_cooldown / backoff / sticky_mode /
+        // TTLs actual config instead of decoration.
         let pool = KeyPool::new(
             cfg.name.clone(),
             secrets,
@@ -157,6 +168,7 @@ impl Provider {
             cfg.max_concurrent,
             storage.cloned(),
             events.cloned(),
+            tuning.clone(),
         );
         // OAuth credentials are refresh tokens: label them with the account
         // e-mail so the dashboard shows "user@example.com" instead of a token
@@ -183,7 +195,7 @@ impl Provider {
             max_retries: cfg.max_retries.unwrap_or(default_retries),
             tuning: tuning.clone(),
             client: build_http_client_with(effective_proxy, &tuning)?,
-            pool,
+            pool: Arc::new(pool),
             models: Arc::new(cfg.models.clone()),
             extra_headers: cfg
                 .headers
@@ -193,7 +205,7 @@ impl Provider {
             capabilities: cfg.capabilities.clone(),
             ag_accounts,
             codex_accounts,
-            models_cache: Mutex::new(None),
+            models_cache: arc_swap::ArcSwap::from_pointee(None),
             quota_cache: Mutex::new(None),
         })
     }
@@ -234,8 +246,8 @@ impl Provider {
     /// request, and cloning a 124-element `Vec<String>` each time was pure waste.
     pub async fn effective_models(&self) -> Arc<Vec<String>> {
         {
-            let cache = self.models_cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((ts, list)) = &*cache
+            let cache = self.models_cache.load();
+            if let Some((ts, list)) = cache.as_ref()
                 && ts.elapsed() < self.tuning.models_cache_ttl()
             {
                 return Arc::clone(list);
@@ -411,22 +423,22 @@ impl Provider {
                         all.push(m);
                     }
                 }
-                *self.models_cache.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some((Instant::now(), Arc::new(all.clone())));
+                self.publish_models(all.clone());
                 all
             }
             Ok(_) => {
                 // Upstream returned an empty list — treat the static config as current.
                 let all = self.models.as_ref().clone();
-                *self.models_cache.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some((Instant::now(), Arc::new(all.clone())));
+                self.publish_models(all.clone());
                 all
             }
             Err(e) => {
                 tracing::debug!(provider = %self.name, "models refresh failed: {e}");
                 let mut all = self.models.as_ref().clone();
-                let mut cache = self.models_cache.lock().unwrap_or_else(|e| e.into_inner());
-                match &*cache {
+                // A whole new snapshot is published, so a reader either sees the
+                // previous cache or this one — never a half-updated value.
+                let current = self.models_cache.load_full();
+                match current.as_ref() {
                     Some((_, list)) => {
                         for m in list.iter() {
                             if !all.contains(m) {
@@ -434,7 +446,8 @@ impl Provider {
                             }
                         }
                         // Bump the timestamp: do not hammer a dead upstream on every /v1/models.
-                        *cache = Some((Instant::now(), list.clone()));
+                        self.models_cache
+                            .store(Arc::new(Some((Instant::now(), list.clone()))));
                     }
                     None => {
                         // Negative cache: shift the timestamp back so only a short
@@ -446,12 +459,19 @@ impl Provider {
                         let ts = Instant::now()
                             .checked_sub(ttl.saturating_sub(margin))
                             .unwrap_or_else(Instant::now);
-                        *cache = Some((ts, Arc::new(all.clone())));
+                        self.models_cache
+                            .store(Arc::new(Some((ts, Arc::new(all.clone())))));
                     }
                 }
                 all
             }
         }
+    }
+
+    /// Publish a freshly fetched model list (and its fetch time) to readers.
+    fn publish_models(&self, all: Vec<String>) {
+        self.models_cache
+            .store(Arc::new(Some((Instant::now(), Arc::new(all)))));
     }
 
     /// Per-account model quotas (antigravity only), cached for 60s.
@@ -537,14 +557,16 @@ impl ProviderRouter {
         {
             return Some((p, rest.to_string()));
         }
+        // Two lookups per provider: the static config list, then the dynamically
+        // discovered one. The latter is read through an `ArcSwap` snapshot — no
+        // lock on the request path, so a periodic model refresh cannot make every
+        // in-flight request queue behind it.
         let listed = self.providers.iter().find(|p| {
             if p.models.iter().any(|m| m == model) {
                 return true;
             }
-            let guard = p.models_cache.lock().unwrap_or_else(|e| e.into_inner());
-            guard
-                .as_ref()
-                .is_some_and(|(_, list)| list.iter().any(|m| m == model))
+            let cache = p.models_cache.load();
+            matches!(&**cache, Some((_, list)) if list.iter().any(|m| m == model))
         });
         if let Some(p) = listed {
             return Some((p, model.to_string()));
@@ -565,5 +587,143 @@ impl ProviderRouter {
             );
         }
         Some((first, model.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool::FailKind;
+
+    fn provider(extra: &str) -> Provider {
+        let src = format!(
+            r#"
+            name = "mock"
+            type = "openai_compat"
+            base_url = "http://127.0.0.1:9/v1"
+            keys = ["sk-1", "sk-2"]
+            {extra}
+            "#
+        );
+        let cfg: ProviderConfig = toml::from_str(&src).expect("test provider config");
+        Provider::from_config(
+            &cfg,
+            None,
+            None,
+            None,
+            Arc::new(crate::config::Tuning::default()),
+            Duration::from_secs(30),
+            2,
+        )
+        .expect("provider builds offline")
+    }
+
+    /// B: the production constructor must hand the configured tuning to the pool.
+    /// It used to call `KeyPool::new`, which substituted `Tuning::default()`, so
+    /// every `[tuning]` cooldown/backoff knob was dead config.
+    #[test]
+    fn from_config_hands_the_configured_tuning_to_the_pool() {
+        let cfg: ProviderConfig = toml::from_str(
+            r#"
+            name = "mock"
+            type = "openai_compat"
+            base_url = "http://127.0.0.1:9/v1"
+            keys = ["sk-1"]
+            "#,
+        )
+        .expect("config");
+        let tuning = Arc::new(crate::config::Tuning {
+            rate_limit_cooldown_secs: 1,
+            base_backoff_secs: 1,
+            max_cooldown_secs: 2,
+            sticky_mode: "map".to_string(),
+            ..crate::config::Tuning::default()
+        });
+        let p = Provider::from_config(
+            &cfg,
+            None,
+            None,
+            None,
+            tuning.clone(),
+            Duration::from_secs(30),
+            2,
+        )
+        .expect("builds offline");
+        assert!(
+            Arc::ptr_eq(&p.pool.tuning(), &tuning),
+            "the pool must hold the config's tuning, not a default"
+        );
+
+        // …and it is what the pool actually uses.
+        let k = p.pool.pick("m", None).expect("a key");
+        p.pool.report_failure(
+            &k,
+            FailKind::RateLimited {
+                retry_after_secs: None,
+            },
+            "m",
+        );
+        assert!(
+            p.pool.snapshot()[0].cooldown_remaining_secs <= 1,
+            "configured rate_limit_cooldown_secs = 1 was ignored"
+        );
+    }
+
+    // ----- L: resolution reads the model cache without locking -----
+
+    /// A model discovered by a refresh must resolve to the provider that found
+    /// it, and a later snapshot must be seen immediately: the router caches
+    /// nothing of its own, it only reads the published snapshot.
+    #[test]
+    fn resolution_follows_the_dynamic_model_cache() {
+        let wildcard = provider("");
+        let mut listed = provider("");
+        listed.name = "listed".to_string();
+        let router = ProviderRouter {
+            providers: vec![wildcard, listed],
+            combos: Vec::new(),
+        };
+
+        // Unknown everywhere: the wildcard provider takes it.
+        match router.resolve("brand-new") {
+            Some(Resolved::One(p, m)) => {
+                assert_eq!(p.name, "mock");
+                assert_eq!(m, "brand-new");
+            }
+            _ => panic!("the wildcard provider must answer"),
+        }
+
+        // The second provider discovers it upstream; explicit discovery wins over
+        // the wildcard fallback, so the request goes where the model really is.
+        router.providers[1].publish_models(vec!["brand-new".to_string()]);
+        match router.resolve("brand-new") {
+            Some(Resolved::One(p, _)) => {
+                assert_eq!(p.name, "listed", "the refreshed list was not consulted");
+            }
+            _ => panic!("resolve returned nothing"),
+        }
+
+        // A new snapshot (the model vanished) is visible at once — no stale cache.
+        router.providers[1].publish_models(Vec::new());
+        match router.resolve("brand-new") {
+            Some(Resolved::One(p, _)) => assert_eq!(p.name, "mock"),
+            _ => panic!("resolve returned nothing"),
+        }
+    }
+
+    #[test]
+    fn an_explicit_provider_prefix_still_wins() {
+        let p = provider("");
+        let router = ProviderRouter {
+            providers: vec![p],
+            combos: Vec::new(),
+        };
+        match router.resolve("mock/any-model-at-all") {
+            Some(Resolved::One(provider, model)) => {
+                assert_eq!(provider.name, "mock");
+                assert_eq!(model, "any-model-at-all");
+            }
+            _ => panic!("an explicit prefix must resolve"),
+        }
     }
 }

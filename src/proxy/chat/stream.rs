@@ -1,10 +1,11 @@
 //! Successful-upstream responses: buffering, translation, and zero-copy streaming.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::body::{Body, Bytes};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde_json::Value;
@@ -19,29 +20,223 @@ use crate::providers::Provider;
 
 use super::error_response;
 
+/// A translated/pass-through upstream body.
+pub(super) type BodyStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+
+/// What the retry loop hands over once a 2xx is accepted.
+pub(super) enum Upstream {
+    /// The body is still attached to its response. Only the codex backend needs
+    /// this: its own parser owns the whole exchange.
+    Attached(reqwest::Response),
+    /// The head is in, and the body stream has already produced its first chunk
+    /// under a deadline (see [`open_body`]).
+    Opened {
+        status: StatusCode,
+        /// Upstream headers worth relaying, already filtered (see [`forward_header`]).
+        headers: Vec<(header::HeaderName, HeaderValue)>,
+        stream: BodyStream,
+    },
+}
+
+/// Why a 2xx upstream had no usable body.
+#[derive(Debug)]
+pub(super) enum BodyError {
+    /// The first byte never arrived inside the attempt timeout.
+    Idle(Duration),
+    /// The connection died while reading.
+    Upstream(String),
+}
+
+impl std::fmt::Display for BodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle(d) => write!(f, "upstream sent no body within {:?}", d),
+            Self::Upstream(e) => write!(f, "upstream body failed: {e}"),
+        }
+    }
+}
+
+/// Wait for the first body chunk, then hand the body back as a stream.
+///
+/// `req.send()` resolving only means the *headers* arrived: an upstream that
+/// sends `200 text/event-stream` and then goes silent used to hold the client
+/// (0 bytes for as long as the socket lived) and the key's in-flight slot for
+/// ever. The first byte is awaited here, inside the retry loop, so a silent
+/// upstream can be retried on another key and reported as a server failure.
+pub(super) async fn open_body(
+    resp: reqwest::Response,
+    idle: Duration,
+) -> Result<Upstream, BodyError> {
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+    let headers: Vec<_> = resp
+        .headers()
+        .iter()
+        .filter(|(n, _)| forward_header(n))
+        .map(|(n, v)| (n.clone(), v.clone()))
+        .collect();
+    let mut body = resp.bytes_stream();
+    let first = match tokio::time::timeout(idle, body.next()).await {
+        Err(_) => return Err(BodyError::Idle(idle)),
+        Ok(None) => None,
+        Ok(Some(Ok(chunk))) => Some(chunk),
+        Ok(Some(Err(e))) => return Err(BodyError::Upstream(e.to_string())),
+    };
+    let head = futures::stream::iter(first.map(Ok::<Bytes, std::io::Error>));
+    let rest = body.map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())));
+    Ok(Upstream::Opened {
+        status,
+        headers,
+        stream: Box::pin(head.chain(rest)),
+    })
+}
+
+/// Fail the stream when the upstream goes quiet for `idle`, first chunk included.
+///
+/// The translators turn this into a terminal error frame, so a stalled stream
+/// ends with a signal instead of a truncated answer.
+pub(super) fn idle_body(stream: BodyStream, idle: Duration) -> BodyStream {
+    struct State {
+        inner: BodyStream,
+        idle: Duration,
+        done: bool,
+    }
+    let state = State {
+        inner: stream,
+        idle,
+        done: false,
+    };
+    Box::pin(futures::stream::unfold(state, |mut s| async move {
+        if s.done {
+            return None;
+        }
+        let item = {
+            let next = s.inner.next();
+            futures::pin_mut!(next);
+            tokio::time::timeout(s.idle, next).await
+        };
+        match item {
+            Ok(Some(Ok(chunk))) => Some((Ok(chunk), s)),
+            Ok(Some(Err(e))) => {
+                s.done = true;
+                Some((Err(e), s))
+            }
+            Ok(None) => None,
+            Err(_) => {
+                s.done = true;
+                Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("upstream body idle for {:?}", s.idle),
+                    )),
+                    s,
+                ))
+            }
+        }
+    }))
+}
+
+/// Read a whole body, with the same idle deadline on every read.
+async fn read_all(mut stream: BodyStream, idle: Duration) -> Result<Bytes, BodyError> {
+    let mut out = Vec::new();
+    loop {
+        match tokio::time::timeout(idle, stream.next()).await {
+            Err(_) => return Err(BodyError::Idle(idle)),
+            Ok(None) => return Ok(Bytes::from(out)),
+            Ok(Some(Ok(chunk))) => out.extend_from_slice(&chunk),
+            Ok(Some(Err(e))) => return Err(BodyError::Upstream(e.to_string())),
+        }
+    }
+}
+
+/// `text/HTML; charset=utf-8` -> `text/html`.
+fn normalize_content_type(raw: &str) -> String {
+    raw.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// The content type of a response head, normalized for [`accept_2xx`].
+pub(super) fn content_type_of(resp: &reqwest::Response) -> String {
+    resp.headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(normalize_content_type)
+        .unwrap_or_default()
+}
+
+/// Is a 2xx upstream actually speaking our protocol?
+///
+/// An upstream error page (`200 text/html` from nginx) used to be relayed as a
+/// successful completion: the client parsed garbage, `report_success` ran, and
+/// nothing in the health counters noticed. The gateway is a protocol proxy — a
+/// body in the wrong protocol is an upstream failure.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Accepted {
+    Ok,
+    WrongContentType(String),
+}
+
+pub(super) fn accept_2xx(kind: ProviderKind, is_stream: bool, raw_content_type: &str) -> Accepted {
+    let content_type = normalize_content_type(raw_content_type);
+    // Codex's backend answers a stream even for a non-stream client request.
+    let wants_sse = is_stream || matches!(kind, ProviderKind::Codex);
+    if wants_sse {
+        return if content_type == "text/event-stream" {
+            Accepted::Ok
+        } else {
+            Accepted::WrongContentType(content_type.to_string())
+        };
+    }
+    if content_type.is_empty()
+        || content_type == "application/json"
+        || content_type.ends_with("+json")
+    {
+        // An absent type is not evidence of an error page; the body still has to
+        // parse as JSON below.
+        return Accepted::Ok;
+    }
+    Accepted::WrongContentType(content_type.to_string())
+}
+
 /// Build the client response for a successful upstream call.
+///
+/// `idle` bounds every read of the upstream body; a translator reports a stall
+/// as a terminal error frame, a buffered read as a 502.
 pub(super) async fn success_response(
     provider: &Provider,
     model: &str,
-    resp: reqwest::Response,
+    body: Upstream,
     is_stream: bool,
     key: Arc<KeyState>,
     guard: KeyGuard,
 ) -> Response {
+    let idle = provider.timeout;
     match provider.kind {
-        ProviderKind::OpenaiCompat => {
-            if is_stream {
-                stream_upstream(resp, guard)
-            } else {
-                // Buffer small JSON responses to capture usage stats.
-                let status = resp.status();
-                let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
+        ProviderKind::Codex => {
+            let Upstream::Attached(resp) = body else {
                 drop(guard);
-                match resp.bytes().await {
-                    Ok(bytes) => {
-                        if let Ok(v) = serde_json::from_slice::<Value>(&bytes)
-                            && let Some(u) = v.get("usage")
-                        {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal: the codex body was consumed before its parser ran",
+                    "internal_error",
+                );
+            };
+            if is_stream {
+                let stream = codex::translate_sse_stream(resp, model, Some(key));
+                let stream = stream.map(move |item| {
+                    let _ = &guard; // keep the in-flight slot until the stream ends
+                    item
+                });
+                sse_response(stream)
+            } else {
+                // Codex backend is stream-only; collect the SSE stream.
+                drop(guard);
+                match codex::collect_non_stream(resp, model).await {
+                    Ok(v) => {
+                        if let Some(u) = v.get("usage") {
                             add_usage(
                                 &key,
                                 u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
@@ -50,36 +245,80 @@ pub(super) async fn success_response(
                                     .unwrap_or(0),
                             );
                         }
-                        let mut b = Response::builder().status(
-                            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK),
-                        );
-                        if let Some(ct) = content_type {
-                            b = b.header(header::CONTENT_TYPE, ct);
-                        }
-                        b.body(Body::from(bytes))
-                            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                        Json(v).into_response()
                     }
-                    Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+                    Err(e) => error_response(
+                        StatusCode::BAD_GATEWAY,
+                        format!("codex stream collect failed: {e}"),
+                        "upstream_error",
+                    ),
                 }
             }
         }
-        ProviderKind::Gemini
-        | ProviderKind::Antigravity
-        | ProviderKind::Anthropic
-        | ProviderKind::Codex => {
+        ProviderKind::OpenaiCompat => {
+            let Upstream::Opened {
+                status,
+                headers,
+                stream,
+            } = body
+            else {
+                drop(guard);
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal: an opened upstream body was expected",
+                    "internal_error",
+                );
+            };
+            if is_stream {
+                pass_through(status, headers, idle_body(stream, idle), guard)
+            } else {
+                drop(guard);
+                match read_all(stream, idle).await {
+                    Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                        Ok(v) => {
+                            add_openai_usage(&key, &v);
+                            let mut b = Response::builder().status(status);
+                            for (n, v) in headers {
+                                b = b.header(n, v);
+                            }
+                            b.body(Body::from(bytes)).unwrap_or_else(|_| {
+                                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                            })
+                        }
+                        // A JSON content type with a non-JSON body is still an
+                        // upstream fault: never relay it as a completion.
+                        Err(e) => error_response(
+                            StatusCode::BAD_GATEWAY,
+                            format!("upstream body is not a completion: {e}"),
+                            "upstream_error",
+                        ),
+                    },
+                    Err(e) => {
+                        error_response(StatusCode::BAD_GATEWAY, format!("{e}"), "upstream_error")
+                    }
+                }
+            }
+        }
+        ProviderKind::Gemini | ProviderKind::Antigravity | ProviderKind::Anthropic => {
+            let Upstream::Opened { stream, .. } = body else {
+                drop(guard);
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal: an opened upstream body was expected",
+                    "internal_error",
+                );
+            };
             let envelope = matches!(provider.kind, ProviderKind::Antigravity);
             if is_stream {
-                let stream: std::pin::Pin<
-                    Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
-                > = match provider.kind {
-                    ProviderKind::Anthropic => {
-                        Box::pin(anthropic::translate_sse_stream(resp, model, Some(key)))
-                    }
-                    ProviderKind::Codex => {
-                        Box::pin(codex::translate_sse_stream(resp, model, Some(key)))
-                    }
-                    _ => Box::pin(gemini::translate_sse_stream(
-                        resp,
+                let stream = idle_body(stream, idle);
+                let stream: BodyStream = match provider.kind {
+                    ProviderKind::Anthropic => Box::pin(anthropic::translate_sse_stream_from(
+                        stream,
+                        model,
+                        Some(key),
+                    )),
+                    _ => Box::pin(gemini::translate_sse_stream_from(
+                        stream,
                         model,
                         envelope,
                         Some(key),
@@ -89,72 +328,74 @@ pub(super) async fn success_response(
                     let _ = &guard; // keep the in-flight slot until the stream ends
                     item
                 });
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header(header::CACHE_CONTROL, "no-cache")
-                    .body(Body::from_stream(stream))
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                sse_response(stream)
             } else {
                 drop(guard);
-                if matches!(provider.kind, ProviderKind::Codex) {
-                    // Codex backend is stream-only; collect the SSE stream.
-                    return match codex::collect_non_stream(resp, model).await {
+                match read_all(stream, idle).await {
+                    Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                         Ok(v) => {
-                            if let Some(u) = v.get("usage") {
+                            if matches!(provider.kind, ProviderKind::Anthropic) {
+                                let u = v.get("usage").cloned().unwrap_or(Value::Null);
                                 add_usage(
                                     &key,
-                                    u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                                    u.get("completion_tokens")
-                                        .and_then(|x| x.as_u64())
-                                        .unwrap_or(0),
+                                    u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                                    u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
                                 );
+                                Json(anthropic::translate_response(model, &v)).into_response()
+                            } else {
+                                let v = if envelope {
+                                    antigravity::unwrap_response(v)
+                                } else {
+                                    v
+                                };
+                                let (p, c) = gemini::usage_pair(&v);
+                                add_usage(&key, p, c);
+                                Json(gemini::translate_response(model, &v)).into_response()
                             }
-                            Json(v).into_response()
                         }
                         Err(e) => error_response(
                             StatusCode::BAD_GATEWAY,
-                            format!("codex stream collect failed: {e}"),
+                            format!("invalid upstream JSON: {e}"),
                             "upstream_error",
                         ),
-                    };
-                }
-                match resp.json::<Value>().await {
-                    Ok(v) => {
-                        if matches!(provider.kind, ProviderKind::Anthropic) {
-                            let u = v.get("usage").cloned().unwrap_or(Value::Null);
-                            add_usage(
-                                &key,
-                                u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                                u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
-                            );
-                            Json(anthropic::translate_response(model, &v)).into_response()
-                        } else {
-                            let v = if envelope {
-                                antigravity::unwrap_response(v)
-                            } else {
-                                v
-                            };
-                            let (p, c) = gemini::usage_pair(&v);
-                            add_usage(&key, p, c);
-                            Json(gemini::translate_response(model, &v)).into_response()
-                        }
+                    },
+                    Err(e) => {
+                        error_response(StatusCode::BAD_GATEWAY, format!("{e}"), "upstream_error")
                     }
-                    Err(e) => error_response(
-                        StatusCode::BAD_GATEWAY,
-                        format!("invalid upstream JSON: {e}"),
-                        "upstream_error",
-                    ),
                 }
             }
         }
     }
 }
 
+fn sse_response(
+    stream: impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 fn add_usage(key: &KeyState, prompt: u64, completion: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     key.prompt_tokens.fetch_add(prompt, Relaxed);
     key.completion_tokens.fetch_add(completion, Relaxed);
+}
+
+/// Pull `usage` out of an OpenAI-compatible completion.
+fn add_openai_usage(key: &KeyState, v: &Value) {
+    if let Some(u) = v.get("usage") {
+        add_usage(
+            key,
+            u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+            u.get("completion_tokens")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0),
+        );
+    }
 }
 
 /// Upstream response headers worth relaying on a pass-through. Deliberately an
@@ -169,20 +410,39 @@ fn forward_header(name: &reqwest::header::HeaderName) -> bool {
         || name.as_str() == "openai-version"
 }
 
-/// Pass an upstream 2xx response through to the client with zero buffering.
+/// Pass an upstream 2xx body through to the client with zero buffering.
 /// The guard keeps the key's in-flight slot until the stream ends.
-fn stream_upstream(resp: reqwest::Response, guard: KeyGuard) -> Response {
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-    let headers: Vec<_> = resp
-        .headers()
-        .iter()
-        .filter(|(n, _)| forward_header(n))
-        .map(|(n, v)| (n.clone(), v.clone()))
-        .collect();
-    let stream = resp.bytes_stream().map(move |chunk| {
-        let _ = &guard;
-        chunk.map_err(|e| std::io::Error::other(format!("upstream stream error: {e}")))
-    });
+///
+/// A failure mid-body (dead connection, idle deadline) must not look like a
+/// finished answer: the relay closes with an OpenAI-style error frame followed by
+/// `[DONE]`, so the client can tell truncation from success.
+fn pass_through(
+    status: StatusCode,
+    headers: Vec<(header::HeaderName, HeaderValue)>,
+    stream: BodyStream,
+    guard: KeyGuard,
+) -> Response {
+    let stream =
+        futures::stream::unfold((Some(stream), Some(guard)), |(inner, guard)| async move {
+            let mut inner = inner?;
+            match inner.next().await {
+                Some(Ok(chunk)) => Some((Ok::<Bytes, std::io::Error>(chunk), (Some(inner), guard))),
+                Some(Err(e)) => {
+                    let frame = crate::sse::frame(&serde_json::json!({
+                        "error": {
+                            "message": format!("upstream stream error: {e}"),
+                            "type": "upstream_error",
+                        }
+                    }));
+                    // Blank line first: terminate any event that was cut in half.
+                    let mut out = bytes::BytesMut::from(&b"\n\n"[..]);
+                    out.extend_from_slice(&frame);
+                    out.extend_from_slice(crate::sse::DONE_FRAME);
+                    Some((Ok::<Bytes, std::io::Error>(out.freeze()), (None, guard)))
+                }
+                None => None,
+            }
+        });
     let mut builder = Response::builder().status(status);
     for (n, v) in headers {
         builder = builder.header(n, v);
@@ -222,5 +482,191 @@ mod tests {
         }
         assert!(!forward_header(&HeaderName::from_static("set-cookie")));
         assert!(!forward_header(&HeaderName::from_static("authorization")));
+    }
+
+    // ----- 2xx bodies that are not completions -----
+
+    /// An nginx error page (`200 text/html`) used to be relayed as a completion.
+    #[test]
+    fn a_200_html_page_is_not_a_completion() {
+        assert_eq!(
+            accept_2xx(ProviderKind::OpenaiCompat, false, "text/html"),
+            Accepted::WrongContentType("text/html".into())
+        );
+        assert_eq!(
+            accept_2xx(ProviderKind::OpenaiCompat, true, "text/html"),
+            Accepted::WrongContentType("text/html".into())
+        );
+        assert_eq!(
+            accept_2xx(ProviderKind::Gemini, false, "text/plain"),
+            Accepted::WrongContentType("text/plain".into())
+        );
+        assert_eq!(
+            accept_2xx(ProviderKind::Anthropic, false, "image/png"),
+            Accepted::WrongContentType("image/png".into())
+        );
+    }
+
+    #[test]
+    fn real_completions_and_streams_are_accepted() {
+        assert_eq!(
+            accept_2xx(ProviderKind::OpenaiCompat, false, "application/json"),
+            Accepted::Ok
+        );
+        assert_eq!(
+            accept_2xx(
+                ProviderKind::Gemini,
+                false,
+                "application/json; charset=utf-8"
+            ),
+            Accepted::Ok
+        );
+        assert_eq!(
+            accept_2xx(ProviderKind::Anthropic, true, "text/event-stream"),
+            Accepted::Ok
+        );
+        // Codex streams even when the client asked for a plain completion.
+        assert_eq!(
+            accept_2xx(ProviderKind::Codex, false, "text/event-stream"),
+            Accepted::Ok
+        );
+        // An untyped body is not evidence of an error page: the JSON parse below
+        // is the real gate.
+        assert_eq!(
+            accept_2xx(ProviderKind::OpenaiCompat, false, ""),
+            Accepted::Ok
+        );
+    }
+
+    // ----- body deadlines -----
+
+    fn provider(source: &str) -> Provider {
+        let cfg: crate::config::ProviderConfig =
+            toml::from_str(source).expect("test provider config");
+        Provider::from_config(
+            &cfg,
+            None,
+            None,
+            None,
+            Arc::new(crate::config::Tuning::default()),
+            Duration::from_secs(30),
+            1,
+        )
+        .expect("the provider builds offline")
+    }
+
+    const OPENAI_PROVIDER: &str = r#"
+        name = "up"
+        type = "openai_compat"
+        base_url = "http://127.0.0.1:1/v1"
+        keys = ["sk-test"]
+        models = ["m"]
+    "#;
+
+    /// `200` and then silence: the first-byte deadline must fail the attempt so
+    /// the retry loop can bench the key, instead of holding the client forever.
+    #[tokio::test]
+    async fn a_body_that_never_starts_arrives_is_a_timeout() {
+        let resp =
+            crate::sse::test_support::silent_body("text/event-stream", Duration::from_secs(2))
+                .await;
+        let Err(err) = open_body(resp, Duration::from_millis(100)).await else {
+            panic!("a silent body must not open");
+        };
+        assert!(matches!(err, BodyError::Idle(_)), "{err}");
+        assert!(err.to_string().contains("no body"), "{err}");
+    }
+
+    /// The first chunk must not be lost by watching for it.
+    #[tokio::test]
+    async fn the_first_chunk_is_replayed_to_the_translator() {
+        let resp = crate::sse::test_support::sse_response(vec![
+            b"data: a\n\n".to_vec(),
+            b"data: b\n\n".to_vec(),
+        ])
+        .await;
+        let Upstream::Opened {
+            stream, headers, ..
+        } = open_body(resp, Duration::from_secs(5))
+            .await
+            .expect("body opens")
+        else {
+            panic!("open_body always yields an opened body");
+        };
+        assert!(
+            headers.iter().any(|(n, _)| *n == header::CONTENT_TYPE),
+            "the content type is kept for the relay: {headers:?}"
+        );
+        let out = crate::sse::test_support::frames(stream).await;
+        assert_eq!(out, vec!["data: a\n\n", "data: b\n\n"]);
+    }
+
+    /// A stall *between* chunks ends the stream with an error item, which the
+    /// translators turn into a terminal error frame.
+    #[tokio::test]
+    async fn a_stalled_stream_errors_instead_of_hanging() {
+        let resp = crate::sse::test_support::sse_response(vec![b"data: a\n\n".to_vec()]).await;
+        let Upstream::Opened { stream, .. } = open_body(resp, Duration::from_secs(5))
+            .await
+            .expect("body opens")
+        else {
+            panic!("open_body always yields an opened body");
+        };
+        // The upstream closed after one event, so idle_body sees EOF, not a stall.
+        let out =
+            crate::sse::test_support::frames(idle_body(stream, Duration::from_millis(50))).await;
+        assert_eq!(out.len(), 1);
+
+        // Now a stream that produces one chunk and then never ends.
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Bytes, std::io::Error>>();
+        tx.unbounded_send(Ok(Bytes::from_static(b"data: a\n\n")))
+            .expect("send");
+        // Keep `tx` alive but silent: the idle deadline is the only way out.
+        let stream: BodyStream = Box::pin(rx);
+        let (out, err) =
+            crate::sse::test_support::frames_or_error(idle_body(stream, Duration::from_millis(50)))
+                .await;
+        assert_eq!(out.len(), 1, "the first chunk is delivered");
+        assert!(
+            err.unwrap_or_default().contains("idle"),
+            "the stall must surface as a timed-out item"
+        );
+        drop(tx);
+    }
+
+    // ----- bodies that are not completions (F6) -----
+
+    /// A `200 application/json` whose body is an HTML error page must not be
+    /// relayed: the client would parse it as a completion.
+    #[tokio::test]
+    async fn a_json_content_type_with_an_html_body_is_a_502() {
+        let provider = provider(OPENAI_PROVIDER);
+        let key = provider.pool.pick("m", None).expect("one key");
+        let guard = key.try_acquire().expect("a free slot");
+        let body = Upstream::Opened {
+            status: StatusCode::OK,
+            headers: vec![(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            stream: Box::pin(futures::stream::iter(vec![Ok(Bytes::from_static(
+                b"<html><body>502 Bad Gateway</body></html>",
+            ))])),
+        };
+        let resp = success_response(&provider, "m", body, false, key, guard).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn content_type_parameters_and_case_are_normalized() {
+        assert_eq!(
+            normalize_content_type("text/HTML; charset=utf-8"),
+            "text/html"
+        );
+        assert_eq!(
+            normalize_content_type(" application/json "),
+            "application/json"
+        );
+        assert_eq!(normalize_content_type(""), "");
     }
 }

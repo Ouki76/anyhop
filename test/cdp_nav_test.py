@@ -28,10 +28,29 @@ PORT = os.environ.get("ANYHOP_TEST_PORT", "18080")
 BASE = f"http://127.0.0.1:{PORT}"
 ADMIN_KEY = "test-gw-key"
 
+# Per-run profile and DevTools port: two suite runs (or an agent's probe) used to
+# share /tmp/anyhop-cdp-profile + port 9222, so the second chromium attached to a
+# dead instance and the stage failed with "connection to remote host was lost".
+_CDP_PORT = None
+
+
+def _free_port():
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+CDP_PORT = _free_port()
+CDP_PROFILE = f"/tmp/anyhop-cdp-profile-{os.getpid()}-{CDP_PORT}"
+
 CHROME = ["chromium-browser", "--headless=new", "--no-sandbox", "--disable-gpu",
           # explicit profile dir: sandboxed environments can't create the default one
-          "--user-data-dir=/tmp/anyhop-cdp-profile",
-          "--remote-debugging-port=9222", "--remote-allow-origins=*", "about:blank"]
+          f"--user-data-dir={CDP_PROFILE}",
+          f"--remote-debugging-port={CDP_PORT}", "--remote-allow-origins=*", "about:blank"]
 
 # Nav label (as rendered) -> page title (as rendered by the tab component).
 TABS = {
@@ -76,7 +95,7 @@ def main():
     proc = subprocess.Popen(CHROME, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
     try:
-        tabs = [t for t in json.load(urllib.request.urlopen("http://127.0.0.1:9222/json"))
+        tabs = [t for t in json.load(urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}/json"))
                 if t.get("type") == "page"]
         ws = websocket.create_connection(tabs[0]["webSocketDebuggerUrl"], timeout=15)
         mid = 0
@@ -254,6 +273,15 @@ def main():
         print("\nno panics, no console errors ✓")
     finally:
         proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001 - a stuck chromium must not fail the stage
+            proc.kill()
+        # A leaked profile or chromium (a crashed earlier run) used to break the
+        # *next* run of this stage; clean up after ourselves.
+        import shutil
+
+        shutil.rmtree(CDP_PROFILE, ignore_errors=True)
         api("POST", "/api/client-keys/delete", {"key": "sk-hop-cdp-test"})
         api("POST", "/api/client-keys/delete", {"key": "sk-hop-cdp-test-2"})
 

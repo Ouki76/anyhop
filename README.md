@@ -447,9 +447,9 @@ load generator caps out around 8k rps on its own and would hide the real capacit
 
 | Endpoint | Throughput | p50 | p99 |
 | --- | --- | --- | --- |
-| `GET /healthz` | **170,000 req/s** | 0.34 ms | ~1 ms |
-| `GET /v1/models` (124 models, cached) | **120,000 req/s** | 0.47 ms | ~1.5 ms |
-| `GET /metrics` (with histograms) | **62,000 req/s** | 1.00 ms | ~2 ms |
+| `GET /healthz` | **197,000 req/s** | 0.30 ms | ~1 ms |
+| `GET /v1/models` (124 models, cached) | **172,000 req/s** | 0.35 ms | ~1 ms |
+| `GET /metrics` (with histograms) | **65,000 req/s** | 0.98 ms | ~2 ms |
 
 RSS 17 MB with the gateway and the load generator sharing the same 16 cores — the
 client steals roughly half the machine, so these are a floor, not a ceiling.

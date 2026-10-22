@@ -153,7 +153,7 @@ pub async fn events(
     let stream = replay.chain(live);
     Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()
-            .interval(state.tuning.sse_keepalive())
+            .interval(state.tuning().sse_keepalive())
             .text("ping"),
     )
 }

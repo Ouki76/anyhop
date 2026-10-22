@@ -43,25 +43,41 @@ fn score(session: u64, key_id: &str) -> u64 {
 }
 
 /// Sticky-session state for one pool.
+///
+/// The tuning is a shared, hot-swappable cell: a `[tuning] sticky_mode`/TTL edit
+/// must take effect on a pool that a reload did *not* rebuild.
 pub(super) struct StickySessions {
     map: Mutex<HashMap<u64, (String, u64)>>,
-    tuning: Arc<Tuning>,
-    hashed: bool,
+    tuning: Arc<arc_swap::ArcSwap<Tuning>>,
+    /// Mirrors `sticky_mode` for the per-request check; refreshed by
+    /// [`StickySessions::set_tuning`] so the hot path never loads the cell.
+    hashed: std::sync::atomic::AtomicBool,
 }
 
 impl StickySessions {
-    pub(super) fn new(tuning: Arc<Tuning>) -> Self {
-        let hashed = tuning.sticky_mode != "map";
+    pub(super) fn new(tuning: Arc<arc_swap::ArcSwap<Tuning>>) -> Self {
+        let hashed = is_hashed(&tuning.load());
         Self {
             map: Mutex::new(HashMap::new()),
             tuning,
-            hashed,
+            hashed: std::sync::atomic::AtomicBool::new(hashed),
         }
+    }
+
+    /// Swap in a new tuning cell state (config reload).
+    pub(super) fn set_tuning(&self, tuning: Arc<Tuning>) {
+        self.hashed
+            .store(is_hashed(&tuning), std::sync::atomic::Ordering::Relaxed);
+        self.tuning.store(tuning);
+    }
+
+    fn tuning(&self) -> Arc<Tuning> {
+        self.tuning.load_full()
     }
 
     /// Whether this pool routes by rendezvous hashing (no shared state).
     pub(super) fn is_hashed(&self) -> bool {
-        self.hashed
+        self.hashed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Index of the highest-scoring available key, or None when none is available.
@@ -80,7 +96,10 @@ impl StickySessions {
                 continue;
             }
             let s = score(session, &k.id_hash);
-            if best.is_none_or(|(bs, _)| s > bs) {
+            // `>=` rather than `>`: two credentials with the same id (which
+            // `add_key` now refuses to create) must not pin every session of the
+            // pair onto the first one forever.
+            if best.is_none_or(|(bs, _)| s >= bs) {
                 best = Some((s, i));
             }
         }
@@ -89,16 +108,15 @@ impl StickySessions {
 
     /// `map` mode: key id bound to `session` while the binding is fresh.
     pub(super) fn lookup(&self, session: u64, now: u64) -> Option<String> {
-        if self.hashed {
+        if self.is_hashed() {
             return None;
         }
+        let ttl = self.tuning().sticky_ttl().as_millis() as u64;
         // Per-entry TTL check instead of a full-map retain sweep on every pick;
         // saturating_sub survives wall-clock steps backward.
         let mut map = lock(&self.map);
         match map.get_mut(&session) {
-            Some((kid, seen))
-                if now.saturating_sub(*seen) < self.tuning.sticky_ttl().as_millis() as u64 =>
-            {
+            Some((kid, seen)) if now.saturating_sub(*seen) < ttl => {
                 *seen = now;
                 Some(kid.clone())
             }
@@ -112,26 +130,32 @@ impl StickySessions {
 
     /// `map` mode: remember that `session` is served by the key `kid`.
     pub(super) fn bind(&self, session: u64, kid: &str, now: u64) {
-        if self.hashed {
+        if self.is_hashed() {
             return;
         }
+        let max_entries = self.tuning().sticky_max_entries;
         let mut map = lock(&self.map);
-        if map.len() >= self.tuning.sticky_max_entries {
+        if map.len() >= max_entries {
             map.clear(); // coarse eviction on overflow
         }
         map.insert(session, (kid.to_string(), now));
     }
 }
 
+/// `[tuning] sticky_mode`: anything but `map` means rendezvous hashing.
+fn is_hashed(tuning: &Tuning) -> bool {
+    tuning.sticky_mode != "map"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tun(mode: &str) -> Arc<Tuning> {
-        Arc::new(Tuning {
+    fn tun(mode: &str) -> Arc<arc_swap::ArcSwap<Tuning>> {
+        Arc::new(arc_swap::ArcSwap::from_pointee(Tuning {
             sticky_mode: mode.to_string(),
             ..Tuning::default()
-        })
+        }))
     }
 
     #[test]
@@ -189,5 +213,51 @@ mod tests {
         // Beyond the TTL (measured from the *refresh* above) the binding is dropped.
         let late = 1_100 + Tuning::default().sticky_ttl().as_millis() as u64 + 1;
         assert!(s.lookup(9, late).is_none());
+    }
+
+    /// A hot `[tuning] sticky_mode` edit must reach a pool that a reload reused.
+    #[test]
+    fn a_tuning_swap_changes_the_mode_and_the_ttl() {
+        let s = StickySessions::new(tun("hash"));
+        assert!(s.is_hashed(), "hash is the default mode");
+        assert!(s.lookup(1, 0).is_none(), "hash mode keeps no map");
+
+        s.set_tuning(Arc::new(Tuning {
+            sticky_mode: "map".to_string(),
+            sticky_ttl_secs: 1,
+            ..Tuning::default()
+        }));
+        assert!(!s.is_hashed(), "switching to map mode must take effect");
+        s.bind(1, "kid", 1_000);
+        assert_eq!(s.lookup(1, 1_500).as_deref(), Some("kid"));
+        assert!(
+            s.lookup(1, 3_000).is_none(),
+            "the new 1 s TTL must apply, not the 1800 s default"
+        );
+
+        // An unknown mode falls back to hashing, as the config validator requires.
+        s.set_tuning(Arc::new(Tuning::default()));
+        assert!(s.is_hashed());
+    }
+
+    /// Equal ids are refused by `KeyPool::add_key`; if one ever reaches the
+    /// scorer, every session must still be spread rather than pinned to the
+    /// first duplicate.
+    #[test]
+    fn duplicate_ids_do_not_pin_every_session_to_one_key() {
+        let s = StickySessions::new(tun("hash"));
+        let keys: Vec<Arc<super::super::KeyState>> = ["same", "same", "other"]
+            .iter()
+            .map(|k| Arc::new(super::super::KeyState::new((*k).to_string(), 0)))
+            .collect();
+        assert_eq!(
+            keys[0].id_hash, keys[1].id_hash,
+            "fixture must be duplicate"
+        );
+        // The strict `>` version always answered index 0 for the pair; `>=` picks
+        // the later one, so the selection still moves.
+        let picked = s.rendezvous(7, &keys, |_| true).expect("a key");
+        assert!(picked < keys.len());
+        assert!(s.rendezvous(7, &keys, |_| false).is_none());
     }
 }

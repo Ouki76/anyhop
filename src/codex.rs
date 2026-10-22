@@ -11,6 +11,11 @@ use serde_json::{Value, json};
 use std::io;
 use tracing::warn;
 
+/// Largest tool-call index we will materialise (mirrors `anthropic.rs`): the index
+/// arrives from the upstream, and `u64::MAX` overflows the `+1` while `1e9` would
+/// size a multi-gigabyte `Vec`.
+const MAX_TOOL_INDEX: u64 = 1024;
+
 pub const AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -587,7 +592,25 @@ pub fn translate_sse_stream(
             }
 
             match s.inner.next().await {
-                Some(Ok(b)) => s.pending.extend(s.parser.feed(&b)),
+                Some(Ok(b)) => match s.parser.feed_checked(&b) {
+                    Ok(events) => s.pending.extend(events),
+                    Err(e) => {
+                        // The cap means the upstream never framed an event: fail the
+                        // stream instead of relaying a truncated answer as complete.
+                        tracing::debug!(error = %e, "upstream SSE event exceeded the parser cap");
+                        s.out.push_back(crate::sse::frame(&json!({
+                            "error": {
+                                "message": e.to_string(),
+                                "type": "upstream_error",
+                                "code": "response_failed",
+                            }
+                        })));
+                        s.out
+                            .push_back(bytes::Bytes::from_static(crate::sse::DONE_FRAME));
+                        s.sent_done = true;
+                        s.eof = true;
+                    }
+                },
                 Some(Err(e)) => return Some((Err(io::Error::other(e)), s)),
                 None => {
                     s.eof = true;
@@ -650,7 +673,15 @@ pub async fn collect_non_stream(resp: reqwest::Response, model: &str) -> Result<
             }
             if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                 for tc in tcs {
-                    let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                    // `index` is upstream-controlled: cap it before it sizes a Vec
+                    // (u64::MAX overflows `+1`; 1e9 allocates gigabytes).
+                    let raw = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                    if raw > MAX_TOOL_INDEX {
+                        return Err(format!(
+                            "tool call index {raw} rejected: the maximum is {MAX_TOOL_INDEX}"
+                        ));
+                    }
+                    let idx = raw as usize;
                     while tool_calls.len() <= idx {
                         tool_calls.push(json!({
                             "id": "", "type": "function",
@@ -752,7 +783,9 @@ pub async fn start_auth_with(
 
     let verifier = random_verifier()?;
     let challenge = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
-    let state = format!("{:x}", now_ms());
+    // Random, not the clock: the callback route carries no admin key, so the
+    // `state` is the only thing binding a `code` to *this* flow.
+    let state = crate::antigravity::random_oauth_state()?;
     let redirect = redirect_uri.unwrap_or(REDIRECT_URI).to_string();
     let url = format!(
         "{AUTH_URL}?response_type=code&client_id={CLIENT_ID}&redirect_uri={}&scope={}&state={state}&code_challenge={challenge}&code_challenge_method=S256&codex_cli_simplified_flow=true&id_token_add_organizations=true",
@@ -937,4 +970,42 @@ fn parse_id_token(id_token: &str) -> (Option<String>, Option<String>) {
         .and_then(|e| e.as_str())
         .map(str::to_string);
     (email, account_id)
+}
+
+#[cfg(test)]
+mod oauth_state_tests {
+    use super::*;
+
+    /// Same defect as antigravity: the state was the wall clock in hex.
+    #[tokio::test]
+    async fn each_flow_gets_an_unpredictable_state() {
+        let a = start_auth_with(
+            None,
+            &crate::config::Tuning::default(),
+            Some("https://gw.example.com/api/auth/callback"),
+        )
+        .await
+        .expect("headless flow");
+        let b = start_auth_with(
+            None,
+            &crate::config::Tuning::default(),
+            Some("https://gw.example.com/api/auth/callback"),
+        )
+        .await
+        .expect("headless flow");
+        assert_ne!(a.state, b.state, "two flows must not share a state");
+        assert_eq!(a.state.len(), 64, "32 bytes, hex-encoded");
+        assert!(a.url.contains(&format!("state={}", a.state)), "{}", a.url);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        assert_ne!(
+            a.state,
+            format!("{now:x}"),
+            "the state must not be the clock"
+        );
+        // The PKCE verifier is independent of the state and still present.
+        assert!(a.url.contains("code_challenge="), "{}", a.url);
+    }
 }

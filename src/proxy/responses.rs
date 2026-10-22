@@ -95,7 +95,7 @@ pub async fn responses(
     };
     // No state file or a zero cap both mean "off", and `previous_response_id` is
     // then refused rather than ignored (see `resolve_previous`).
-    let store_max = state.tuning.response_store_max;
+    let store_max = state.tuning().response_store_max;
     let storage = state.storage.as_ref().filter(|_| store_max > 0);
     if let Some(s) = storage {
         // The writer task owns eviction but cannot see `Tuning`: hand it the cap

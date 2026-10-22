@@ -109,8 +109,9 @@ impl SharedLimiter {
     /// Consume one request. `Err(retry_after_secs)` = limited.
     pub async fn try_acquire(&self) -> Result<(), u64> {
         match self {
-            // Same rounding the middleware always applied to the local bucket.
-            Self::Local(l) => l.try_take().map_err(|d| d.as_secs().max(1)),
+            // Round up: a client that sleeps exactly the advertised time must find
+            // the bucket refilled (truncating 2.4 s to 2 s answers 429 again).
+            Self::Local(l) => l.try_take().map_err(crate::middleware::retry_after_secs_of),
             Self::Redis(r) => r.try_acquire().await,
         }
     }

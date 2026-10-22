@@ -98,6 +98,12 @@ pub struct Tuning {
     pub ui_refresh_secs: u64,
     /// Keep-alive ping interval on the SSE stream (proxies drop idle streams).
     pub sse_keepalive_secs: u64,
+    /// How long a graceful shutdown waits for in-flight responses before it
+    /// gives up on them (they are aborted) and flushes state.
+    pub shutdown_grace_secs: u64,
+    /// How long a client may take to send (each chunk of) a request body.
+    /// Bounds slowloris; 0 is not allowed because it would disable the guard.
+    pub client_body_timeout_secs: u64,
     /// How long the per-account quota snapshot is reused.
     pub quota_cache_ttl_secs: u64,
     /// Responses API store size: how many `resp_*` records are kept so a
@@ -126,6 +132,8 @@ impl Default for Tuning {
             token_refresh_window_secs: 300,
             ui_refresh_secs: 3,
             sse_keepalive_secs: 15,
+            shutdown_grace_secs: 10,
+            client_body_timeout_secs: 30,
             quota_cache_ttl_secs: 60,
             response_store_max: 1000,
         }
@@ -159,6 +167,14 @@ impl Tuning {
     }
     pub fn sse_keepalive(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.sse_keepalive_secs.max(1))
+    }
+    /// How long a graceful shutdown may wait for open responses.
+    pub fn shutdown_grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.shutdown_grace_secs.clamp(1, 120))
+    }
+    /// Per-chunk request-body read deadline (slowloris guard).
+    pub fn client_body_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.client_body_timeout_secs.clamp(1, 300))
     }
     pub fn quota_cache_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.quota_cache_ttl_secs.max(1))
@@ -207,6 +223,14 @@ impl Tuning {
         anyhow::ensure!(
             matches!(self.sticky_mode.as_str(), "hash" | "map"),
             "tuning.sticky_mode must be \"hash\" or \"map\""
+        );
+        anyhow::ensure!(
+            (1..=120).contains(&self.shutdown_grace_secs),
+            "tuning.shutdown_grace_secs must be between 1 and 120"
+        );
+        anyhow::ensure!(
+            (1..=300).contains(&self.client_body_timeout_secs),
+            "tuning.client_body_timeout_secs must be between 1 and 300"
         );
         anyhow::ensure!(
             (1..=86_400).contains(&self.sticky_ttl_secs),
@@ -301,6 +325,25 @@ impl Config {
             );
         }
         self.tuning.validate()?;
+        // A one-character master key is a typo, not a key: the dashboard path
+        // already requires 8, so the TOML path must agree or the API is
+        // "protected" by something guessable.
+        for (name, value) in [
+            ("api_key", self.server.api_key.as_deref()),
+            ("admin_key", self.server.admin_key.as_deref()),
+        ] {
+            if let Some(secret) = value {
+                anyhow::ensure!(
+                    !secret.trim().is_empty(),
+                    "server.{name} must not be blank (remove the field to disable it)"
+                );
+                anyhow::ensure!(
+                    secret.trim().len() >= 8,
+                    "server.{name} must be at least 8 characters"
+                );
+            }
+        }
+        self.tuning.validate()?;
         anyhow::ensure!(
             matches!(self.ratelimit.backend.as_str(), "local" | "redis"),
             "ratelimit.backend must be \"local\" or \"redis\""
@@ -333,15 +376,62 @@ impl Config {
             !self.server.listen.trim().is_empty(),
             "server.listen is empty"
         );
+        // A listener without a port cannot be bound.
+        anyhow::ensure!(
+            self.server.listen.contains(':'),
+            "server.listen must look like host:port (got '{}')",
+            self.server.listen
+        );
+        // Ranges, not just types — the same ones POST /api/server/update
+        // enforces. Out-of-range values are accepted by serde but break the
+        // gateway in ways that are hard to diagnose afterwards.
+        //
         // run_target() would silently clamp 0 to 1; a config that cannot be
         // served as written should be rejected instead.
         anyhow::ensure!(
-            self.server.max_retries >= 1,
-            "server.max_retries must be >= 1"
+            (1..=32).contains(&self.server.max_retries),
+            "server.max_retries must be between 1 and 32"
         );
         anyhow::ensure!(
-            self.server.attempt_timeout_secs >= 1,
-            "server.attempt_timeout_secs must be >= 1"
+            (1..=3600).contains(&self.server.attempt_timeout_secs),
+            "server.attempt_timeout_secs must be between 1 and 3600"
+        );
+        // The body limit is a layer installed at startup; 0 would turn every
+        // POST into an immediate 413, while an unbounded value lets one upload
+        // eat the process's memory.
+        anyhow::ensure!(
+            (1024..=256 * 1024 * 1024).contains(&self.server.max_body_bytes),
+            "server.max_body_bytes must be between 1024 and 268435456"
+        );
+        anyhow::ensure!(
+            self.server.events_history <= 100_000,
+            "server.events_history must be <= 100000"
+        );
+        anyhow::ensure!(
+            self.server.requests_history <= 100_000,
+            "server.requests_history must be <= 100000"
+        );
+        anyhow::ensure!(
+            self.server.models_refresh_secs <= 86_400,
+            "server.models_refresh_secs must be <= 86400"
+        );
+        // A zero window makes the brute-force guard forget every attempt as it
+        // is counted, which silently disables the lockout entirely.
+        anyhow::ensure!(
+            (1..=10_000).contains(&self.server.auth_fail_burst),
+            "server.auth_fail_burst must be between 1 and 10000"
+        );
+        anyhow::ensure!(
+            (1..=3600).contains(&self.server.auth_fail_window_secs),
+            "server.auth_fail_window_secs must be between 1 and 3600"
+        );
+        anyhow::ensure!(
+            self.server.client_key_max_concurrent <= 10_000,
+            "server.client_key_max_concurrent must be <= 10000"
+        );
+        anyhow::ensure!(
+            matches!(self.server.log_format.as_str(), "text" | "json"),
+            "server.log_format must be \"text\" or \"json\""
         );
 
         let mut names = std::collections::HashSet::new();
@@ -359,14 +449,39 @@ impl Config {
                 "provider '{}': drain_below_pct must be <= 100",
                 p.name
             );
-            // A provider with no credentials can never serve a request, and the
-            // runtime rejects it — so treat it as a config error here, before an
-            // edit is written to disk.
-            anyhow::ensure!(
-                !p.keys.is_empty() || !p.accounts.is_empty(),
-                "provider '{}' has no keys or accounts",
-                p.name
-            );
+            // A provider with no credentials can never serve a request. The
+            // per-kind check below mirrors `Provider::from_config` exactly:
+            // validate() is what guards the config file, so anything it accepts
+            // and the runtime rejects would brick the next start.
+            match p.kind {
+                ProviderKind::OpenaiCompat | ProviderKind::Gemini | ProviderKind::Anthropic => {
+                    anyhow::ensure!(
+                        !p.keys.is_empty(),
+                        "provider '{}': no keys configured",
+                        p.name
+                    );
+                    // anthropic has a built-in default endpoint; the other two
+                    // must say where to send the request.
+                    anyhow::ensure!(
+                        !p.base_url.trim_end_matches('/').is_empty()
+                            || matches!(p.kind, ProviderKind::Anthropic),
+                        "provider '{}': base_url is required",
+                        p.name
+                    );
+                }
+                ProviderKind::Antigravity | ProviderKind::Codex => {
+                    let auth_cmd = if matches!(p.kind, ProviderKind::Antigravity) {
+                        "anyhop auth antigravity"
+                    } else {
+                        "anyhop auth codex"
+                    };
+                    anyhow::ensure!(
+                        !p.accounts.is_empty(),
+                        "provider '{}': no accounts configured (run `{auth_cmd}`)",
+                        p.name
+                    );
+                }
+            }
             // A repeated secret is counted twice in rotation and in the stats
             // (the dashboard "add key" path already rejects duplicates).
             let mut seen = std::collections::HashSet::new();
@@ -428,9 +543,6 @@ impl Config {
                     rpm > 0 || burst == 0,
                     "client_keys[{i}]: 'burst' set without 'rpm' (add rpm = <requests per minute>)"
                 );
-                if rpm > 0 && burst > 0 {
-                    anyhow::ensure!(burst >= 1, "client_keys[{i}]: 'burst' must be at least 1");
-                }
             }
         }
         Ok(())
@@ -593,10 +705,55 @@ fn default_attempt_timeout_secs() -> u64 {
 
 /// Atomic config write: temp file + rename — a crash mid-write must not
 /// leave a truncated TOML that bricks the next startup.
+///
+/// The config holds provider API keys and OAuth refresh tokens, so the file must
+/// stay owner-only: `fs::write` created the temporary with the process umask
+/// (0644) and the rename carried that mode over the 0600 file the operator had.
+/// The temporary is created with `create_new` + 0600, which also means a symlink
+/// planted at that path cannot redirect the write, and it gets a unique name so
+/// two processes sharing a config cannot clobber each other's temporary.
 pub fn write_atomic(path: &str, contents: &str) -> std::io::Result<()> {
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)
+    let tmp = temp_path(path);
+    let write = || -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(contents.as_bytes())?;
+            f.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&tmp, contents)?;
+        }
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // Rename keeps the temporary's 0600 mode, so the config never becomes
+    // group/world readable.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// A unique sibling path for the atomic write: `<path>.tmp.<pid>.<counter>`.
+/// Uniqueness only has to survive concurrent writers, so pid + process-local
+/// counter is enough and needs no randomness.
+fn temp_path(path: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{path}.tmp.{}.{n}", std::process::id())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -684,4 +841,263 @@ pub enum Strategy {
     /// Stick to the first available key until it gets rate-limited, then the next.
     /// Best for per-key daily quotas (e.g. Gemini free tier).
     FillFirst,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal valid config: one openai_compat provider with one key.
+    const VALID: &str = r#"
+        [server]
+        listen = "127.0.0.1:8080"
+
+        [[providers]]
+        name = "p"
+        type = "openai_compat"
+        base_url = "http://127.0.0.1:9/v1"
+        keys = ["sk-1"]
+    "#;
+
+    fn parse(toml_text: &str) -> Config {
+        toml::from_str(toml_text).expect("the fixture parses")
+    }
+
+    fn error_of(toml_text: &str) -> String {
+        parse(toml_text)
+            .validate()
+            .expect_err("this config must be rejected")
+            .to_string()
+    }
+
+    // ----- A: validate() mirrors Provider::from_config -----
+
+    #[test]
+    fn a_valid_config_still_validates() {
+        parse(VALID)
+            .validate()
+            .expect("the baseline config is valid");
+    }
+
+    /// Every shape `Provider::from_config` rejects must be rejected here too:
+    /// write_validated() only runs validate(), so an accepted-but-unbuildable
+    /// config used to be written to disk and then fail the *next* `anyhop` start.
+    #[test]
+    fn a_missing_or_empty_base_url_is_rejected_before_the_write() {
+        for kind in ["openai_compat", "gemini"] {
+            let text = format!(
+                r#"
+                [[providers]]
+                name = "p"
+                type = "{kind}"
+                keys = ["sk-1"]
+                "#
+            );
+            let e = error_of(&text);
+            assert!(
+                e.contains("base_url is required"),
+                "{kind}: unexpected error: {e}"
+            );
+
+            let blank = format!(
+                r#"
+                [[providers]]
+                name = "p"
+                type = "{kind}"
+                base_url = ""
+                keys = ["sk-1"]
+                "#
+            );
+            assert!(
+                error_of(&blank).contains("base_url is required"),
+                "{kind}: an empty base_url must be rejected"
+            );
+        }
+    }
+
+    /// anthropic has a default endpoint, so an empty base_url stays valid there.
+    #[test]
+    fn anthropic_needs_no_base_url() {
+        let text = r#"
+            [[providers]]
+            name = "claude"
+            type = "anthropic"
+            keys = ["sk-ant"]
+        "#;
+        parse(text)
+            .validate()
+            .expect("anthropic has a default base_url");
+    }
+
+    #[test]
+    fn an_oauth_provider_with_keys_but_no_accounts_is_rejected() {
+        for kind in ["antigravity", "codex"] {
+            let text = format!(
+                r#"
+                [[providers]]
+                name = "p"
+                type = "{kind}"
+                keys = ["sk-1"]
+                "#
+            );
+            let e = error_of(&text);
+            assert!(
+                e.contains("no accounts configured"),
+                "{kind}: unexpected error: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_provider_with_accounts_but_no_keys_is_rejected() {
+        let text = r#"
+            [[providers]]
+            name = "g"
+            type = "gemini"
+            base_url = "http://127.0.0.1:9/v1beta"
+
+            [[providers.accounts]]
+            email = "x@example.com"
+            access_token = "tok"
+        "#;
+        let e = error_of(text);
+        assert!(e.contains("no keys configured"), "unexpected error: {e}");
+    }
+
+    // ----- I: ranges that disable safety features -----
+
+    #[test]
+    fn out_of_range_server_values_are_rejected() {
+        // (toml body, the fragment the error must name)
+        let cases = [
+            ("max_retries = 0", "max_retries"),
+            ("max_retries = 33", "max_retries"),
+            (
+                "max_retries = 1000000",
+                "max_retries", // a huge value spins the retry loop
+            ),
+            ("attempt_timeout_secs = 0", "attempt_timeout_secs"),
+            ("max_body_bytes = 0", "max_body_bytes"),
+            ("events_history = 100001", "events_history"),
+            ("requests_history = 100001", "requests_history"),
+            ("models_refresh_secs = 86401", "models_refresh_secs"),
+            ("auth_fail_burst = 0", "auth_fail_burst"),
+            (
+                // A zero window made the brute-force lockout forget every
+                // attempt: the counter was reset as it was counted.
+                "auth_fail_window_secs = 0",
+                "auth_fail_window_secs",
+            ),
+            (
+                "client_key_max_concurrent = 10001",
+                "client_key_max_concurrent",
+            ),
+            ("log_format = \"xml\"", "log_format"),
+        ];
+        for (line, field) in cases {
+            let text = format!(
+                r#"
+                [server]
+                {line}
+
+                [[providers]]
+                name = "p"
+                type = "openai_compat"
+                base_url = "http://127.0.0.1:9/v1"
+                keys = ["sk-1"]
+                "#
+            );
+            let e = error_of(&text);
+            assert!(
+                e.contains(field),
+                "config with '{line}' must be rejected naming {field}, got: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_boundary_values_the_dashboard_accepts_still_validate() {
+        let text = r#"
+            [server]
+            max_retries = 32
+            attempt_timeout_secs = 3600
+            max_body_bytes = 1024
+            events_history = 100000
+            requests_history = 100000
+            auth_fail_burst = 1
+            auth_fail_window_secs = 3600
+            models_refresh_secs = 86400
+
+            [[providers]]
+            name = "p"
+            type = "openai_compat"
+            base_url = "http://127.0.0.1:9/v1"
+            keys = ["sk-1"]
+        "#;
+        parse(text)
+            .validate()
+            .expect("the documented boundary values are valid");
+    }
+
+    // ----- M: the config file holds secrets and must stay owner-only -----
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_leaves_an_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "anyhop-cfg-perm-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("anyhop.toml");
+        // Pre-create it world-readable, the way an old `fs::write` would have:
+        // the rewrite must not inherit that mode.
+        std::fs::write(&path, "listen = \"127.0.0.1:1\"\n").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let p = path.to_str().expect("utf-8 path");
+
+        write_atomic(p, "max_retries = 7\n").expect("write");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "the config holds provider keys and OAuth tokens; mode {mode:o} is not owner-only"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "max_retries = 7\n"
+        );
+        // No temporary left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("list")
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_uses_a_unique_temp_name_per_call() {
+        let dir = std::env::temp_dir().join(format!(
+            "anyhop-cfg-tmp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("anyhop.toml");
+        let p = path.to_str().expect("utf-8 path");
+        // Two writers sharing the path (a multi-instance deployment points both
+        // at the same file) must not race on one fixed ".tmp" name.
+        let a = temp_path(p);
+        let b = temp_path(p);
+        assert_ne!(a, b, "the temporary path must not be shared");
+        write_atomic(p, "x = 1\n").expect("write");
+        write_atomic(p, "x = 2\n").expect("write");
+        assert_eq!(std::fs::read_to_string(p).expect("read"), "x = 2\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -19,6 +19,75 @@ pub(super) fn internal_body_error() -> Response {
     )
 }
 
+/// Why one target produced no answer.
+///
+/// `KeyPool::pick` returning `None` is ambiguous — "every key is momentarily at
+/// its in-flight cap" and "no key can serve this model" are different answers
+/// for the client — so the retry loop records what actually happened instead of
+/// guessing at the end.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum TargetFailure {
+    /// Keys are alive but every in-flight slot is taken: retry shortly.
+    Capacity { attempts: usize },
+    /// No key can serve the model right now (cooling down / dead / empty pool).
+    Unavailable {
+        attempts: usize,
+        wake: Option<Duration>,
+    },
+    /// The upstream answered 2xx with something that is not a completion.
+    BadBody {
+        attempts: usize,
+        content_type: String,
+    },
+}
+
+/// Turn a target failure into the client's answer.
+pub(super) fn failure_response(provider: &str, failure: TargetFailure) -> Response {
+    match failure {
+        TargetFailure::Capacity { attempts } => busy_response(provider, attempts),
+        TargetFailure::Unavailable { attempts, wake } => {
+            exhausted_response(provider, attempts, wake)
+        }
+        TargetFailure::BadBody {
+            attempts,
+            content_type,
+        } => {
+            let got = if content_type.is_empty() {
+                "a body with no content type".to_string()
+            } else {
+                format!("'{content_type}'")
+            };
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "provider '{provider}' answered 2xx with {got} instead of a completion \
+                     after {attempts} attempt(s)"
+                ),
+                "upstream_error",
+            )
+        }
+    }
+}
+
+/// The gateway is saturated: the keys are healthy, there is simply no in-flight
+/// slot free. That is "come back in a moment", not "this provider is down" — so
+/// it is a 429 with a Retry-After instead of a bare 503 (and never a 503 without
+/// the header, which leaves the client to guess).
+pub(super) fn busy_response(provider: &str, attempts: usize) -> Response {
+    let mut resp = error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "provider '{provider}' is at its concurrency limit \
+             ({attempts} upstream attempt(s) made); retry shortly"
+        ),
+        "rate_limit_exceeded",
+    );
+    if let Ok(v) = header::HeaderValue::from_str("1") {
+        resp.headers_mut().insert(header::RETRY_AFTER, v);
+    }
+    resp
+}
+
 pub(super) fn exhausted_response(
     provider: &str,
     attempts: usize,
@@ -32,14 +101,27 @@ pub(super) fn exhausted_response(
     // Tell the client when it is worth retrying: without this a single-key
     // provider that just went into a 5s cooldown looks permanently down.
     if let Some(d) = retry_after
-        && let Ok(v) = header::HeaderValue::from_str(&d.as_secs().max(1).to_string())
+        && let Ok(v) =
+            header::HeaderValue::from_str(&crate::middleware::retry_after_secs_of(d).to_string())
     {
         resp.headers_mut().insert(header::RETRY_AFTER, v);
     }
     resp
 }
 
+/// Longest cooldown a single header may request.
+///
+/// A reset time is attacker-influenced (it comes from the upstream's response
+/// headers), and a cooldown pins keys out of rotation: allowing a day is already
+/// generous, allowing a week or a millennium is a self-inflicted outage.
+const MAX_RESET: Duration = Duration::from_secs(24 * 3600);
+
 /// Parse OpenAI-style reset durations: "500ms", "1s", "1m30s", "2h5m".
+///
+/// Every value here is untrusted, so nothing is fed to `Duration::from_secs_f64`
+/// before it is proven finite, non-negative and bounded — that constructor panics
+/// on NaN/inf/out-of-range, and `"999999999999999999999999999999s"` (1e30) is a
+/// perfectly legal header value.
 pub(super) fn parse_reset_duration(s: &str) -> Option<Duration> {
     let mut total = Duration::ZERO;
     let mut num = String::new();
@@ -55,14 +137,25 @@ pub(super) fn parse_reset_duration(s: &str) -> Option<Duration> {
             return None;
         }
         let v: f64 = num.parse().ok()?;
-        let d = match unit.as_str() {
-            "ms" => Duration::from_secs_f64(v / 1000.0),
-            "s" => Duration::from_secs_f64(v),
-            "m" => Duration::from_secs_f64(v * 60.0),
-            "h" => Duration::from_secs_f64(v * 3600.0),
+        let scale = match unit.as_str() {
+            "ms" => 0.001,
+            "s" => 1.0,
+            "m" => 60.0,
+            "h" => 3600.0,
             _ => return None,
         };
-        total += d;
+        let secs = v * scale;
+        if !secs.is_finite() || secs < 0.0 || secs > MAX_RESET.as_secs_f64() {
+            return None;
+        }
+        // checked_add: a header full of components must not wrap the total.
+        total = total.checked_add(Duration::from_secs_f64(secs))?;
+        // Clamp instead of rejecting a *sum* that adds up to more than a day:
+        // "cool down for a long time" is still a meaningful instruction, it just
+        // does not get to disable the pool for a week.
+        if total > MAX_RESET {
+            total = MAX_RESET;
+        }
         num.clear();
         unit.clear();
         Some(())
@@ -197,6 +290,70 @@ mod tests {
         }
     }
 
+    // ----- how a target failure is answered -----
+
+    /// A saturated gateway must say "retry shortly" *with* a Retry-After, not
+    /// "unavailable after 4 attempts" (which also lied about the attempt count).
+    #[test]
+    fn a_saturated_gateway_answers_429_with_retry_after() {
+        let resp = busy_response("openai", 0);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024);
+        let body = futures::executor::block_on(body).expect("the body collects");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON envelope");
+        assert_eq!(v["error"]["type"], "rate_limit_exceeded");
+        assert_eq!(v["error"]["code"], 429);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("0 upstream attempt"),
+            "{v}"
+        );
+    }
+
+    /// A 2xx in the wrong protocol is an upstream failure with its own answer.
+    #[test]
+    fn a_non_completion_body_is_a_502_naming_the_content_type() {
+        let resp = failure_response(
+            "upstream",
+            TargetFailure::BadBody {
+                attempts: 2,
+                content_type: "text/html".into(),
+            },
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// The exhaustion message must carry the attempts that were really made.
+    #[test]
+    fn exhaustion_reports_the_real_attempt_count() {
+        let resp = failure_response(
+            "upstream",
+            TargetFailure::Unavailable {
+                attempts: 0,
+                wake: Some(Duration::from_secs(3)),
+            },
+        );
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = futures::executor::block_on(axum::body::to_bytes(resp.into_body(), 64 * 1024))
+            .expect("the body collects");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON envelope");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("after 0 attempts"),
+            "{v}"
+        );
+    }
+
     // ----- Retry-After / x-ratelimit-reset parsing -----
 
     #[test]
@@ -227,5 +384,44 @@ mod tests {
         assert_eq!(parse_reset_duration("5x"), None);
         assert_eq!(parse_reset_duration("0s"), None);
         assert_eq!(parse_reset_duration("-5s"), None);
+    }
+
+    /// A hostile header used to reach `Duration::from_secs_f64(1e30)`, which
+    /// panics — in the retry loop, so the connection (and the task) died.
+    #[test]
+    fn an_absurd_reset_header_is_rejected_without_panicking() {
+        for hostile in [
+            "999999999999999999999999999999s",
+            "999999999999999999999999999999999999999999999999ms",
+            "999999999999999999999999999999m",
+            "999999999999999999999999999999h",
+            "1e300s",
+            // 25h in one component: beyond the ceiling, refused outright.
+            "90000s",
+            "25h",
+        ] {
+            assert_eq!(parse_reset_duration(hostile), None, "{hostile}");
+        }
+        // ...and a real long cooldown still parses, clamped to the ceiling.
+        assert_eq!(parse_reset_duration("24h"), Some(MAX_RESET));
+        assert_eq!(
+            parse_reset_duration("1h1h1h1h1h1h1h1h1h1h1h1h1h1h1h1h1h1h1h1h1h1h1h1h1h1h"),
+            Some(MAX_RESET),
+            "a total over the ceiling is clamped, not wrapped or rejected"
+        );
+        assert_eq!(
+            parse_reset_duration("3h30m"),
+            Some(Duration::from_secs(3 * 3600 + 30 * 60))
+        );
+    }
+
+    /// `total += d` overflowed before; many components now stay bounded.
+    #[test]
+    fn many_components_cannot_overflow_the_total() {
+        let mut s = String::new();
+        for _ in 0..100_000 {
+            s.push_str("23h59m");
+        }
+        assert_eq!(parse_reset_duration(&s), Some(MAX_RESET));
     }
 }

@@ -669,7 +669,7 @@ pub async fn start_auth_with(
         builder = builder.proxy(reqwest::Proxy::all(p)?);
     }
     let http = builder.build()?;
-    let state = format!("{:x}", now_ms());
+    let state = random_oauth_state()?;
     match redirect_uri {
         Some(uri) => {
             let url = build_auth_url_with(&state, uri);
@@ -700,6 +700,18 @@ pub async fn start_auth_with(
             })
         }
     }
+}
+
+/// A fresh OAuth `state` for one flow: 32 bytes from the OS CSPRNG, hex-encoded.
+///
+/// This was `format!("{:x}", now_ms())` — the wall clock in hex, i.e. fully
+/// predictable within a wide window. Since the callback is unauthenticated (a
+/// browser redirect cannot carry the admin key), a guessable `state` let an
+/// attacker finish a victim's flow with their own account.
+pub(crate) fn random_oauth_state() -> anyhow::Result<String> {
+    let mut raw = [0u8; 32];
+    getrandom::fill(&mut raw).map_err(|e| anyhow::anyhow!("CSPRNG unavailable: {e}"))?;
+    Ok(hex::encode(raw))
 }
 
 pub fn loopback_redirect_uri() -> String {
@@ -953,6 +965,54 @@ mod token_rotation_tests {
             acc.state.lock().await.refresh_token.as_deref(),
             Some("1//config")
         );
+    }
+}
+
+#[cfg(test)]
+mod oauth_state_tests {
+    use super::*;
+
+    /// The `state` used to be `format!("{:x}", now_ms())` — the wall clock in hex.
+    /// The callback route has no admin key, so a predictable state lets an
+    /// attacker finish a victim's flow with their own Google account (antigravity
+    /// sends no PKCE, so the code alone is enough).
+    #[tokio::test]
+    async fn each_flow_gets_an_unpredictable_state() {
+        // The headless branch does not bind the loopback port, so two flows fit.
+        let mut seen = std::collections::HashSet::new();
+        let mut clock_hex = std::collections::HashSet::new();
+        for _ in 0..8 {
+            let flow = start_auth_with(
+                None,
+                &crate::config::Tuning::default(),
+                Some("https://gw.example.com/api/auth/callback"),
+            )
+            .await
+            .expect("headless flow");
+            assert_eq!(flow.state.len(), 64, "32 bytes, hex-encoded");
+            assert!(
+                flow.state.chars().all(|c| c.is_ascii_hexdigit()),
+                "{}",
+                flow.state
+            );
+            assert!(
+                flow.url.contains(&format!("state={}", flow.state)),
+                "the URL must carry the same state: {}",
+                flow.url
+            );
+            assert!(seen.insert(flow.state.clone()), "states must not repeat");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            clock_hex.insert(format!("{now:x}"));
+        }
+        for clock in clock_hex {
+            assert!(
+                !seen.contains(&clock),
+                "a state equal to the current clock in hex is predictable"
+            );
+        }
     }
 }
 
