@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::Digest;
 
+use base64::Engine as _;
 use serde_json::{Value, json};
 use tracing::warn;
 
@@ -540,16 +541,37 @@ pub fn unwrap_response(v: Value) -> Value {
 
 // ---------- OAuth authorization-code flow (for `anyhop auth antigravity`) ----------
 
-pub fn build_auth_url(state: &str) -> String {
-    build_auth_url_with(state, &loopback_redirect_uri())
+/// The authorize URL for a flow started by [`start_auth_with`].
+///
+/// Kept for callers that only need the URL to display; the PKCE challenge is part
+/// of the flow, so this now takes it explicitly.
+pub fn build_auth_url(state: &str, challenge: &str) -> String {
+    build_auth_url_with(state, &loopback_redirect_uri(), challenge)
 }
 
-pub fn build_auth_url_with(state: &str, redirect_uri: &str) -> String {
+pub fn build_auth_url_with(state: &str, redirect_uri: &str, challenge: &str) -> String {
+    // PKCE (RFC 7636, S256). Without it, anyone who obtains a code for this public
+    // client_id + redirect_uri could exchange it — the state token stops that only
+    // for flows that are still pending.
     format!(
-        "{AUTH_ENDPOINT}?access_type=offline&client_id={CLIENT_ID}&prompt=consent&redirect_uri={}&response_type=code&scope={}&state={state}",
+        "{AUTH_ENDPOINT}?access_type=offline&client_id={CLIENT_ID}&prompt=consent&redirect_uri={}&response_type=code&scope={}&state={state}&code_challenge={challenge}&code_challenge_method=S256",
         urlencoded(redirect_uri),
         urlencoded(&SCOPES.join(" ")),
     )
+}
+
+/// PKCE code verifier: 43-128 characters from the RFC 7636 alphabet, from a CSPRNG.
+fn random_verifier() -> anyhow::Result<String> {
+    let mut raw = [0u8; 48];
+    getrandom::fill(&mut raw).map_err(|e| anyhow::anyhow!("CSPRNG unavailable: {e}"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw))
+}
+
+/// S256 challenge: base64url(sha256(verifier)) without padding.
+pub fn pkce_challenge(verifier: &str) -> String {
+    use sha2::Digest;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(verifier.as_bytes()))
 }
 
 pub fn urlencoded(s: &str) -> String {
@@ -574,6 +596,7 @@ pub async fn exchange_code(
     http: &reqwest::Client,
     code: &str,
     redirect_uri: &str,
+    verifier: &str,
 ) -> anyhow::Result<AuthTokens> {
     let resp = http
         .post(TOKEN_ENDPOINT)
@@ -582,6 +605,8 @@ pub async fn exchange_code(
             ("client_id", CLIENT_ID),
             ("client_secret", CLIENT_SECRET),
             ("redirect_uri", redirect_uri),
+            // Proves this is the same client that started the flow (RFC 7636).
+            ("code_verifier", verifier),
             ("grant_type", "authorization_code"),
         ])
         .send()
@@ -635,6 +660,8 @@ fn needs_refresh(expires_at_ms: u64, now_ms: u64, window_ms: u64) -> bool {
 pub struct PendingAuth {
     pub url: String,
     pub state: String,
+    /// PKCE verifier; sent as `code_verifier` on the token exchange.
+    verifier: String,
     /// Redirect URI sent to the provider; must match the one in the auth URL.
     pub redirect_uri: String,
     /// Present for the loopback flow only. `None` = headless, the code arrives
@@ -670,12 +697,15 @@ pub async fn start_auth_with(
     }
     let http = builder.build()?;
     let state = random_oauth_state()?;
+    let verifier = random_verifier()?;
+    let challenge = pkce_challenge(&verifier);
     match redirect_uri {
         Some(uri) => {
-            let url = build_auth_url_with(&state, uri);
+            let url = build_auth_url_with(&state, uri, &challenge);
             Ok(PendingAuth {
                 url,
                 state,
+                verifier,
                 redirect_uri: uri.to_string(),
                 listener: None,
                 http,
@@ -683,7 +713,7 @@ pub async fn start_auth_with(
         }
         None => {
             let uri = loopback_redirect_uri();
-            let url = build_auth_url_with(&state, &uri);
+            let url = build_auth_url_with(&state, &uri, &challenge);
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
                 .await
                 .map_err(|e| {
@@ -694,6 +724,7 @@ pub async fn start_auth_with(
             Ok(PendingAuth {
                 url,
                 state,
+                verifier,
                 redirect_uri: uri,
                 listener: Some(listener),
                 http,
@@ -785,7 +816,7 @@ pub async fn complete_with_code(p: PendingAuth, code: &str) -> anyhow::Result<Au
 }
 
 async fn finish(p: PendingAuth, code: &str) -> anyhow::Result<AuthOutcome> {
-    let tokens = exchange_code(&p.http, code, &p.redirect_uri).await?;
+    let tokens = exchange_code(&p.http, code, &p.redirect_uri, &p.verifier).await?;
     let email = fetch_email(&p.http, &tokens.access_token).await;
 
     // Best-effort project discovery so the snippet is complete.
@@ -1043,5 +1074,47 @@ mod refresh_window_tests {
     fn a_zero_window_refreshes_only_on_expiry() {
         assert!(!needs_refresh(1, 0, 0));
         assert!(needs_refresh(0, 1, 0));
+    }
+}
+
+#[cfg(test)]
+mod pkce_tests {
+    use super::*;
+
+    /// RFC 7636 Appendix B: verifier → S256 challenge.
+    #[test]
+    fn pkce_challenge_matches_rfc7636() {
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    /// The verifier must come from the CSPRNG and fit the RFC alphabet/length.
+    #[test]
+    fn verifiers_are_random_and_well_formed() {
+        let a = random_verifier().expect("csprng");
+        let b = random_verifier().expect("csprng");
+        assert_ne!(a, b);
+        assert!((43..=128).contains(&a.len()), "len {}", a.len());
+        assert!(a.bytes().all(|c| c.is_ascii_alphanumeric()
+            || c == b'-'
+            || c == b'_'
+            || c == b'.'
+            || c == b'~'));
+    }
+
+    /// The authorize URL must carry the challenge (and never the verifier).
+    #[test]
+    fn the_authorize_url_carries_the_challenge_only() {
+        let verifier = random_verifier().expect("csprng");
+        let challenge = pkce_challenge(&verifier);
+        let url = build_auth_url_with("st4te", "http://127.0.0.1:1/cb", &challenge);
+        assert!(url.contains(&format!("code_challenge={challenge}")));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(
+            !url.contains(&verifier),
+            "the verifier must never appear in a URL the browser sees"
+        );
     }
 }
