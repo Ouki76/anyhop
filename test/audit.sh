@@ -69,6 +69,18 @@ else
 fi
 
 echo "== dependencies =="
+if command -v cargo-audit >/dev/null 2>&1; then
+    # A dependency advisory is a real vulnerability in this binary, not a style
+    # issue: fail the audit when the tree carries one.
+    ADV=$(cargo audit 2>/dev/null | grep -cE "^Crate:")
+    if [ "$ADV" = "0" ]; then
+        ok "cargo audit: no known advisories"
+    else
+        fail "cargo audit: $ADV advisory(ies) in the dependency tree"
+    fi
+else
+    warn "cargo-audit is not installed: dependency advisories unchecked"
+fi
 DIRECT=$(sed -n '/^\[dependencies\]/,/^\[/p' Cargo.toml | grep -cE "^[a-z]")
 ok "direct dependencies: $DIRECT"
 # Every dependency should be justified somewhere we can point at in review.
