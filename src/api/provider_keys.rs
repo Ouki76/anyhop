@@ -912,7 +912,9 @@ mod edit_tests {
         assert_eq!(added.keys, vec!["sk-new".to_string()]);
         assert_eq!(added.capabilities, vec!["images".to_string()]);
         assert!(
-            std::fs::read_to_string(&path).unwrap().contains("keep this comment"),
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("keep this comment"),
             "the operator's comments must survive the edit"
         );
         // The live router follows (reload_config ran).

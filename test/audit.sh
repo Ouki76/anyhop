@@ -101,7 +101,14 @@ else
 fi
 
 if [ "$QUICK" = "0" ]; then
-    echo "== integration =="
+    echo "== fuzz =="
+if ANYHOP_FUZZ_ITERS=20000 cargo test --offline --test fuzz_parsers >/tmp/anyhop-fuzz.log 2>&1; then
+    ok "fuzz parsers: $(grep -oE '[0-9]+ passed' /tmp/anyhop-fuzz.log | head -1) (8 targets)"
+else
+    fail "fuzz parsers (see /tmp/anyhop-fuzz.log)"
+fi
+
+echo "== integration =="
     if [ -n "${ANYHOP_TEST_PORT:-}" ] || ! ss -ltn 2>/dev/null | grep -q ":18080 "; then
         OUT=$(ANYHOP_TEST_PORT="${ANYHOP_TEST_PORT:-18091}" timeout 1500 ./test/run_all.sh ./target/release/anyhop 2>&1 | tail -3)
         if echo "$OUT" | grep -q "FAIL=0"; then
