@@ -724,6 +724,54 @@ mod tests {
         }
     }
 
+    /// A loopback upstream that streams events until the connection dies, and
+    /// records the moment its peer (the gateway) hung up.
+    ///
+    /// A client disconnect is invisible to a stream that ends on its own:
+    /// something has to keep writing after the gateway is gone. This one writes
+    /// every 20 ms for ~20 s, so `peer_gone` flips within one write of the
+    /// gateway dropping the upstream body — long before the stream would have
+    /// ended by itself.
+    async fn endless_stream(peer_gone: Arc<std::sync::atomic::AtomicBool>) -> reqwest::Response {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("local address");
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut head = [0u8; 2048];
+            let _ = sock.read(&mut head).await;
+            let header = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                           connection: close\r\n\r\n";
+            if sock.write_all(header).await.is_err() {
+                peer_gone.store(true, Ordering::SeqCst);
+                return;
+            }
+            for _ in 0..1000 {
+                if sock.write_all(b"data: tick\n\n").await.is_err() {
+                    // The gateway is gone: the write went nowhere.
+                    peer_gone.store(true, Ordering::SeqCst);
+                    return;
+                }
+                let _ = sock.flush().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("build a test client")
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("the loopback upstream starts streaming")
+    }
+
     /// 2.3: the in-flight counter is the pool's admission control *and* a
     /// dashboard field. Releasing the `KeyGuard` when the handler returned used to
     /// free the slot while the client was still reading: `/api/providers` showed 0
@@ -768,7 +816,7 @@ mod tests {
 
         let provider = provider(OPENAI_PROVIDER);
         let peer_gone = Arc::new(AtomicBool::new(false));
-        let upstream = crate::sse::test_support::endless_stream(peer_gone.clone()).await;
+        let upstream = endless_stream(peer_gone.clone()).await;
         let body = open_body(upstream, Duration::from_secs(5))
             .await
             .expect("the body opens");

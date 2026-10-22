@@ -9,6 +9,25 @@ Severity follows the usual ladder: **C**ritical = remote outage / auth bypass /
 secret leak; **H**igh = cheap DoS, data exposure, broken promise; **M**edium =
 hardening gap or resource limit; **L**ow = hygiene.
 
+## Round 3 (full-project audit: core, API, translations, chaos)
+
+Three independent read-only audits (key pool/config/storage, provider
+translations, API+dashboard) plus a chaos harness produced 30 findings that
+reproduced; all are fixed with tests. The high-water marks:
+
+| Sev | Where | What | Fix |
+| --- | --- | --- | --- |
+| C | `api/persist.rs`, `config.rs` | `validate()` accepted configs `from_config` rejects, and the file was written *before* the reload proved it buildable — a dashboard save could make the next start exit. | Per-kind invariants mirroring `from_config`; the write path is now build → write → swap. |
+| C | `antigravity.rs`, `codex.rs`, `api/auth.rs` | The OAuth `state` was `hex(wall-clock ms)`, the callback accepted an **empty** state, never expired it and allowed reuse — an anonymous caller could poison any in-flight login, and without PKCE bind their own account. | 32 CSPRNG bytes bound to the flow, constant-time compare, single-use, TTL, rate-limited like a failed credential. |
+| C | `gemini.rs` | Parallel tool calls in separate chunks all arrived as `index: 0` with one shared id, so clients merged them into one mangled call. | Monotonic index + per-stream ids in `SseState`. |
+| H | `providers.rs`, `pool/*` | `[tuning]` never reached the pool (`KeyPool::new` substituted `Default`), and `AppState.tuning` was frozen at startup: every cooldown/backoff/sticky knob was dead config that the API reported as applied. | One constructor that takes the tuning; `ArcSwap` published on reload. |
+| H | `lib.rs` | Reload rebuilt pools from a 2 s-stale storage batch, resurrecting keys that had just been benched or disabled. | Reuse unchanged pools, flush before rebuilding, persist per-model cooldowns. |
+| H | `proxy/mod.rs` | Client-key `in_flight` was copied on `rebind` while live guards decremented the old counter — a tenant could be 429'd forever after a few reloads. | Shared `Arc<AtomicU32>`. |
+| H | `api/server.rs` | Rotating `api_key`/`admin_key` from the dashboard was silently dropped, and `""` silently opened every route. | Non-empty values are written; clearing needs an explicit flag and a loopback listener. |
+| H | `config.rs` | Every config save downgraded `0600` to `0644` (provider keys, OAuth refresh tokens) with a fixed temp name. | `create_new` + mode `0600`, unique temp name, rename. |
+| H | `proxy/chat/*` | Upstream silence after headers, `200 text/html`, and a mid-stream stall had no deadline; a client disconnect stopped cancelling the upstream. | First-byte and inter-chunk deadlines, content-type validation, the key guard lives in the response body. |
+| M | many | Wrong-model `wake_after`, unclamped restored cooldowns, dropped storage batch on commit failure, full-scan eviction, `max_concurrent` lost in the TOML round-trip, dashboard CSP missing on `/dashboard/index.html`, validation gaps that disabled the lockout, `Retry-After` rounding down, an invalid Prometheus exposition order. | Each fixed with a regression test. |
+
 ## Round 2 (multi-instance, media, realtime, response store)
 
 | # | Sev | Where | What was wrong | Fix |

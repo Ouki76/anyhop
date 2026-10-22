@@ -335,55 +335,6 @@ pub(crate) mod test_support {
             .expect("the loopback upstream answers the headers")
     }
 
-    /// An upstream that streams events until the connection dies, and records the
-    /// moment its peer (the gateway) hung up.
-    ///
-    /// The client-disconnect regression (chaos 2.4) is invisible to a stream that
-    /// ends on its own: something has to keep writing after the gateway is gone.
-    /// This one writes every 20 ms for ~20 s, so `peer_gone` flips within one
-    /// write of the gateway dropping the upstream body — long before the stream
-    /// would have ended by itself.
-    pub(crate) async fn endless_stream(
-        peer_gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> reqwest::Response {
-        use std::sync::atomic::Ordering;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a loopback port");
-        let addr = listener.local_addr().expect("local address");
-        tokio::spawn(async move {
-            let Ok((mut sock, _)) = listener.accept().await else {
-                return;
-            };
-            let mut head = [0u8; 2048];
-            let _ = sock.read(&mut head).await;
-            let header = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
-                           connection: close\r\n\r\n";
-            if sock.write_all(header).await.is_err() {
-                peer_gone.store(true, Ordering::SeqCst);
-                return;
-            }
-            for _ in 0..1000 {
-                if sock.write_all(b"data: tick\n\n").await.is_err() {
-                    // The gateway is gone: the write went nowhere.
-                    peer_gone.store(true, Ordering::SeqCst);
-                    return;
-                }
-                let _ = sock.flush().await;
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        });
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("build a test client")
-            .get(format!("http://{addr}/"))
-            .send()
-            .await
-            .expect("the loopback upstream starts streaming")
-    }
-
     /// A one-key pool entry, for the per-key usage counters.
     pub(crate) fn key_state() -> std::sync::Arc<crate::pool::KeyState> {
         let pool = crate::pool::KeyPool::new(
