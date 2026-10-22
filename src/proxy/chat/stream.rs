@@ -563,6 +563,16 @@ mod tests {
         models = ["m"]
     "#;
 
+    /// A translating provider: its stream goes through the SSE parser before it
+    /// reaches the client, which is a separate place to lose the slot.
+    const ANTHROPIC_PROVIDER: &str = r#"
+        name = "up"
+        type = "anthropic"
+        base_url = "http://127.0.0.1:1"
+        keys = ["sk-test"]
+        models = ["m"]
+    "#;
+
     /// `200` and then silence: the first-byte deadline must fail the attempt so
     /// the retry loop can bench the key, instead of holding the client forever.
     #[tokio::test]
@@ -668,5 +678,177 @@ mod tests {
             "application/json"
         );
         assert_eq!(normalize_content_type(""), "");
+    }
+
+    // ----- the stream's lifetime is the slot's lifetime (chaos 2.3 / 2.4) -----
+
+    /// The in-flight counters the dashboard shows for a provider.
+    fn in_flight(provider: &Provider) -> u32 {
+        provider.pool.snapshot().iter().map(|k| k.in_flight).sum()
+    }
+
+    /// A body that emits one frame and then never ends, plus a flag that flips
+    /// when the stream is really dropped.
+    ///
+    /// The flag is carried *inside* the stream state, so it proves the body — and
+    /// with it the upstream it stands for — was released, not merely stopped
+    /// being read.
+    fn stalled_body() -> (BodyStream, Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Probe(Arc<AtomicBool>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Bytes, std::io::Error>>();
+        tx.unbounded_send(Ok(Bytes::from_static(b"data: a\n\n")))
+            .expect("queue the first frame");
+        // `tx` rides along in the state, so the stream cannot reach a natural EOF.
+        let state = (Probe(dropped.clone()), tx, rx);
+        let stream = futures::stream::unfold(state, |(probe, tx, mut rx)| async move {
+            let item = rx.next().await?;
+            Some((item, (probe, tx, rx)))
+        });
+        (Box::pin(stream), dropped)
+    }
+
+    fn opened(stream: BodyStream) -> Upstream {
+        Upstream::Opened {
+            status: StatusCode::OK,
+            headers: Vec::new(),
+            stream,
+        }
+    }
+
+    /// 2.3: the in-flight counter is the pool's admission control *and* a
+    /// dashboard field. Releasing the `KeyGuard` when the handler returned used to
+    /// free the slot while the client was still reading: `/api/providers` showed 0
+    /// for a live stream, and the pool believed it had capacity it did not have.
+    #[tokio::test]
+    async fn a_live_stream_holds_its_key_slot_until_the_body_is_dropped() {
+        let provider = provider(OPENAI_PROVIDER);
+        let key = provider.pool.pick("m", None).expect("one key");
+        let guard = key.try_acquire().expect("a free slot");
+        let (body, upstream_dropped) = stalled_body();
+        let resp = success_response(&provider, "m", opened(body), true, key, guard).await;
+
+        assert_eq!(
+            in_flight(&provider),
+            1,
+            "an open stream holds exactly one slot"
+        );
+
+        // Reading a frame must not release it either.
+        let mut frames = resp.into_body().into_data_stream();
+        assert!(frames.next().await.is_some(), "the first frame is relayed");
+        assert_eq!(in_flight(&provider), 1, "still held while the client reads");
+
+        drop(frames);
+        assert_eq!(
+            in_flight(&provider),
+            0,
+            "dropping the body releases the slot"
+        );
+        assert!(
+            upstream_dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "dropping the client body must drop the upstream body with it"
+        );
+    }
+
+    /// 2.4: dropping the client response must close the *upstream connection*, not
+    /// just stop reading it. When the upstream lived in a task of its own the
+    /// provider kept streaming (and burning quota and a key slot) to the end.
+    #[tokio::test]
+    async fn dropping_the_client_body_closes_the_upstream_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let provider = provider(OPENAI_PROVIDER);
+        let peer_gone = Arc::new(AtomicBool::new(false));
+        let upstream = crate::sse::test_support::endless_stream(peer_gone.clone()).await;
+        let body = open_body(upstream, Duration::from_secs(5))
+            .await
+            .expect("the body opens");
+        let key = provider.pool.pick("m", None).expect("one key");
+        let guard = key.try_acquire().expect("a free slot");
+        let resp = success_response(&provider, "m", body, true, key, guard).await;
+
+        // A client that reads one frame and vanishes.
+        let mut frames = resp.into_body().into_data_stream();
+        assert!(frames.next().await.is_some(), "the relay produces a frame");
+        assert_eq!(in_flight(&provider), 1, "the live stream holds the slot");
+        drop(frames);
+
+        // The upstream writes for ~20 s: "still writing" cannot be a race with a
+        // natural end of body, it is the regression.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !peer_gone.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            peer_gone.load(Ordering::SeqCst),
+            "the upstream was still streaming 3s after the client-facing body was dropped: \
+             nothing ties the upstream connection to the response body any more"
+        );
+        assert_eq!(in_flight(&provider), 0, "and the slot comes back with it");
+    }
+
+    /// The other half of the contract: a stream that ends normally releases the
+    /// slot, so a short completion does not leak one either.
+    #[tokio::test]
+    async fn a_finished_stream_releases_its_slot() {
+        let provider = provider(OPENAI_PROVIDER);
+        let key = provider.pool.pick("m", None).expect("one key");
+        let guard = key.try_acquire().expect("a free slot");
+        let body = Upstream::Opened {
+            status: StatusCode::OK,
+            headers: Vec::new(),
+            stream: Box::pin(futures::stream::iter(vec![Ok(Bytes::from_static(
+                b"data: a\n\n",
+            ))])),
+        };
+        let resp = success_response(&provider, "m", body, true, key, guard).await;
+
+        let mut frames = resp.into_body().into_data_stream();
+        let mut count = 0;
+        while let Some(item) = frames.next().await {
+            item.expect("every relayed item is a frame");
+            count += 1;
+        }
+        assert_eq!(
+            count, 1,
+            "the single frame is relayed before the end of body"
+        );
+        assert_eq!(
+            in_flight(&provider),
+            0,
+            "a finished stream must not leak a slot"
+        );
+    }
+
+    /// The translated path (gemini/anthropic) wraps the upstream in a parser
+    /// before it reaches the client: the slot has to survive that wrapping too.
+    #[tokio::test]
+    async fn a_translated_stream_holds_its_key_slot_too() {
+        let provider = provider(ANTHROPIC_PROVIDER);
+        let key = provider.pool.pick("m", None).expect("one key");
+        let guard = key.try_acquire().expect("a free slot");
+        let (body, upstream_dropped) = stalled_body();
+        let resp = success_response(&provider, "m", opened(body), true, key, guard).await;
+
+        assert_eq!(
+            in_flight(&provider),
+            1,
+            "an open translated stream holds its slot"
+        );
+        drop(resp);
+        assert_eq!(in_flight(&provider), 0, "and releases it with the body");
+        assert!(
+            upstream_dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the parser must not keep the upstream body alive on its own"
+        );
     }
 }

@@ -1090,6 +1090,11 @@ def scenario1b() -> None:
 def scenario2(gw: Gateway) -> None:
     port = gw.port
     print("\n== 2. slow / hostile clients ==", flush=True)
+    # Scenario 1 hammers the same instance with 5xx/429s, so its keys may still be
+    # cooling down. Starting here without waiting made every check report "no key
+    # was ever picked" — an artefact, not a gateway fault.
+    if not wait_keys(port, 15):
+        note("scenario 2: keys still cooling from scenario 1; waiting for recovery")
 
     # --- a 1 B/s reader must not block anybody ---------------------------
     slow = Stream(port, "slow-stream", timeout=15)

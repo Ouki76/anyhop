@@ -107,6 +107,7 @@ pub struct TuningUpdate {
     ui_refresh_secs: Option<u64>,
     sse_keepalive_secs: Option<u64>,
     client_body_timeout_secs: Option<u64>,
+    capacity_wait_ms: Option<u64>,
     shutdown_grace_secs: Option<u64>,
     quota_cache_ttl_secs: Option<u64>,
     response_store_max: Option<usize>,
@@ -498,6 +499,7 @@ pub async fn update_server(
         sync_num!(ui_refresh_secs, "ui_refresh_secs");
         sync_num!(sse_keepalive_secs, "sse_keepalive_secs");
         sync_num!(client_body_timeout_secs, "client_body_timeout_secs");
+        sync_num!(capacity_wait_ms, "capacity_wait_ms");
         sync_num!(shutdown_grace_secs, "shutdown_grace_secs");
         sync_num!(quota_cache_ttl_secs, "quota_cache_ttl_secs");
         sync_num!(response_store_max, "response_store_max");

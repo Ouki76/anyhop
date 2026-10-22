@@ -102,6 +102,16 @@ if [ "$QUICK" = "0" ]; then
     fi
 fi
 
+if [ "$QUICK" = "0" ] && [ -f test/chaos_test.py ]; then
+    echo "== chaos =="
+    OUT=$(timeout 600 python3 test/chaos_test.py 2>&1 | tail -2)
+    if echo "$OUT" | grep -q "FAIL=0"; then
+        ok "chaos: $(echo "$OUT" | grep -oE 'PASS=[0-9]+' | head -1) FAIL=0"
+    else
+        fail "chaos: $(echo "$OUT" | tail -1)"
+    fi
+fi
+
 echo
 if [ "$FAILED" = "0" ]; then
     echo "AUDIT PASSED"

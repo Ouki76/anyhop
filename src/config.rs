@@ -104,6 +104,11 @@ pub struct Tuning {
     /// How long a client may take to send (each chunk of) a request body.
     /// Bounds slowloris; 0 is not allowed because it would disable the guard.
     pub client_body_timeout_secs: u64,
+    /// How long a request waits for a free upstream slot when every key is at its
+    /// concurrency cap, before the gateway answers `429 + Retry-After: 1`.
+    /// Saturation is "come back in a moment", not an outage: failing fast turned
+    /// a 100 ms burst into 196 instant 429s. 0 = fail fast (the old behaviour).
+    pub capacity_wait_ms: u64,
     /// How long the per-account quota snapshot is reused.
     pub quota_cache_ttl_secs: u64,
     /// Responses API store size: how many `resp_*` records are kept so a
@@ -134,6 +139,7 @@ impl Default for Tuning {
             sse_keepalive_secs: 15,
             shutdown_grace_secs: 10,
             client_body_timeout_secs: 30,
+            capacity_wait_ms: 5000,
             quota_cache_ttl_secs: 60,
             response_store_max: 1000,
         }
@@ -175,6 +181,13 @@ impl Tuning {
     /// Per-chunk request-body read deadline (slowloris guard).
     pub fn client_body_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.client_body_timeout_secs.clamp(1, 300))
+    }
+    /// How long one admission round may wait for a free in-flight slot.
+    ///
+    /// Zero is meaningful (fail fast) and must survive the conversion, so this is
+    /// a clamp on the upper bound only.
+    pub fn capacity_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.capacity_wait_ms.min(30_000))
     }
     pub fn quota_cache_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.quota_cache_ttl_secs.max(1))
@@ -231,6 +244,10 @@ impl Tuning {
         anyhow::ensure!(
             (1..=300).contains(&self.client_body_timeout_secs),
             "tuning.client_body_timeout_secs must be between 1 and 300"
+        );
+        anyhow::ensure!(
+            self.capacity_wait_ms <= 30_000,
+            "tuning.capacity_wait_ms must be between 0 and 30000 (0 = fail fast)"
         );
         anyhow::ensure!(
             (1..=86_400).contains(&self.sticky_ttl_secs),

@@ -11,6 +11,7 @@ mod session;
 mod stream;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -24,7 +25,7 @@ use crate::antigravity::{self, AuthError};
 use crate::codex;
 use crate::config::ProviderKind;
 use crate::gemini;
-use crate::pool::FailKind;
+use crate::pool::{FailKind, KeyGuard, KeyState};
 use crate::providers::{Provider, Resolved};
 
 use super::access::{combo_allowed, model_allowed, model_disabled};
@@ -364,19 +365,31 @@ async fn run_target(
     // that sends operators looking in the wrong place.
     let mut made = 0usize;
     let mut last: Option<TargetFailure> = None;
+    // How long one round may wait for a free in-flight slot. Read once per target
+    // so a hot `[tuning]` reload cannot make the loop wait for two different
+    // budgets in the same request.
+    let capacity_budget = state.tuning().capacity_wait();
     for _ in 0..attempts.max(1) {
-        let Some(key) = provider.pool.pick(model, session) else {
-            warn!(provider = %provider.name, model, "no available key (empty pool, cooling down, or saturated)");
-            keep_specific(
-                &mut last,
-                empty_pool_failure(&provider.pool, model, provider.max_concurrent, made),
-            );
-            break;
-        };
-        let Some(guard) = key.try_acquire() else {
-            // Saturated — try another key without penalizing this one.
-            last = Some(TargetFailure::Capacity { attempts: made });
-            continue;
+        let (key, guard) = match admit(provider, model, session, capacity_budget).await {
+            Admission::Ready(key, guard) => (key, guard),
+            Admission::Busy => {
+                // Healthy keys, no free slot: a 100 ms burst, not an outage. A
+                // capacity round costs no upstream attempt, so it may be repeated
+                // (bounded by the same budget) before the client is told to retry.
+                // debug!: a storm would otherwise write one warn line per round
+                // per request — thousands of lines describing one busy second.
+                tracing::debug!(provider = %provider.name, model, "every key is at its concurrency limit");
+                last = Some(TargetFailure::Capacity { attempts: made });
+                continue;
+            }
+            Admission::Unavailable => {
+                warn!(provider = %provider.name, model, "no available key (empty pool or cooling down)");
+                keep_specific(
+                    &mut last,
+                    empty_pool_failure(&provider.pool, model, provider.max_concurrent, made),
+                );
+                break;
+            }
         };
 
         let mut req = match provider.kind {
@@ -673,6 +686,109 @@ fn keep_specific(last: &mut Option<TargetFailure>, fallback: TargetFailure) {
     }
 }
 
+/// How often a request waiting for a slot re-checks the pool.
+const CAPACITY_POLL: Duration = Duration::from_millis(25);
+
+/// What one admission attempt found.
+enum Admission {
+    /// A key and a free in-flight slot, ready to send.
+    Ready(Arc<KeyState>, KeyGuard),
+    /// Every usable key was at its concurrency cap for the whole budget: the
+    /// provider is healthy, this gateway is just busy (`429 Retry-After: 1`).
+    Busy,
+    /// No key can serve this model at all (none configured, all dead or
+    /// cooling down). Waiting cannot help.
+    Unavailable,
+}
+
+/// Take an in-flight slot, waiting a bounded time when the pool is only *busy*.
+///
+/// `pick()` returning `None` used to be answered immediately, so a burst that the
+/// pool would have drained in seconds came back as a wall of 429s: with two keys
+/// at `max_concurrent = 2` and a 100 ms upstream, 200 parallel requests produced
+/// 4 successes and 196 instant 429s. Saturation is a short queue, not a failure,
+/// so a capacity round now waits up to `[tuning] capacity_wait_ms` (polling every
+/// [`CAPACITY_POLL`]) before it reports [`Admission::Busy`].
+///
+/// A *dead* or cooling pool is not waited for: those requests get their answer
+/// immediately, because no amount of waiting brings a benched key back.
+async fn admit(
+    provider: &Provider,
+    model: &str,
+    session: Option<u64>,
+    budget: Duration,
+) -> Admission {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(key) = provider.pool.pick(model, session) {
+            if let Some(guard) = key.try_acquire() {
+                return Admission::Ready(key, guard);
+            }
+            // Lost the race for that key; another one may still be free.
+        } else if !worth_waiting(&provider.pool, model, provider.max_concurrent) {
+            return Admission::Unavailable;
+        }
+        let waited = started.elapsed();
+        if waited >= budget {
+            return Admission::Busy;
+        }
+        // Never sleep past the deadline: the budget bounds the client's latency.
+        tokio::time::sleep(CAPACITY_POLL.min(budget - waited)).await;
+    }
+}
+
+/// Is an empty `pick` worth waiting out?
+///
+/// A full pool and a pool that cannot serve this model look identical from
+/// `pick()`'s `None`, and they deserve opposite answers. A full pool is a queue;
+/// a benched one is a `503` the client should see now.
+///
+/// The last clause is deliberate: `pick()` and `snapshot()` are two calls at two
+/// instants, so a slot that was taken when `pick` looked can already be free when
+/// the snapshot runs. Reading that as "provider unavailable" turned a busy
+/// moment into a 503 (it is how one request of a 200-request burst failed while
+/// its peers were being served). A live key plus no per-model quota means
+/// "transient, look again".
+fn worth_waiting(pool: &crate::pool::KeyPool, model: &str, max_concurrent: u32) -> bool {
+    if max_concurrent == 0 {
+        // Unlimited per key: a missing key can only mean "nothing usable".
+        return false;
+    }
+    let snapshot = pool.snapshot();
+    let mut live = snapshot
+        .iter()
+        .filter(|k| k.status != "dead" && k.status != "cooldown")
+        .peekable();
+    if live.peek().is_none() {
+        return false;
+    }
+    if live.all(|k| k.in_flight >= max_concurrent) {
+        return true;
+    }
+    // A live key that cannot serve *this model* right now: only a per-model quota
+    // does that, and it will not clear inside a capacity wait.
+    pool.wake_after_any(model).is_none()
+}
+
+/// Is `pick()` returning `None` only because every key is at its in-flight cap?
+///
+/// Stricter than [`worth_waiting`] — this is what the *final* answer says, so it
+/// must not call a transient race "capacity". `snapshot()` is consulted only when
+/// a request is already waiting or failing.
+fn pool_busy(pool: &crate::pool::KeyPool, max_concurrent: u32) -> bool {
+    if max_concurrent == 0 {
+        // Unlimited per key: a missing key can only mean "nothing usable".
+        return false;
+    }
+    let snapshot = pool.snapshot();
+    let mut usable = snapshot
+        .iter()
+        .filter(|k| k.status != "dead" && k.status != "cooldown")
+        .peekable();
+    // `peek()` on an exhausted iterator is None, so `is_some()` is "no usable key".
+    usable.peek().is_some() && usable.all(|k| k.in_flight >= max_concurrent)
+}
+
 /// Why the pool handed out no key.
 ///
 /// `pick` returns `None` both when every key is momentarily at its in-flight cap
@@ -685,15 +801,7 @@ fn empty_pool_failure(
     max_concurrent: u32,
     made: usize,
 ) -> TargetFailure {
-    let snapshot = pool.snapshot();
-    let usable: Vec<_> = snapshot
-        .iter()
-        .filter(|k| k.status != "dead" && k.status != "cooldown")
-        .collect();
-    let saturated = max_concurrent > 0
-        && !usable.is_empty()
-        && usable.iter().all(|k| k.in_flight >= max_concurrent);
-    if saturated {
+    if pool_busy(pool, max_concurrent) {
         return TargetFailure::Capacity { attempts: made };
     }
     TargetFailure::Unavailable {
@@ -871,6 +979,258 @@ mod tests {
             None,
             "the client-facing alias knows nothing about the cooldown — this is \
              exactly why the exhaustion path must pass the upstream model"
+        );
+    }
+
+    // ----- bounded wait for a free slot (chaos 3.5) -----
+
+    /// A provider built from a TOML snippet, offline.
+    fn provider_from(source: &str) -> crate::providers::Provider {
+        let cfg: crate::config::ProviderConfig =
+            toml::from_str(source).expect("test provider config");
+        crate::providers::Provider::from_config(
+            &cfg,
+            None,
+            None,
+            None,
+            std::sync::Arc::new(crate::config::Tuning::default()),
+            std::time::Duration::from_secs(5),
+            4,
+        )
+        .expect("the provider builds offline")
+    }
+
+    const ONE_KEY_ONE_SLOT: &str = r#"
+        name = "up"
+        type = "openai_compat"
+        base_url = "http://127.0.0.1:1/v1"
+        keys = ["sk-only"]
+        models = ["m"]
+        max_concurrent = 1
+    "#;
+
+    const TWO_KEYS_ONE_SLOT: &str = r#"
+        name = "up"
+        type = "openai_compat"
+        base_url = "http://127.0.0.1:1/v1"
+        keys = ["sk-a", "sk-b"]
+        models = ["m"]
+        max_concurrent = 1
+    "#;
+
+    /// An upstream body that emits one frame and then never ends; the returned
+    /// sender keeps it open (dropping both ends the stream).
+    fn stalled_body() -> (
+        stream::BodyStream,
+        futures::channel::mpsc::UnboundedSender<Result<axum::body::Bytes, std::io::Error>>,
+    ) {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        tx.unbounded_send(Ok(axum::body::Bytes::from_static(b"data: a\n\n")))
+            .expect("queue the first frame");
+        (Box::pin(rx), tx)
+    }
+
+    /// Open a client-facing stream through the real response path.
+    async fn open_stream(
+        provider: &crate::providers::Provider,
+    ) -> (
+        Response,
+        futures::channel::mpsc::UnboundedSender<Result<axum::body::Bytes, std::io::Error>>,
+    ) {
+        let key = provider.pool.pick("m", None).expect("a key");
+        let guard = key.try_acquire().expect("a free slot");
+        let (body, keepalive) = stalled_body();
+        let resp = stream::success_response(
+            provider,
+            "m",
+            stream::Upstream::Opened {
+                status: StatusCode::OK,
+                headers: Vec::new(),
+                stream: body,
+            },
+            true,
+            key,
+            guard,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        (resp, keepalive)
+    }
+
+    /// 3.5: a full pool is a queue, not a failure. 200 parallel requests against
+    /// 4 slots used to produce 4 successes and 196 instant 429s, which tells the
+    /// client the provider is down when it is merely busy for a moment.
+    #[tokio::test]
+    async fn a_waiting_request_is_admitted_when_a_slot_frees() {
+        let provider = provider_from(ONE_KEY_ONE_SLOT);
+        let key = provider.pool.pick("m", None).expect("one key");
+        let guard = key.try_acquire().expect("the only slot");
+        // The slot is busy for a while, then freed by the request holding it.
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(guard);
+        });
+
+        let started = std::time::Instant::now();
+        let admission = admit(&provider, "m", None, Duration::from_secs(2)).await;
+        let waited = started.elapsed();
+        assert!(
+            matches!(admission, Admission::Ready(..)),
+            "the waiting request must be admitted once a slot frees"
+        );
+        assert!(
+            waited >= Duration::from_millis(120),
+            "it must actually wait for the slot, not race it ({waited:?})"
+        );
+        release.await.expect("the releaser finishes");
+    }
+
+    /// The wait is bounded: when nothing frees up, the client gets the designed
+    /// `429 + Retry-After: 1`, not an unbounded hang and not a 503.
+    #[tokio::test]
+    async fn the_capacity_wait_expires_into_429_with_retry_after() {
+        let provider = provider_from(ONE_KEY_ONE_SLOT);
+        let key = provider.pool.pick("m", None).expect("one key");
+        let _held = key.try_acquire().expect("the only slot");
+
+        let started = std::time::Instant::now();
+        let admission = admit(&provider, "m", None, Duration::from_millis(120)).await;
+        let waited = started.elapsed();
+        assert!(
+            matches!(admission, Admission::Busy),
+            "a full pool for the whole budget must report Busy"
+        );
+        assert!(
+            waited >= Duration::from_millis(100) && waited < Duration::from_secs(2),
+            "the budget must bound the wait ({waited:?})"
+        );
+
+        let resp = failure_response("up", TargetFailure::Capacity { attempts: 0 });
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(header::RETRY_AFTER)
+                .map(|v| v.as_bytes()),
+            Some(&b"1"[..]),
+            "a busy gateway must say when to come back"
+        );
+    }
+
+    /// `capacity_wait_ms = 0` is the documented "fail fast": the old behaviour,
+    /// one poll and out.
+    #[tokio::test]
+    async fn a_zero_budget_fails_fast() {
+        let provider = provider_from(ONE_KEY_ONE_SLOT);
+        let key = provider.pool.pick("m", None).expect("one key");
+        let _held = key.try_acquire().expect("the only slot");
+
+        let started = std::time::Instant::now();
+        let admission = admit(&provider, "m", None, Duration::ZERO).await;
+        assert!(matches!(admission, Admission::Busy));
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "a zero budget must not sleep at all"
+        );
+    }
+
+    /// A benched pool is *not* worth waiting for: no slot will free up, so the
+    /// request must be told 503 immediately instead of stalling for the budget.
+    #[tokio::test]
+    async fn a_benched_pool_is_not_waited_for() {
+        let provider = provider_from(ONE_KEY_ONE_SLOT);
+        let key = provider.pool.pick("m", None).expect("one key");
+        provider.pool.report_failure(&key, FailKind::Auth, "m");
+
+        let started = std::time::Instant::now();
+        let admission = admit(&provider, "m", None, Duration::from_secs(5)).await;
+        assert!(
+            matches!(admission, Admission::Unavailable),
+            "a dead key can never free a slot"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "nothing to wait for, so nothing is waited"
+        );
+    }
+
+    /// `pick()` and `snapshot()` are two calls at two instants. A full pool, a
+    /// slot that freed in between, and a pool benched for this model must not be
+    /// conflated: only the middle one is a transient, and only the last one is an
+    /// outage.
+    #[test]
+    fn only_a_healthy_but_full_pool_is_worth_waiting_for() {
+        let provider = provider_from(ONE_KEY_ONE_SLOT);
+        let key = provider.pool.pick("m", None).expect("one key");
+        let guard = key.try_acquire().expect("the only slot");
+        assert!(
+            worth_waiting(&provider.pool, "m", 1),
+            "a full pool is exactly what the capacity wait is for"
+        );
+
+        // The slot frees between `pick` and the snapshot: a transient, not an
+        // outage — this is how one request of a 200-request burst got a 503 while
+        // its peers were being served.
+        drop(guard);
+        assert!(
+            worth_waiting(&provider.pool, "m", 1),
+            "a live key under its cap is never 'provider unavailable'"
+        );
+
+        // A per-model quota keeps the key's status active, so only the cooldown
+        // itself can say "waiting here is pointless".
+        let until_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+            + 60_000;
+        provider
+            .pool
+            .report_failure(&key, FailKind::ModelQuota { until_ms }, "m");
+        assert!(
+            !worth_waiting(&provider.pool, "m", 1),
+            "a model quota outlives any capacity wait: answer 503 with its reset time"
+        );
+
+        // Unlimited concurrency means an empty pick is never about capacity.
+        assert!(
+            !worth_waiting(&provider.pool, "m", 0),
+            "with no per-key cap there is nothing to wait for"
+        );
+    }
+
+    // ----- a slow reader does not block the pool (chaos 2.1/2.3) -----
+
+    /// A client reading a stream slowly holds exactly one slot. The pool must
+    /// keep serving from its other key, and when a single key really is at its
+    /// cap the answer is "busy" (429 + Retry-After) rather than "provider
+    /// unavailable" (503) — chaos 2.1 measured 503s for exactly this.
+    #[tokio::test]
+    async fn a_slow_reader_holds_one_slot_not_the_pool() {
+        let provider = provider_from(TWO_KEYS_ONE_SLOT);
+        let (resp, keepalive) = open_stream(&provider).await;
+        assert!(
+            provider.pool.pick("m", None).is_some(),
+            "the second key must still serve while a stream is open"
+        );
+        drop(resp);
+        drop(keepalive);
+
+        let provider = provider_from(ONE_KEY_ONE_SLOT);
+        let (resp, keepalive) = open_stream(&provider).await;
+        assert!(
+            provider.pool.pick("m", None).is_none(),
+            "the only key is at its cap while the stream lives"
+        );
+        assert_eq!(
+            empty_pool_failure(&provider.pool, "m", 1, 0),
+            TargetFailure::Capacity { attempts: 0 },
+            "a busy pool is 429, never 503"
+        );
+        drop(resp);
+        drop(keepalive);
+        assert!(
+            provider.pool.pick("m", None).is_some(),
+            "the slot comes back with the response body"
         );
     }
 }

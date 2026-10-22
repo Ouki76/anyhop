@@ -157,3 +157,46 @@ pub async fn events(
             .text("ping"),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `/api/providers` is a dashboard contract: the per-key `in_flight` counter
+    /// is how an operator (and the chaos harness) sees that a live stream is still
+    /// holding a slot. Renaming or hiding it turns "one slow reader" into "the
+    /// pool is idle" on the dashboard.
+    #[test]
+    fn the_provider_dto_exposes_the_live_in_flight_counter() {
+        let dto = ProviderDto {
+            name: "p".into(),
+            kind: "openai_compat",
+            strategy: "round_robin",
+            base_url: "http://127.0.0.1:1/v1".into(),
+            keys: vec![KeySnapshot {
+                id: "0123456789abcdef".into(),
+                masked: "sk-test…".into(),
+                status: "active".into(),
+                cooldown_remaining_secs: 0,
+                in_flight: 1,
+                requests: 4,
+                failures: 0,
+                prompt_tokens: 10,
+                completion_tokens: 20,
+            }],
+            models: vec!["m".into()],
+            max_concurrent: 2,
+            drain_below_pct: 0,
+            proxy: None,
+            oauth: false,
+            timeout_secs: 30,
+            max_retries: 2,
+            capabilities: Vec::new(),
+        };
+        let json = serde_json::to_value(&dto).expect("the DTO serializes");
+        let key = &json["keys"][0];
+        assert_eq!(key["in_flight"], 1, "the dashboard reads keys[].in_flight");
+        assert_eq!(key["masked"], "sk-test…");
+        assert_eq!(json["max_concurrent"], 2);
+    }
+}
