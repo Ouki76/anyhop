@@ -327,3 +327,19 @@ and the shared gateway's log showed it being started and shut down by another
 process within five seconds. That is a second suite holding the same port, the
 exact collision the "run it alone" rule exists for. The reported `PASS=38 FAIL=0`
 comes from a re-run with no other gateway, mock or suite alive.
+
+## 6. Closed in this round (was: "reported, not fixed")
+
+| # | Finding | Fix |
+| --- | --- | --- |
+| 1 | `provider_add` wrote the config before building it, so an unbuildable edit left a file that made the **next start exit**. Reproduced live: `POST /api/providers/add` without a key → `400 saved but reload failed`, `grep nokey` = 1 hit, next start died with `provider 'nokey': no keys configured`. | Routed through `commit_config_text` (build → write → swap). The same request now answers `400 invalid config: …` with the file untouched, and the gateway starts. |
+| 2 | `AuthFailures` pruned only *expired* entries, so a spray of fresh spoofed IPs inside one window grew the map without limit. | Hard cap with oldest-quarter eviction; the expiry sweep still runs first. |
+| 3 | `disabled_models = ["combo/x"]` meant two different things (request path vs catalogue). | Both spellings loaded; `disabled_entry()` derives the bare form. Test: `a_qualified_combo_is_reduced_to_its_bare_name`. |
+| 4 | `GET /v1/models/{id}` ignored the client-key allowlist. | Same `model_allowed`/`combo_allowed` check as the list endpoint → `403 model_not_allowed`. |
+| 5 | `parse_rfc3339_ms` accepted month 13 / day 45 / hour 25 from an upstream 429 body. | Range-checked before the arithmetic. Tests: `an_out_of_range_timestamp_is_rejected`, `a_valid_timestamp_still_parses`. |
+
+### Still untested, and why that is acceptable
+
+* **OAuth flows** — need a browser and a real IdP; the state/PKCE logic is unit-tested and the authorize URL was verified against Google live.
+* **Stream assembly loops** — the event mapping is unit-tested; framing is covered end-to-end by the mocks and the fuzz harness.
+* **Anthropic and Codex wire formats** — no credentials in this environment. The translators are covered by contract tests built from the documented event shapes; `docs/WIRE-VERIFICATION.md` marks them `[NOT TESTABLE HERE]` rather than pretending.
