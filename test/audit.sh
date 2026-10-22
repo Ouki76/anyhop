@@ -110,11 +110,16 @@ fi
 
 echo "== integration =="
     if [ -n "${ANYHOP_TEST_PORT:-}" ] || ! ss -ltn 2>/dev/null | grep -q ":18080 "; then
-        OUT=$(ANYHOP_TEST_PORT="${ANYHOP_TEST_PORT:-18091}" timeout 1500 ./test/run_all.sh ./target/release/anyhop 2>&1 | tail -3)
+        # Pick a free port ourselves: a hardcoded one collides with a gateway left
+        # behind by an earlier run, and the suite then talks to a stale binary
+        # (seen as PASS=3/FAIL=35 while the same binary passes 38/0 alone).
+        PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+        ANYHOP_TEST_PORT="${ANYHOP_TEST_PORT:-$PORT}" timeout 1500 ./test/run_all.sh ./target/release/anyhop > /tmp/anyhop-audit-suite.log 2>&1
+        OUT=$(tail -3 /tmp/anyhop-audit-suite.log)
         if echo "$OUT" | grep -q "FAIL=0"; then
             ok "suite: $(echo "$OUT" | grep -oE 'PASS=[0-9]+' | head -1) FAIL=0"
         else
-            fail "suite: $(echo "$OUT" | tail -1)"
+            fail "suite: $(echo "$OUT" | tail -1) — $(grep -cE '^  FAIL' /tmp/anyhop-audit-suite.log) failing: $(grep -E '^  FAIL' /tmp/anyhop-audit-suite.log | head -3 | tr '\n' ';')"
         fi
     else
         warn "port 18080 is busy — set ANYHOP_TEST_PORT to run the suite"
