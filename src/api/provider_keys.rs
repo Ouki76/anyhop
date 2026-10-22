@@ -185,20 +185,17 @@ pub async fn provider_add(
     }
     arr.push(t);
 
-    if let Err(e) = crate::config::write_atomic(&state.config_path, &doc.to_string()) {
-        return Err(ApiError::internal(format!("cannot write config: {e}")));
+    // Build before writing: `commit_config_text` parses, validates **and builds**
+    // the router, and only then replaces the file. Writing first (as this handler
+    // used to) left a config on disk that the next start refuses — adding a
+    // provider without a key bricked the gateway until someone edited the file.
+    if let Err(resp) = super::persist::commit_config_text(&state, &doc.to_string()).await {
+        return Ok(*resp);
     }
-    match crate::reload_config(&state) {
-        Ok(_) => {
-            state
-                .events
-                .emit_simple("config", "", "backoff", format!("provider '{name}' added"));
-            ok_json(serde_json::json!({"name": name}))
-        }
-        Err(e) => Err(ApiError::bad_request(format!(
-            "saved but reload failed: {e}"
-        ))),
-    }
+    state
+        .events
+        .emit_simple("config", "", "backoff", format!("provider '{name}' added"));
+    ok_json(serde_json::json!({"name": name}))
 }
 
 // ---------- provider settings ----------
