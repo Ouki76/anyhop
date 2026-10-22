@@ -109,6 +109,10 @@ models = ["openai/gpt-4o-mini", "deepseek/deepseek-chat"]
 # ---------------------------------------------------------------------------
 [tuning]
 max_cooldown_secs = 3600          # hard cap on a benched key
+capacity_wait_ms = 5000           # wait for a free slot before answering 429
+shutdown_grace_secs = 10          # SIGTERM drain budget before aborting streams
+client_body_timeout_secs = 30     # per-chunk request-body deadline (slowloris)
+sticky_mode = "hash"              # stateless rendezvous routing (multi-instance)
 base_backoff_secs = 5             # 5xx/network backoff base (doubles per failure)
 rate_limit_cooldown_secs = 60     # 429 without Retry-After
 drain_fallback_secs = 60          # unparseable reset window

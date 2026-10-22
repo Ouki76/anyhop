@@ -174,6 +174,8 @@ pub struct TuningDto {
     #[serde(default)]
     pub shutdown_grace_secs: u64,
     #[serde(default)]
+    pub capacity_wait_ms: u64,
+    #[serde(default)]
     pub response_store_max: usize,
     pub max_cooldown_secs: u64,
     pub base_backoff_secs: u64,

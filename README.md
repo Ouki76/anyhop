@@ -248,6 +248,14 @@ intermediates; PKCS#8/PKCS#1/SEC1 keys). A certificate/key mismatch fails at sta
 at the first handshake. When TLS is on, HSTS is sent; behind a proxy it is sent when
 `X-Forwarded-Proto: https` arrives.
 
+### Bursts and saturation
+
+A request that finds every key at its `max_concurrent` cap waits for a slot
+(`[tuning] capacity_wait_ms`, default 5000, `0` = fail fast) instead of being
+refused at once; when the budget expires the answer is `429` + `Retry-After: 1`.
+A pool with no live key, or a model under a quota cooldown, still answers `503`
+immediately with the reset time — waiting there would be lying.
+
 ### Limits inside the Redis client
 
 The RESP client parses untrusted bytes with hard caps: 64 KiB per line, 8 MiB per
