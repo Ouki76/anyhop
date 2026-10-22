@@ -39,6 +39,14 @@ use axum::serve::ListenerExt;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+/// Normalise a `disabled_models` entry so every spelling of a combo means the same
+/// thing: the catalogue stores combos **bare** (`testcombo`), while the request
+/// path also accepts `combo/testcombo`, so a hand-written `disabled_models =
+/// ["combo/x"]` used to be honoured by one path and ignored by `/v1/models`.
+fn disabled_entry(raw: &str) -> String {
+    raw.strip_prefix("combo/").unwrap_or(raw).to_string()
+}
+
 pub fn run() -> anyhow::Result<()> {
     let workers = std::env::var("ANYHOP_WORKERS")
         .ok()
@@ -188,6 +196,9 @@ async fn async_main() -> anyhow::Result<()> {
 
     let mut disabled_models_set = std::collections::HashSet::new();
     for m in cfg.disabled_models.clone() {
+        // Store both spellings: `combo/x` in the file must hide the bare `x` in
+        // the catalogue and in the request path alike.
+        disabled_models_set.insert(disabled_entry(&m));
         disabled_models_set.insert(m);
     }
 
@@ -491,6 +502,7 @@ fn install_config(state: &Arc<proxy::AppState>, prepared: PreparedConfig) -> usi
             .unwrap_or_else(|e| e.into_inner());
         dm.clear();
         for m in &cfg.disabled_models {
+            dm.insert(disabled_entry(m));
             dm.insert(m.clone());
         }
     }
@@ -1295,5 +1307,21 @@ mod tests {
         let body = body_with_idle_timeout(axum::body::Body::from("hello"), Duration::from_secs(30));
         let bytes = axum::body::to_bytes(body, 1024).await.expect("body");
         assert_eq!(&bytes[..], b"hello");
+    }
+}
+
+#[cfg(test)]
+mod disabled_entry_tests {
+    use super::disabled_entry;
+
+    /// `disabled_models = ["combo/x"]` must hide the bare `x` the catalogue serves;
+    /// the two spellings used to disagree between paths.
+    #[test]
+    fn a_qualified_combo_is_reduced_to_its_bare_name() {
+        assert_eq!(disabled_entry("combo/testcombo"), "testcombo");
+        assert_eq!(disabled_entry("testcombo"), "testcombo");
+        // A provider-qualified model keeps its slash: only "combo/" is special.
+        assert_eq!(disabled_entry("mock/test-model"), "mock/test-model");
+        assert_eq!(disabled_entry("combo/combo/x"), "combo/x");
     }
 }

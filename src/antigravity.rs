@@ -525,6 +525,17 @@ fn parse_rfc3339_ms(s: &str) -> Option<u64> {
     let h: i64 = tp.next()?.parse().ok()?;
     let mi: i64 = tp.next()?.parse().ok()?;
     let sec: i64 = tp.next()?.parse().ok()?;
+    // Range-check before the arithmetic below: the string comes from an upstream
+    // body, and `days * 86400` on a month of 13 (or a day of 45) silently produced
+    // a garbage epoch instead of rejecting the timestamp.
+    if !(1..=12).contains(&mo)
+        || !(1..=31).contains(&d)
+        || !(0..=23).contains(&h)
+        || !(0..=59).contains(&mi)
+        || !(0..=60).contains(&sec)
+    {
+        return None;
+    }
     let off_secs: i64 = if off == "Z" || off.is_empty() {
         0
     } else {
@@ -1391,5 +1402,36 @@ mod response_envelope_tests {
                 "https://daily-cloudcode-pa.googleapis.com/{API_VERSION}:streamGenerateContent?alt=sse"
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::parse_rfc3339_ms;
+
+    /// Out-of-range parts used to be accepted and produced a garbage epoch; the
+    /// value comes from an upstream 429 body, so it must be validated.
+    #[test]
+    fn an_out_of_range_timestamp_is_rejected() {
+        assert!(
+            parse_rfc3339_ms("2026-13-01T00:00:00Z").is_none(),
+            "month 13"
+        );
+        assert!(parse_rfc3339_ms("2026-01-45T00:00:00Z").is_none(), "day 45");
+        assert!(
+            parse_rfc3339_ms("2026-01-01T25:00:00Z").is_none(),
+            "hour 25"
+        );
+        assert!(
+            parse_rfc3339_ms("2026-01-01T00:61:00Z").is_none(),
+            "minute 61"
+        );
+    }
+
+    /// A well-formed timestamp still parses (no regression on the happy path).
+    #[test]
+    fn a_valid_timestamp_still_parses() {
+        let ts = parse_rfc3339_ms("2026-01-01T00:00:00Z").expect("valid");
+        assert!(ts > 1_700_000_000_000 && ts < 1_900_000_000_000, "got {ts}");
     }
 }
