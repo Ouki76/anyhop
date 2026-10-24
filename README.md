@@ -83,12 +83,37 @@ without the proxy.
 
 ### 2. Docker
 
+A prebuilt image is published to the GitHub Container Registry by
+[`.github/workflows/docker.yml`](.github/workflows/docker.yml) on every push to
+`main` and on `v*` tags (`linux/amd64`; the workflow documents the one-line change
+for arm64):
+
 ```bash
+# pull the published image (public package; on an older GHCR setup run
+# `echo $PAT | docker login ghcr.io -u <user> --password-stdin` first)
+docker pull ghcr.io/ouki76/anyhop:latest
+
 cp anyhop.example.toml anyhop.toml && chmod 600 anyhop.toml
 # A container must listen on all interfaces for the published port to work:
 sed -i 's|^listen = .*|listen = "0.0.0.0:8080"|' anyhop.toml
-docker compose up -d          # builds the image, mounts the config read-only, /data volume
+
+docker run -d --name anyhop --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -v "$PWD/anyhop.toml:/etc/anyhop/anyhop.toml:ro,z" \
+  -v anyhop-data:/data \
+  --read-only --tmpfs /tmp --security-opt no-new-privileges:true \
+  --memory 256m \
+  ghcr.io/ouki76/anyhop:latest
 ```
+
+`docker compose up -d` also works and builds from the checkout instead (the compose
+file mounts the config read-only and keeps state in the `anyhop-data` volume).
+
+The `,z` on the config mount relabels it for the container's SELinux domain. On a
+host with SELinux enforcing (Fedora, RHEL, CentOS) the `z` is required — without it
+the gateway cannot read the mounted file and exits with `Permission denied`.
+Pin a server to one build with the commit tag, e.g. `:sha-1a2b3c4`, or a release tag
+`:1.2.3`.
 
 The image also works standalone; the healthcheck probes `$ANYHOP_HEALTH_URL`
 (default `http://127.0.0.1:8080/healthz`) — override it if you change

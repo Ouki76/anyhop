@@ -19,7 +19,10 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - ./anyhop.toml:/etc/anyhop/anyhop.toml:ro
+      # `:ro,z` relabels the file for the container's SELinux domain. Without the
+      # `z` the process (uid 10001) gets EACCES on a host with SELinux enforcing
+      # (Fedora, RHEL, CentOS) and the gateway exits with "cannot read config".
+      - ./anyhop.toml:/etc/anyhop/anyhop.toml:ro,z
       - anyhop-data:/data
     environment:
       RUST_LOG: info

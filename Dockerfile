@@ -42,6 +42,10 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
+# Cargo.toml declares two bench targets, so `cargo build` refuses to parse the
+# manifest when benches/ is missing — the image had not been rebuilt since the
+# benches were added, and this COPY is what kept it broken.
+COPY benches ./benches
 # Dashboard assets must exist before `cargo build`: rust-embed needs the folder.
 COPY --from=ui /src/ui/dist ./ui/dist
 
