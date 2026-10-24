@@ -27,3 +27,7 @@ __pycache__/
 
 /ui/dist
 /ui/target
+
+# Secrets outside the repo are loaded by scripts/run.sh
+.env
+.env.*
