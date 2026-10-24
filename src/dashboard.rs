@@ -131,16 +131,22 @@ pub fn csp_for(html: &[u8]) -> Option<String> {
 
 /// Bodies of `<script>` elements that have no `src` attribute.
 fn inline_scripts(html: &str) -> Vec<&str> {
+    // Case-insensitive tag matching. HTML is case-insensitive and a bundler that
+    // emitted `<SCRIPT>` would have been skipped silently: the hash list would then
+    // miss exactly the script it was supposed to allow, and the SPA would refuse to
+    // boot with no error anyone could see. Folding is ASCII, so indices match.
+    let lower = html.to_ascii_lowercase();
     let mut out = Vec::new();
-    let mut rest = html;
-    while let Some(start) = rest.find("<script") {
-        let after = &rest[start..];
-        let Some(open_end) = after.find('>') else {
+    let mut off = 0usize;
+    while let Some(start) = lower[off..].find("<script") {
+        let start = off + start;
+        let after = &html[start..];
+        let Some(open_end) = lower[start..].find('>') else {
             break;
         };
-        let tag = &after[..open_end];
+        let tag = lower[start..start + open_end].to_string();
         let body_start = open_end + 1;
-        let Some(body_end) = after[body_start..].find("</script>") else {
+        let Some(body_end) = lower[start + body_start..].find("</script>") else {
             break;
         };
         let body = &after[body_start..body_start + body_end];
@@ -148,7 +154,7 @@ fn inline_scripts(html: &str) -> Vec<&str> {
         if !tag.contains("src=") {
             out.push(body);
         }
-        rest = &after[body_start + body_end..];
+        off = start + body_start + body_end + "</script>".len();
     }
     out
 }
@@ -209,6 +215,19 @@ mod tests {
         // Bodies keep their surrounding whitespace: CSP hashes the raw text.
         assert_eq!(got[0], "var a=1;");
         assert_eq!(got[1], "await init();");
+    }
+
+    /// HTML is case-insensitive: an uppercase tag must still be hashed, or the
+    /// policy would forbid the very script the app needs.
+    #[test]
+    fn an_uppercase_script_tag_is_hashed_too() {
+        let html = br#"<SCRIPT>var a=1;</SCRIPT><script>run();</script>"#;
+        let scripts = inline_scripts(std::str::from_utf8(html).expect("utf8"));
+        assert_eq!(scripts.len(), 2, "got {scripts:?}");
+        assert_eq!(scripts[0], "var a=1;");
+        let policy = csp_for(html).expect("csp");
+        // Two distinct hashes.
+        assert_eq!(policy.matches("sha256-").count(), 2, "{policy}");
     }
 
     #[test]

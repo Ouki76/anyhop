@@ -416,7 +416,7 @@ fn prepare_config(
             // them instead of the last periodic snapshot.
             p.pool.persist_stats();
         }
-        s.flush_blocking();
+        s.flush_in_place();
     }
 
     let mut list = build_providers(&cfg, state.storage.as_ref(), Some(&state.events))?;

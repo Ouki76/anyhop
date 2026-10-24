@@ -159,11 +159,16 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
                 out,
                 "anyhop_client_key_rate_limited_total{{key=\"{name}\"}} {n}"
             );
-            let _ = writeln!(
-                out,
-                "anyhop_client_key_rate_limit_tokens{{key=\"{name}\"}} {:.3}",
-                limiter.available()
-            );
+            // The token gauge only describes the *local* bucket. Under the redis
+            // backend the bucket lives in Redis and the local one is never drained,
+            // so emitting it reported a permanently full bucket.
+            if rt.shared.as_ref().is_none_or(|s| s.is_local()) {
+                let _ = writeln!(
+                    out,
+                    "anyhop_client_key_rate_limit_tokens{{key=\"{name}\"}} {:.3}",
+                    limiter.available()
+                );
+            }
         }
     }
     drop(keys);

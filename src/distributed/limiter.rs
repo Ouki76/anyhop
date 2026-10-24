@@ -111,6 +111,15 @@ impl SharedLimiter {
         local.map(|l| Arc::new(Self::Local(l)))
     }
 
+    /// Is this key enforced by the in-process bucket?
+    ///
+    /// `/metrics` needs it: the `…_rate_limit_tokens` gauge reads the local bucket,
+    /// which is never consumed under the redis backend — reporting it there showed
+    /// a permanently full bucket.
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
+
     /// Consume one request. `Err(retry_after_secs)` = limited.
     pub async fn try_acquire(&self) -> Result<(), u64> {
         match self {

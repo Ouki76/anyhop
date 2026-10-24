@@ -738,6 +738,23 @@ impl Storage {
     /// alive, a model cooldown would be forgotten. Blocking here is deliberate
     /// (reloads are rare admin actions) and safe to call from a worker thread:
     /// the batch is behind a mutex the writer task never holds across an await.
+    /// [`flush_blocking`], moved off the runtime worker when possible.
+    ///
+    /// A `commit()` is an fsync: on a slow disk it takes milliseconds, and this is
+    /// called from async handlers (config reload). `block_in_place` lets the
+    /// multi-threaded runtime hand *other* tasks to a fresh worker meanwhile. It is
+    /// illegal on the current-thread runtime (tests, the CLI), so the flavour is
+    /// checked first and the plain call kept there.
+    pub fn flush_in_place(&self) {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+        match Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| self.flush_blocking());
+            }
+            _ => self.flush_blocking(),
+        }
+    }
+
     pub fn flush_blocking(&self) {
         let mut batch = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         flush(

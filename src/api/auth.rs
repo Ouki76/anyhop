@@ -662,7 +662,24 @@ fn html_page(status: StatusCode, title: &str, body: &str) -> Response {
          <style>body{{font:15px/1.5 system-ui,sans-serif;margin:12vh auto;max-width:32rem;padding:0 1.5rem}}</style>\
          <h1>{title}</h1><p>{body}</p>"
     );
-    (status, [("content-type", "text/html; charset=utf-8")], html).into_response()
+    // The only same-origin HTML this crate serves outside the dashboard, so it
+    // gets the same treatment: no scripts, no inline styles except the one block
+    // above, nothing embeddable. (The dashboard's own policy is hash-pinned; this
+    // page has no dynamic script at all, so a fixed policy is enough.)
+    (
+        status,
+        [
+            ("content-type", "text/html; charset=utf-8"),
+            (
+                "content-security-policy",
+                "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            ),
+            ("x-content-type-options", "nosniff"),
+            ("referrer-policy", "no-referrer"),
+        ],
+        html,
+    )
+        .into_response()
 }
 
 fn append_account(
