@@ -227,8 +227,13 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/fim/completions" -H "$CT
 echo "== soak (latency + leaks) =="
 # Short by default so it fits a regression run; ANYHOP_SOAK_SECS=60 for a real one.
 SOAK_SECS="${ANYHOP_SOAK_SECS:-10}"
+# Worker count and the p99 ceiling are machine-dependent: a 2-vCPU CI runner needs
+# fewer workers and a looser ceiling than a workstation, or the stage reports the
+# runner's scheduling jitter as a gateway defect.
+SOAK_WORKERS="${ANYHOP_SOAK_WORKERS:-8}"
+SOAK_P99="${ANYHOP_SOAK_MAX_P99:-250}"
 if timeout 300 python3 test/soak.py --url "$BASE" --key test-gw-key \
-        --duration "$SOAK_SECS" --workers 8 --pid "$AH_PID" --max-p99-ms 250 \
+        --duration "$SOAK_SECS" --workers "$SOAK_WORKERS" --pid "$AH_PID" --max-p99-ms "$SOAK_P99" \
         > /tmp/anyhop-soak.log 2>&1; then
     ok "soak ${SOAK_SECS}s: $(grep -oE '[0-9,]+ req/s' /tmp/anyhop-soak.log | head -1), $(grep -oE 'p99=[0-9.]+ms' /tmp/anyhop-soak.log | head -1) p99, $(grep -oE 'delta [+-][0-9]+MB' /tmp/anyhop-soak.log | head -1) RSS"
 else

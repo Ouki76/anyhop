@@ -351,15 +351,23 @@ def main():
         # CI has network: pull the server instead of silently skipping the only test
         # that ever executes the shipped Lua.
         print(f"pulling {IMAGE} …")
-        pull = subprocess.run(["docker", "pull", IMAGE],
-                              capture_output=True, text=True, timeout=300)
+        try:
+            pull = subprocess.run(["docker", "pull", IMAGE],
+                                  capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            print("SKIP: docker pull timed out")
+            return 2
         if pull.returncode != 0:
             print(f"SKIP: cannot pull {IMAGE}: {pull.stderr.strip()[:200]}")
             return 2
 
     port = free_port()
     name = f"anyhop-lua-{port}"
-    started = start_redis(name, port)
+    try:
+        started = start_redis(name, port)
+    except subprocess.TimeoutExpired:
+        print("SKIP: docker run timed out")
+        return 2
     if started.returncode != 0:
         print(f"SKIP: cannot start {IMAGE}: {started.stderr.strip()[:200]}")
         return 2

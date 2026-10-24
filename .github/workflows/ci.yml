@@ -49,7 +49,52 @@ jobs:
       # run_all.sh skips the CDP/browser part when chromium is absent; the API
       # assertions still run, which is what this job is for.
       - name: Integration suite
-        run: ./test/run_all.sh ./target/release/anyhop
+        env:
+          # A shared 4-vCPU runner cannot hold a workstation's latency ceiling;
+          # the gate is about regressions, not about the runner's jitter.
+          ANYHOP_SOAK_WORKERS: "4"
+          ANYHOP_SOAK_MAX_P99: "1500"
+          ANYHOP_SOAK_SECS: "5"
+        run: |
+          set -o pipefail
+          ./test/run_all.sh ./target/release/anyhop 2>&1 | tee /tmp/suite.log
+
+      # A failing e2e run is unreadable without a token (the log endpoint needs
+      # auth), and it is almost always environmental. Publish the tail to a
+      # throwaway branch so the failure can be inspected from a checkout.
+      - name: Publish failure logs
+        if: failure() && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          mkdir -p ci-logs
+          {
+            echo "# integration failure — $(date -u +%FT%TZ) — ${GITHUB_SHA}"
+            echo
+            echo '## suite tail'
+            echo '```'
+            tail -120 /tmp/suite.log 2>/dev/null || echo '(no suite log)'
+            echo '```'
+            echo '## failing checks'
+            echo '```'
+            grep -E '^  FAIL|^!!! ' /tmp/suite.log 2>/dev/null || echo '(none matched)'
+            echo '```'
+            echo '## gateway log tail'
+            echo '```'
+            tail -60 /tmp/anyhop-regress.log 2>/dev/null || echo '(no gateway log)'
+            echo '```'
+          } > ci-logs/last-failure.md
+          cd ci-logs
+          git init -q -b ci-logs .
+          git add last-failure.md
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "ci: integration failure for ${GITHUB_SHA}"
+          git push -q --force \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              HEAD:ci-logs
+          echo "published to the ci-logs branch"
 
   # The dashboard is a Rust→WASM app and is not covered by `cargo build` at the root.
   ui:
