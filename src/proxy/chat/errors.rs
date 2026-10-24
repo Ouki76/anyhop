@@ -25,7 +25,7 @@ pub(super) fn internal_body_error() -> Response {
 /// its in-flight cap" and "no key can serve this model" are different answers
 /// for the client — so the retry loop records what actually happened instead of
 /// guessing at the end.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TargetFailure {
     /// Keys are alive but every in-flight slot is taken: retry shortly.
     Capacity { attempts: usize },
@@ -174,6 +174,107 @@ pub(super) fn parse_reset_duration(s: &str) -> Option<Duration> {
     (total > Duration::ZERO).then_some(total)
 }
 
+/// Parse a `Retry-After` header: delta-seconds or an HTTP-date.
+///
+/// Both spellings are used in the wild (Google sends seconds, several CDNs send
+/// an IMF-fixdate). The old code did `parse::<u64>()` only, so a date fell back to
+/// a flat 60 s, and `Retry-After: 0` produced a zero-length cooldown — the key was
+/// instantly "available" again, got re-picked by FillFirst and ate the next 429
+/// while the other keys sat idle.
+///
+/// Returns whole seconds, clamped to `1..=MAX_RESET`.
+pub(crate) fn parse_retry_after(value: &str) -> Option<u64> {
+    let v = value.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(secs.clamp(1, MAX_RESET.as_secs()));
+    }
+    let secs = http_date_secs(v)?;
+    Some(secs.clamp(1, MAX_RESET.as_secs()))
+}
+
+/// Seconds until an IMF-fixdate (`Wed, 21 Oct 2026 07:28:00 GMT`), or `None`.
+///
+/// Deliberately small: only the fixed format RFC 7231 requires. A date in the past
+/// (clock skew, a cached response) yields `Some(0)`, which the caller clamps to 1s.
+fn http_date_secs(s: &str) -> Option<u64> {
+    // "Wdy, DD Mon YYYY HH:MM:SS GMT" — the weekday is not needed for the math.
+    let rest = s.split_once(", ")?.1;
+    let mut parts = rest.split_whitespace();
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts.next()?.parse().ok()?;
+    let time = parts.next()?;
+    if !parts.next()?.eq_ignore_ascii_case("GMT") {
+        return None;
+    }
+    let mut tp = time.split(':');
+    let hour: i64 = tp.next()?.parse().ok()?;
+    let min: i64 = tp.next()?.parse().ok()?;
+    let sec: i64 = tp.next()?.parse().ok()?;
+    if !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&min)
+        || !(0..=60).contains(&sec)
+        || !(1970..=9999).contains(&year)
+    {
+        return None;
+    }
+    let target = days_from_civil(year, month, day) * 86_400 + hour * 3600 + min * 60 + sec;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some(target.saturating_sub(now).max(0) as u64)
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil`), exact for any year in range and free of leap-second tables.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (m + 9) % 12; // Mar=0
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Does a 403 body describe a policy denial rather than a bad credential?
+///
+/// Deliberately narrow and lowercase-matched: only the phrases upstreams actually
+/// use when the key is fine but *this request* is not permitted. Anything else
+/// (including an empty body) keeps the historical "403 = dead key" behaviour, so a
+/// genuinely revoked credential still stops being retried.
+fn looks_like_policy_denial(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    const NEEDLES: [&str; 9] = [
+        "model_not_available",
+        "model not available",
+        "model_not_found",
+        "does not have access",
+        "not available in your",
+        "unsupported_country",
+        "unsupported country",
+        "billing",
+        "insufficient_quota",
+    ];
+    NEEDLES.iter().any(|n| b.contains(n))
+}
+
 /// How a non-2xx upstream status maps onto key-pool bookkeeping.
 ///
 /// Extracted from the retry loop so the mapping is unit-testable: getting it
@@ -201,7 +302,20 @@ pub(super) fn classify_error_status(kind: ProviderKind, status: u16, body: &str)
                 ErrorAction::RateLimited
             }
         }
-        401 | 403 => ErrorAction::Auth,
+        401 => ErrorAction::Auth,
+        403 => {
+            // 403 is not always "this credential is invalid": upstreams also use it
+            // for model/region/plan policy ("model not available in your region",
+            // "billing hard limit reached", Cloudflare challenges). Marking a key
+            // DEAD is permanent, so one request for a model the account cannot use
+            // used to take the provider down. Policy denials cool the key down
+            // instead, which self-heals once the model is not requested again.
+            if looks_like_policy_denial(body) {
+                ErrorAction::RateLimited
+            } else {
+                ErrorAction::Auth
+            }
+        }
         // Gemini reports an invalid key as 400 INVALID_ARGUMENT, not 401.
         400 if matches!(kind, ProviderKind::Gemini) && body.contains("API key not valid") => {
             ErrorAction::Auth
@@ -216,6 +330,66 @@ mod tests {
     use super::*;
 
     // ----- upstream error classification -----
+
+    // ----- Retry-After -----
+
+    #[test]
+    fn retry_after_accepts_both_spellings() {
+        // Delta-seconds, the common case.
+        assert_eq!(parse_retry_after("7"), Some(7));
+        // `0` must not produce a zero-length cooldown (the key would be re-picked
+        // immediately and eat the next 429 while the other keys idle).
+        assert_eq!(parse_retry_after("0"), Some(1));
+        // An HTTP-date (RFC 7231 IMF-fixdate), which used to be discarded.
+        let future = std::time::SystemTime::now() + Duration::from_secs(120);
+        let secs = future
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let date = imf_fixdate(secs);
+        let parsed = parse_retry_after(&date).expect("an IMF-fixdate must parse");
+        assert!(
+            (110..=130).contains(&parsed),
+            "expected ~120 s from {date}, got {parsed}"
+        );
+        // A date in the past is "now", not a panic and not a negative.
+        assert_eq!(parse_retry_after("Thu, 01 Jan 1970 00:00:00 GMT"), Some(1));
+        // Junk falls back to the caller's default instead of a bogus cooldown.
+        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after(""), None);
+        // A hostile value is clamped to the 24 h cap, not multiplied into an outage.
+        assert_eq!(parse_retry_after("999999999"), Some(86_400));
+    }
+
+    /// Format a UNIX timestamp as an IMF-fixdate (the inverse of the parser).
+    fn imf_fixdate(unix: u64) -> String {
+        const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let days = unix / 86_400;
+        let secs = unix % 86_400;
+        // 1970-01-01 was a Thursday.
+        let wday = DAYS[(days % 7) as usize];
+        // Civil date from days since the epoch (Howard Hinnant, inverse direction).
+        let z = days as i64 + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!(
+            "{wday}, {d:02} {} {y} {:02}:{:02}:{:02} GMT",
+            MONTHS[(m - 1) as usize],
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
+    }
 
     #[test]
     fn rate_limit_cools_the_key_except_for_antigravity() {

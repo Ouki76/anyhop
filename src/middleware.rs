@@ -7,6 +7,7 @@ use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::Response;
+use futures::StreamExt;
 
 use crate::proxy;
 
@@ -139,12 +140,19 @@ pub async fn require_api_key(
 
     // An upgrade is served by a task that outlives the response, so the
     // concurrency slot must follow the request rather than the response.
+    // Split on commas: `Upgrade` is a list-valued header, and the realtime
+    // handler accepts `websocket` anywhere in it. Matching the whole value here
+    // meant `Upgrade: websocket, foo` got a 101 while this layer classified it as
+    // a normal response — the guard then died with the (empty) response head and
+    // `max_concurrent` did not bound the session.
     let upgrade = if req
         .headers()
         .get(header::UPGRADE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
-    {
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("websocket"))
+        }) {
         Upgrade::WebSocket
     } else {
         Upgrade::Normal
@@ -178,12 +186,12 @@ pub async fn require_api_key(
             }
             return resp;
         }
-        state
-            .auth_fails
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear(&ip);
-        // Concurrency cap: the key's own limit, else the server-wide default.
+        // NOTE: a successful client-key request deliberately does *not* clear the
+        // per-IP failure budget. Clearing it on success let anyone holding one
+        // valid key interleave 1 good request with `burst-1` guesses at other
+        // tenants' keys and never be locked out — and with 4-char keys allowed the
+        // search space is small enough to walk. Entries expire with the window
+        // instead (the master key still clears: it is the operator's credential).
         let limit = if ck.max_concurrent > 0 {
             ck.max_concurrent
         } else {
@@ -220,10 +228,9 @@ pub async fn require_api_key(
         if limit > 0 && upgrade == Upgrade::WebSocket {
             req.extensions_mut().insert(ClientKeyGuard(ck.clone()));
         }
-        let mut resp = next.run(req).await;
+        let resp = next.run(req).await;
         if limit > 0 && upgrade == Upgrade::Normal {
-            // Dropped with the response — i.e. after a streamed body completes.
-            resp.extensions_mut().insert(ClientKeyGuard(ck));
+            return hold_slot_until_body_ends(resp, ck);
         }
         return resp;
     }
@@ -437,6 +444,30 @@ impl Drop for ClientKeyGuard {
             .in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Keep a client key's in-flight slot until its **body** is finished.
+///
+/// The slot used to be parked in the response's extensions. hyper encodes the
+/// response head and drops it (extensions included) before it starts polling the
+/// body, so a streamed response released the slot at the first byte: a key with
+/// `max_concurrent = 1` could hold unlimited SSE streams, each of which also
+/// pins an upstream `KeyGuard` — one tenant could exhaust the whole pool. The
+/// chat path already holds its provider guard inside the body stream; this does
+/// the same for the tenant's slot.
+fn hold_slot_until_body_ends(
+    resp: Response,
+    ck: std::sync::Arc<proxy::ClientKeyRuntime>,
+) -> Response {
+    let guard = ClientKeyGuard(ck);
+    let (parts, body) = resp.into_parts();
+    let stream = body.into_data_stream().map(move |chunk| {
+        // The closure owns the guard: it is dropped with the last chunk, or with
+        // the response if the client disconnects first.
+        let _ = &guard;
+        chunk
+    });
+    Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
 /// Where the request came from: the socket peer, else the first X-Forwarded-For
@@ -786,7 +817,7 @@ mod json_error_tests {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use axum::http::Request;
 
     fn req(method: &str, uri: &str) -> Request<Body> {
@@ -1094,6 +1125,87 @@ mod auth_tests {
             .await
             .expect("third request");
         assert_eq!(third.status(), StatusCode::OK, "the slot must be reusable");
+    }
+
+    /// A streamed body must hold the slot for as long as the client is reading.
+    ///
+    /// The permit used to live in the response extensions; hyper encodes the head
+    /// and drops them before it starts polling the body, so a tenant with
+    /// `max_concurrent = 1` could open unlimited SSE streams (each also pinning a
+    /// provider key). This test keeps the body undrained and asserts the slot is
+    /// still taken.
+    #[tokio::test]
+    async fn a_streamed_body_holds_the_slot_until_it_is_dropped() {
+        let rt = key_runtime(1);
+        let st = state_with_key(rt.clone());
+        let addr = stream_router(st).await;
+        let url = format!("http://{addr}/stream");
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(&url)
+            .bearer_auth("ck-tenant")
+            .send()
+            .await
+            .expect("streamed response head");
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The head is in, the body is not: the slot must still be held.
+        wait_until("the streaming request to hold its slot", || {
+            rt.in_flight.load(std::sync::atomic::Ordering::Relaxed) == 1
+        })
+        .await;
+
+        let second = client
+            .get(&url)
+            .bearer_auth("ck-tenant")
+            .send()
+            .await
+            .expect("second request");
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a live stream must keep the only slot busy"
+        );
+
+        drop(resp);
+        wait_until("the slot to come back when the stream is dropped", || {
+            rt.in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0
+        })
+        .await;
+        let third = client
+            .get(&url)
+            .bearer_auth("ck-tenant")
+            .send()
+            .await
+            .expect("third request");
+        assert_eq!(third.status(), StatusCode::OK, "the slot must be reusable");
+    }
+
+    /// A route answering with an endless stream of tiny chunks.
+    async fn endless() -> axum::response::Response {
+        // One chunk, then a stream that never ends: the body stays "in progress"
+        // for as long as the test keeps the response alive.
+        let stream = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+            b"data: x\n\n",
+        ))])
+        .chain(futures::stream::pending());
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(axum::body::Body::from_stream(stream))
+            .expect("response builds")
+    }
+
+    async fn stream_router(state: std::sync::Arc<proxy::AppState>) -> std::net::SocketAddr {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/stream", get(endless))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_api_key,
+            ))
+            .with_state(state);
+        serve(app).await
     }
 
     /// An upgrade outlives its response, so its slot cannot ride on the response:

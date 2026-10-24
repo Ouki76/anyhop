@@ -106,6 +106,19 @@ fn App() -> View {
     let client_keys = create_signal(Vec::<ClientKeyDto>::new());
     let models = create_signal(Vec::<ModelItemDto>::new());
     let loaded = create_signal(false);
+    // Dashboard poll interval comes from `[tuning] ui_refresh_secs`. It used to be
+    // hard-coded (5 s / 3 s), so the setting validated and shown in Settings had no
+    // effect at all. One fetch up front seeds it; the loops below read it on every
+    // iteration, so a reload of the config takes effect without a page refresh.
+    let refresh_secs = std::rc::Rc::new(std::cell::Cell::new(3u64));
+    spawn_local({
+        let refresh_secs = refresh_secs.clone();
+        async move {
+            if let Some(s) = fetch_json::<ServerDto>("/api/server").await {
+                refresh_secs.set(s.tuning.ui_refresh_secs.clamp(1, 600));
+            }
+        }
+    });
 
     // Single hashchange listener for the whole app: back/forward navigation
     // switches both the tab and the provider detail page.
@@ -124,6 +137,7 @@ fn App() -> View {
     }
 
     spawn_local({
+        let refresh_secs = refresh_secs.clone();
         async move {
             loop {
                 if let Some(data) = fetch_json::<Vec<ModelItemDto>>("/api/models").await {
@@ -135,12 +149,14 @@ fn App() -> View {
                         models.set(data);
                     }
                 }
-                gloo_timers::future::sleep(std::time::Duration::from_secs(5)).await;
+                gloo_timers::future::sleep(std::time::Duration::from_secs(refresh_secs.get()))
+                    .await;
             }
         }
     });
 
     spawn_local({
+        let refresh_secs = refresh_secs.clone();
         async move {
             loop {
                 if let Some(data) = fetch_json::<Vec<ClientKeyDto>>("/api/client-keys").await {
@@ -151,12 +167,14 @@ fn App() -> View {
                         client_keys.set(data);
                     }
                 }
-                gloo_timers::future::sleep(std::time::Duration::from_secs(5)).await;
+                gloo_timers::future::sleep(std::time::Duration::from_secs(refresh_secs.get()))
+                    .await;
             }
         }
     });
 
     spawn_local({
+        let refresh_secs = refresh_secs.clone();
         async move {
             loop {
                 if let Some(data) = fetch_json::<Vec<ProviderDto>>("/api/providers").await {
@@ -174,7 +192,8 @@ fn App() -> View {
                 if na && need_auth.is_alive() {
                     need_auth.set(true);
                 }
-                gloo_timers::future::sleep(std::time::Duration::from_secs(3)).await;
+                gloo_timers::future::sleep(std::time::Duration::from_secs(refresh_secs.get()))
+                    .await;
             }
         }
     });
@@ -259,7 +278,8 @@ fn App() -> View {
                         );
                     }
                 }
-                gloo_timers::future::sleep(std::time::Duration::from_secs(3)).await;
+                gloo_timers::future::sleep(std::time::Duration::from_secs(refresh_secs.get()))
+                    .await;
             }
         }
     });

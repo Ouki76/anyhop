@@ -14,6 +14,13 @@ use crate::storage::{StatsRecord, Storage};
 
 use sticky::StickySessions;
 
+/// Largest number of per-model cooldowns kept for one key.
+///
+/// The model name comes from the client on a wildcard provider, so an attacker (or
+/// a busy multi-model client) could grow this map — and the health record written on
+/// every failure — without bound.
+const MAX_MODEL_COOLDOWNS: usize = 256;
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -195,7 +202,31 @@ impl KeyPool {
 
     /// Pick the next key available for this model according to the strategy.
     /// `session` enables sticky routing: the same session hash sticks to one key.
+    ///
+    /// Health only — used by callers that do not consume an in-flight slot (model
+    /// listing, quota probes). Request paths want [`KeyPool::pick_ready`].
     pub fn pick(&self, model: &str, session: Option<u64>) -> Option<Arc<KeyState>> {
+        self.pick_where(model, session, |_| true)
+    }
+
+    /// Admission-aware [`KeyPool::pick`]: the key must also have a free in-flight
+    /// slot.
+    ///
+    /// Returning a saturated key wasted the admission loop — every 25 ms poll
+    /// handed back the same one, `try_acquire` failed again, and the other keys
+    /// were never considered. With `fill_first` (the default for OAuth providers)
+    /// that made the pool's effective concurrency one key's `max_concurrent`:
+    /// under a 200-request storm a 2x2 pool served ~54 % of what it should.
+    pub fn pick_ready(&self, model: &str, session: Option<u64>) -> Option<Arc<KeyState>> {
+        self.pick_where(model, session, KeyState::has_capacity)
+    }
+
+    fn pick_where(
+        &self,
+        model: &str,
+        session: Option<u64>,
+        ready: impl Fn(&KeyState) -> bool + Copy,
+    ) -> Option<Arc<KeyState>> {
         // Sticky routing (round_robin/least_used; fill_first is sticky by design).
         if let Some(s) = session
             && !matches!(self.strategy, Strategy::FillFirst)
@@ -206,7 +237,7 @@ impl KeyPool {
                 let keys = lock(&self.keys);
                 return self
                     .sticky
-                    .rendezvous(s, &keys, |k| k.is_available(model))
+                    .rendezvous(s, &keys, |k| k.is_available(model) && ready(k))
                     .map(|i| keys[i].clone());
             }
             let now = now_ms();
@@ -214,22 +245,22 @@ impl KeyPool {
                 let keys = lock(&self.keys);
                 if let Some(k) = keys
                     .iter()
-                    .find(|k| k.id_hash == kid && k.is_available(model))
+                    .find(|k| k.id_hash == kid && k.is_available(model) && ready(k))
                 {
                     return Some(k.clone());
                 }
-                // The key went into cooldown/died — repick below.
+                // The key went into cooldown/died/became busy — repick below.
             }
-            let picked = self.pick_inner(model);
+            let picked = self.pick_inner(model, ready);
             if let Some(k) = &picked {
                 self.sticky.bind(s, &k.id_hash, now);
             }
             return picked;
         }
-        self.pick_inner(model)
+        self.pick_inner(model, ready)
     }
 
-    fn pick_inner(&self, model: &str) -> Option<Arc<KeyState>> {
+    fn pick_inner(&self, model: &str, ready: impl Fn(&KeyState) -> bool) -> Option<Arc<KeyState>> {
         let keys = lock(&self.keys);
         if keys.is_empty() {
             return None;
@@ -240,15 +271,18 @@ impl KeyPool {
                 let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
                 (0..n)
                     .map(|i| &keys[(start + i) % n])
-                    .find(|k| k.is_available(model))
+                    .find(|k| k.is_available(model) && ready(k))
                     .cloned()
             }
             Strategy::LeastUsed => keys
                 .iter()
-                .filter(|k| k.is_available(model))
+                .filter(|k| k.is_available(model) && ready(k))
                 .min_by_key(|k| k.requests.load(Ordering::Relaxed))
                 .cloned(),
-            Strategy::FillFirst => keys.iter().find(|k| k.is_available(model)).cloned(),
+            Strategy::FillFirst => keys
+                .iter()
+                .find(|k| k.is_available(model) && ready(k))
+                .cloned(),
         }
     }
 
@@ -280,7 +314,27 @@ impl KeyPool {
                 // the configured maximum like every other cooldown.
                 let until_ms = until_ms.min(now_ms().saturating_add(max.as_millis() as u64));
                 let secs = until_ms.saturating_sub(now_ms()) / 1000;
-                lock(&key.model_cooldowns).insert(model.to_string(), until_ms);
+                {
+                    let mut cooldowns = lock(&key.model_cooldowns);
+                    // Prune expired entries and cap the map: the model name is
+                    // client-chosen on a wildcard provider, every 429 inserts one,
+                    // and nothing ever removed them — so the map (and the health
+                    // record persisted on each failure) grew without bound.
+                    let now = now_ms();
+                    cooldowns.retain(|_, until| *until > now);
+                    if cooldowns.len() >= MAX_MODEL_COOLDOWNS {
+                        // Drop the entry closest to expiring: cheapest to lose and
+                        // the least likely to still be needed.
+                        if let Some(oldest) = cooldowns
+                            .iter()
+                            .min_by_key(|(_, until)| **until)
+                            .map(|(m, _)| m.clone())
+                        {
+                            cooldowns.remove(&oldest);
+                        }
+                    }
+                    cooldowns.insert(model.to_string(), until_ms);
+                }
                 key.has_model_cooldowns.store(true, Ordering::Relaxed);
                 self.emit(
                     key,
@@ -530,6 +584,60 @@ mod tests {
             None,
             tuning,
         )
+    }
+
+    /// A pool where every key admits exactly `per_key` concurrent requests.
+    fn pool_with_capacity(strategy: Strategy, secrets: &[&str], per_key: u32) -> KeyPool {
+        KeyPool::new(
+            "test".into(),
+            secrets.iter().map(|s| s.to_string()).collect(),
+            strategy,
+            per_key,
+            None,
+            None,
+            Arc::new(crate::config::Tuning::default()),
+        )
+    }
+
+    /// A saturated key must not shadow the rest of the pool.
+    ///
+    /// `pick` returns key 1 until it is *benched*, so with `fill_first` the
+    /// admission loop kept getting the same saturated key back: a 2x2 pool served
+    /// at half its capacity and the overflow was rejected.
+    #[test]
+    fn a_saturated_key_does_not_hide_the_others() {
+        let p = pool_with_capacity(Strategy::FillFirst, &["k1", "k2"], 1);
+        let first = p.pick_ready("m", None).expect("a ready key");
+        let held = first.try_acquire().expect("its only slot");
+        let second = p
+            .pick_ready("m", None)
+            .expect("the second key still has a slot");
+        assert_ne!(
+            first.id_hash, second.id_hash,
+            "pick_ready repeated the saturated key"
+        );
+        let held2 = second.try_acquire().expect("its slot");
+        assert!(
+            p.pick_ready("m", None).is_none(),
+            "both keys are at their cap, so nothing is ready"
+        );
+        // `pick` (health + capacity) is the same predicate here: model listing
+        // simply sees an empty pool while every key is busy, which is honest.
+        assert!(p.pick("m", None).is_none());
+        drop(held);
+        assert!(p.pick_ready("m", None).is_some(), "the slot was returned");
+        drop(held2);
+    }
+
+    /// `least_used` must also skip a key that has no room, not just the busiest one.
+    #[test]
+    fn least_used_skips_a_full_key() {
+        let p = pool_with_capacity(Strategy::LeastUsed, &["k1", "k2"], 1);
+        let a = p.pick_ready("m", None).expect("a key");
+        let guard = a.try_acquire().expect("slot");
+        let b = p.pick_ready("m", None).expect("the other key");
+        assert_ne!(a.id_hash, b.id_hash);
+        drop(guard);
     }
 
     #[allow(dead_code)] // used by the id-based tests below

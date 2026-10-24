@@ -156,6 +156,17 @@ impl KeyState {
     }
 
     /// Acquire an in-flight slot. Returns None when saturated.
+    /// Is there a free in-flight slot right now?
+    ///
+    /// `is_available` answers "can this key serve the model at all" (health,
+    /// cooldown, per-model quota). Admission also needs "…and does it have room":
+    /// without that, `fill_first` handed back the same saturated key forever while
+    /// the other keys of the pool sat idle, and the pool's real concurrency was one
+    /// key's `max_concurrent` instead of the sum.
+    pub fn has_capacity(&self) -> bool {
+        self.max_concurrent == 0 || self.in_flight.load(Ordering::Relaxed) < self.max_concurrent
+    }
+
     pub fn try_acquire(self: &Arc<Self>) -> Option<KeyGuard> {
         let limit = self.max_concurrent;
         loop {

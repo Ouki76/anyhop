@@ -110,6 +110,24 @@ def run_tests(original_toml):
     assert restr_ids == ["gemini/test-gemini"], f"Expected only gemini/test-gemini, got: {restr_ids}"
     print("  ok /v1/models with restricted client key returned ONLY allowed models")
 
+    # 6b. The single-model variant must filter identically, or a restricted key can
+    # enumerate the catalogue one id at a time (200 vs 404) and probe models it may
+    # not use. The allowed id still resolves (200).
+    status, _ = request("GET", "/v1/models/gemini/test-gemini", token="sk-hop-test-gemini-only")
+    assert status == 200, f"the allowed model must resolve, got {status}"
+    status, _ = request("GET", "/v1/models/mock/test-model", token="sk-hop-test-gemini-only")
+    assert status >= 400, f"a disallowed model must not resolve, got {status}"
+    print("  ok /v1/models/{id} honours the client-key allowlist")
+
+    # 6c. ...and so does the bare-name spelling of a disabled model.
+    status, _ = request("POST", "/api/models/disable", {"model": "mock/test-model"})
+    assert status == 200, f"disable failed: {status}"
+    status, _ = request("GET", "/v1/models/mock/test-model")
+    assert status == 404, f"disabled model resolved by its qualified id, got {status}"
+    status, _ = request("POST", "/api/models/enable", {"model": "mock/test-model"})
+    assert status == 200, f"enable failed: {status}"
+    print("  ok /v1/models/{id} honours the disabled set")
+
     # 7. Test /v1/chat/completions with restricted client key:
     # 7a. Allowed model: gemini/test-gemini -> 200 OK
     status, chat_resp = request("POST", "/v1/chat/completions", {

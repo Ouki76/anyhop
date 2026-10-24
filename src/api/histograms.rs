@@ -379,13 +379,33 @@ fn api_label(rest: &str) -> String {
     if !is_slug(resource) {
         return OTHER_ROUTE.to_owned();
     }
+    // Only a *known* resource may grow a `{id}` series. Before this, any random
+    // slug created one (`/api/zzz1/x`, `/api/zzz2/x`, …), so an unauthenticated
+    // client could send 500 distinct paths, exhaust [`MAX_SERIES`] and fold every
+    // later series — including real routes' new status codes — into `other` for
+    // the life of the process.
+    let known = matches!(
+        resource,
+        "providers"
+            | "keys"
+            | "combos"
+            | "client-keys"
+            | "models"
+            | "server"
+            | "config"
+            | "auth"
+            | "reload"
+            | "requests"
+            | "quotas"
+            | "events"
+    );
     match segments.next() {
         // Unknown single-segment resource: nothing to collapse, so do not invent
         // a series for it.
         None => OTHER_ROUTE.to_owned(),
-        // Unknown shape under a known-looking resource, or an id under an
-        // unknown one: keep the resource, hide the parameter. Deeper paths are
-        // folded into the same label.
+        Some(_) if !known => OTHER_ROUTE.to_owned(),
+        // A known route with an id: keep the resource, hide the parameter. Deeper
+        // paths are folded into the same label.
         Some(_) => format!("/api/{resource}/{{id}}"),
     }
 }
@@ -509,11 +529,16 @@ mod tests {
 
     #[test]
     fn route_label_collapses_ids_and_assets() {
-        // Known resource, unknown action → keep the resource, hide the parameter.
-        assert_eq!(route_label("/api/foo/12345"), "/api/foo/{id}");
+        // A *known* resource with an id → keep the resource, hide the parameter.
         assert_eq!(route_label("/api/providers/8675309"), "/api/providers/{id}");
+        assert_eq!(route_label("/api/models/1"), "/api/models/{id}");
         // Deeper paths collapse into the same series as their two-segment form.
-        assert_eq!(route_label("/api/foo/1/2/3"), "/api/foo/{id}");
+        assert_eq!(route_label("/api/providers/1/2/3"), "/api/providers/{id}");
+        // An *unknown* resource must not create a series at all: letting every
+        // random slug through made MAX_SERIES exhaustible by unauthenticated 404s,
+        // after which real routes folded into `other` for the process lifetime.
+        assert_eq!(route_label("/api/foo/12345"), "other");
+        assert_eq!(route_label("/api/zzz3/1"), "other");
         // Dashboard assets: bounded by construction.
         assert_eq!(route_label("/dashboard/"), "/dashboard");
         assert_eq!(

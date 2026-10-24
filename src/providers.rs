@@ -112,11 +112,14 @@ impl Provider {
                     "provider '{}': no accounts configured (run `{auth_cmd}`)",
                     cfg.name
                 );
-                let provider_client = build_http_client(effective_proxy)?;
+                // The configured tuning, not `Tuning::default()`: connect_timeout
+                // and the pool settings were dead config for every Antigravity and
+                // Codex account (only the provider-wide client below honoured them).
+                let provider_client = build_http_client_with(effective_proxy, &tuning)?;
                 let mut ag: Vec<Arc<Account>> = Vec::new();
                 for a in &cfg.accounts {
                     let client = match &a.proxy {
-                        Some(p) => build_http_client(Some(p))?,
+                        Some(p) => build_http_client_with(Some(p), &tuning)?,
                         None => provider_client.clone(),
                     };
                     if matches!(cfg.kind, ProviderKind::Antigravity) {
@@ -327,10 +330,14 @@ impl Provider {
                 let url = format!("{base}/models");
                 // key in a header, not the URL — reqwest errors include the URL
                 // in their Display, so a ?key= query would leak it into logs
-                let resp = self
-                    .client
-                    .get(&url)
-                    .header("x-goog-api-key", &key.secret)
+                let mut req = self.client.get(&url).header("x-goog-api-key", &key.secret);
+                // Same extra headers as the chat path: a gemini provider behind a
+                // gateway that needs a routing/beta header served completions but
+                // returned 401 for /v1/models (and an empty dashboard catalogue).
+                for (k, v) in &self.extra_headers {
+                    req = req.header(k, v);
+                }
+                let resp = req
                     .timeout(self.tuning.meta_timeout())
                     .send()
                     .await

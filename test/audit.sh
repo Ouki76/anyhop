@@ -26,8 +26,15 @@ else
 fi
 
 echo "== lints =="
-CLIPPY=$(cargo clippy --all-targets 2>&1 | grep -cE "^(warning|error)")
-if [ "$CLIPPY" = "0" ]; then
+# Exit status first: when the tool cannot run at all (missing component, a wrapper
+# that refuses), its message does not start with "warning"/"error", so counting
+# diagnostics alone reported a clean tree.
+CLIPPY_LOG=$(cargo clippy --all-targets 2>&1)
+CLIPPY_STATUS=$?
+CLIPPY=$(echo "$CLIPPY_LOG" | grep -cE "^(warning|error)")
+if [ "$CLIPPY_STATUS" -ne 0 ]; then
+    fail "clippy did not run cleanly (exit $CLIPPY_STATUS): $(echo "$CLIPPY_LOG" | tail -3 | tr '\n' ' ')"
+elif [ "$CLIPPY" = "0" ]; then
     ok "clippy --all-targets: clean"
 else
     fail "clippy: $CLIPPY diagnostics"
@@ -39,11 +46,18 @@ else
 fi
 
 echo "== tests =="
-UNIT=$(cargo test 2>&1 | grep -m1 "test result" | grep -oE "[0-9]+ passed")
-if echo "$UNIT" | grep -qE "^[0-9]+"; then
-    ok "cargo test: $UNIT"
+# Judge the run, not a substring: `test result: FAILED. 575 passed; 3 failed`
+# contains "575 passed" and used to be printed as ok, and only the *first* test
+# binary's line was inspected (so tests/fuzz_parsers.rs could fail unnoticed).
+TEST_LOG=$(cargo test 2>&1)
+TEST_STATUS=$?
+TOTAL=$(echo "$TEST_LOG" | grep -oE "^test result: [A-Z]+" | grep -c "ok")
+FAILED_BIN=$(echo "$TEST_LOG" | grep -cE "^test result: FAILED")
+if [ "$TEST_STATUS" -ne 0 ] || [ "$FAILED_BIN" -ne 0 ]; then
+    fail "cargo test (exit $TEST_STATUS, $FAILED_BIN failing binary(ies)): $(echo "$TEST_LOG" | grep -E '^(test result|failures:)' | tail -3 | tr '\n' ' ')"
 else
-    fail "cargo test failed"
+    PASSED=$(echo "$TEST_LOG" | grep -oE "[0-9]+ passed" | awk -F' ' '{s+=$1} END {print s+0}')
+    ok "cargo test: $PASSED passed in $TOTAL binaries"
 fi
 
 echo "== code policy =="
@@ -84,13 +98,20 @@ fi
 DIRECT=$(sed -n '/^\[dependencies\]/,/^\[/p' Cargo.toml | grep -cE "^[a-z]")
 ok "direct dependencies: $DIRECT"
 # Every dependency should be justified somewhere we can point at in review.
-if [ -f Cargo.lock ] && ! grep -q "name = \"rcgen\"" Cargo.lock; then
+if [ ! -f Cargo.lock ]; then
+    fail "Cargo.lock is missing (no reproducible build to audit)"
+elif grep -q "name = \"rcgen\"" Cargo.lock; then
+    fail "a test-only certificate generator (rcgen) leaked into the tree"
+else
     ok "no test-only certificate generator leaked into the tree"
 fi
 
 echo "== secrets =="
-if git ls-files | xargs grep -lE "1//0c[0-9A-Za-z_-]{20,}|sk-[a-f0-9]{20,}" 2>/dev/null | grep -q .; then
-    fail "a credential-looking string is tracked by git"
+# Patterns cover the shapes this project actually issues: Google refresh tokens,
+# OpenAI-style `sk-…`/`sk-proj-…`, and the gateway's own `sk-hop-…` client keys.
+SECRETS=$(git ls-files -z | xargs -0 grep -lE "1//0[0-9A-Za-z_-]{25,}|sk-(proj-|ant-|hop-)?[A-Za-z0-9_-]{24,}" 2>/dev/null)
+if [ -n "$SECRETS" ]; then
+    fail "a credential-looking string is tracked by git: $(echo "$SECRETS" | head -3 | tr '\n' ' ')"
 else
     ok "no credentials in tracked files"
 fi
@@ -109,6 +130,13 @@ else
 fi
 
 echo "== integration =="
+    # Build what the suite tests. It used to run ./target/release/anyhop whatever
+    # its age, so a local `audit.sh` could "verify" two-day-old code.
+    if cargo build --release >/tmp/anyhop-release-build.log 2>&1; then
+        ok "release binary rebuilt for the suite"
+    else
+        fail "the release build failed (see /tmp/anyhop-release-build.log)"
+    fi
     if [ -n "${ANYHOP_TEST_PORT:-}" ] || ! ss -ltn 2>/dev/null | grep -q ":18080 "; then
         # Pick a free port ourselves: a hardcoded one collides with a gateway left
         # behind by an earlier run, and the suite then talks to a stale binary

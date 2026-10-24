@@ -11,7 +11,11 @@ Single binary (~6MB), minimal resource footprint.
   `codex` (ChatGPT OAuth accounts)
 - **Combos**: virtual models with a fallback chain across providers (`[[combos]]`)
 - **Rotation strategies**: `round_robin`, `least_used`, `fill_first` (exhaust a key's quota → next)
-- **Failover**: 429 + Retry-After → precise cooldown, 401/403 → dead, 5xx/timeout → backoff;
+- **Failover**: 429 + `Retry-After` (seconds *or* an HTTP-date) → precise cooldown,
+  401 → dead, 403 → dead unless the body names a model/region/billing policy (then a
+  cooldown, so one forbidden model cannot take the whole provider down), 5xx/timeout → backoff;
+  an OAuth 401 also drops the cached access token so the next attempt refreshes instead of
+  replaying the rejected one;
   per-model cooldowns for Antigravity (one model's quota doesn't block the others);
   when every key is cooling the client gets `503` **with `Retry-After`**
 - **Proactive drain**: reads x-ratelimit-* headers, leaves a key before the limit is hit
@@ -444,6 +448,11 @@ burst = 20       # optional spike allowance (default: same as rpm)
 - The live bucket survives a config reload (`SIGHUP`) as long as the limits did not
   change, so editing one key does not hand every tenant a fresh quota.
 - Visible/edit in the dashboard (API Keys tab) and via `POST /api/client-keys/add|update`.
+- `[[client_keys]]` requires `[server] api_key` (or `admin_key`): client keys secure `/v1/*`,
+  and an admin credential is what keeps `/api/*` — the raw TOML editor, provider CRUD and the
+  OAuth endpoints — closed. `Config::validate` refuses the combination without one.
+- The per-key concurrency cap (`max_concurrent`) counts a request until its **body** is done,
+  so a long SSE stream holds its slot for as long as it is open.
 
 ## Benchmarks
 

@@ -61,6 +61,35 @@ fn normalize(a: &ModelAction) -> &str {
         .unwrap_or(a.model.trim())
 }
 
+/// Longest accepted model id.
+///
+/// Every `disabled_models` entry ends up in the TOML file, which is rewritten in
+/// full on every toggle, and in the event feed. An unbounded id (the field is a
+/// bare `String`) meant one request could add a multi-megabyte entry that every
+/// later config write had to fsync.
+const MAX_MODEL_ID_LEN: usize = 256;
+
+/// Reject model ids that cannot be real catalogue entries.
+fn validate_model_action(a: &ModelAction) -> Result<(), super::ApiError> {
+    let m = a.model.trim();
+    if m.is_empty() {
+        return Err(super::ApiError::BadRequest("model is required".into()));
+    }
+    if m.chars().count() > MAX_MODEL_ID_LEN {
+        return Err(super::ApiError::BadRequest(format!(
+            "model id is too long (max {MAX_MODEL_ID_LEN} characters)"
+        )));
+    }
+    // Reject control characters: they corrupt the log line, the event payload and
+    // (via the TOML writer) make the config file unreadable.
+    if m.chars().any(|c| c.is_control()) {
+        return Err(super::ApiError::BadRequest(
+            "model id must not contain control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Is `model` disabled under either spelling?
 ///
 /// Matches `proxy::access::model_disabled` exactly: the request path blocks a
@@ -149,6 +178,7 @@ pub async fn model_enable(
     State(state): State<Arc<AppState>>,
     Json(a): Json<ModelAction>,
 ) -> ApiResult {
+    validate_model_action(&a)?;
     let model = normalize(&a).to_string();
     clear_model(&mut dm_write(&state), &model);
     save_disabled(&state).await;
@@ -167,6 +197,7 @@ pub async fn model_disable(
     State(state): State<Arc<AppState>>,
     Json(a): Json<ModelAction>,
 ) -> ApiResult {
+    validate_model_action(&a)?;
     let model = normalize(&a).to_string();
     dm_write(&state).insert(model.clone());
     save_disabled(&state).await;
@@ -185,6 +216,7 @@ pub async fn model_toggle(
     State(state): State<Arc<AppState>>,
     Json(a): Json<ModelAction>,
 ) -> ApiResult {
+    validate_model_action(&a)?;
     let model = normalize(&a).to_string();
     let new_enabled = {
         let mut dm = dm_write(&state);

@@ -31,7 +31,7 @@
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Extension, State};
@@ -627,7 +627,12 @@ async fn forward(
     let client_key_owned = key_perm.as_ref().and_then(|e| e.0.key_name.clone());
     let client_key = client_key_owned.as_deref();
 
-    let router = state.router.load();
+    // `load_full()` (an owned Arc), not `load()` (a guard): arc-swap's `store()`
+    // waits for every outstanding guard on the old pointer, so a config save would
+    // block until this whole upstream round-trip finished — up to the provider's
+    // attempt timeout (120 s by default). The Arc is cheap and the router is
+    // immutable, so holding it across the awaits costs nothing.
+    let router = state.router.load_full();
     let planned = match plan(&router, &request.model, endpoint.capability) {
         Ok(plan) => plan,
         Err(reject) => return reject.into_response(),
@@ -661,7 +666,7 @@ async fn forward(
         };
         for _ in 0..budget.max(1) {
             attempts += 1;
-            let Some(key) = provider.pool.pick(upstream_model, None) else {
+            let Some(key) = provider.pool.pick_ready(upstream_model, None) else {
                 break; // pool exhausted for this model — try the next target
             };
             let Some(guard) = key.try_acquire() else {
@@ -737,7 +742,7 @@ async fn forward(
                 );
                 // The guard rides along in the stream: the key keeps its
                 // in-flight slot until the client has the whole payload.
-                return relay_upstream(resp, guard);
+                return relay_upstream(resp, guard, provider.timeout);
             }
 
             // Failure: classify exactly like chat so key health stays consistent.
@@ -745,7 +750,7 @@ async fn forward(
                 .headers()
                 .get(header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
+                .and_then(super::chat::parse_retry_after_header);
             log_attempt(
                 &state,
                 provider,
@@ -778,7 +783,7 @@ async fn forward(
                     // The caller's problem (400/404/413/…): relay the upstream
                     // body untouched instead of burning keys on retries. It is
                     // usually a JSON error with a precise message.
-                    return relay_upstream(resp, guard);
+                    return relay_upstream(resp, guard, provider.timeout);
                 }
             }
             drop(guard);
@@ -832,7 +837,7 @@ fn forward_header(name: &HeaderName) -> bool {
 /// Relay an upstream response: status and content-type as received, body streamed
 /// without buffering (a 20 MiB image or a long TTS clip must not be copied into
 /// memory just to be handed to the client).
-fn relay_upstream(resp: reqwest::Response, guard: KeyGuard) -> Response {
+fn relay_upstream(resp: reqwest::Response, guard: KeyGuard, idle: Duration) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let headers: Vec<(HeaderName, HeaderValue)> = resp
         .headers()
@@ -840,11 +845,66 @@ fn relay_upstream(resp: reqwest::Response, guard: KeyGuard) -> Response {
         .filter(|(name, _)| forward_header(name))
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
-    let stream = resp.bytes_stream().map(move |chunk| {
-        let _ = &guard;
+    // `req.send()` only covers the head: without a per-chunk deadline a provider
+    // that answers 200 and then stalls held the client, the socket and the key's
+    // in-flight slot forever (there is no global request timeout above this).
+    let inner = resp.bytes_stream().map(|chunk| {
         chunk.map_err(|e| std::io::Error::other(format!("upstream stream error: {e}")))
     });
+    let stream = idle_stream(Box::pin(inner), idle).map(move |chunk| {
+        let _ = &guard;
+        chunk
+    });
     relay(status, headers, Body::from_stream(stream))
+}
+
+/// Fail a relayed stream when the upstream goes quiet for `idle`.
+///
+/// Same shape as `chat::stream::idle_body`; media responses (images, audio) can be
+/// large and slow, so the deadline is the provider's configured timeout rather
+/// than a short fixed one.
+fn idle_stream(
+    stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+    idle: Duration,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
+    struct State {
+        inner: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+        idle: Duration,
+        done: bool,
+    }
+    let state = State {
+        inner: stream,
+        idle,
+        done: false,
+    };
+    Box::pin(futures::stream::unfold(state, |mut s| async move {
+        if s.done {
+            return None;
+        }
+        let item = {
+            let next = s.inner.next();
+            futures::pin_mut!(next);
+            tokio::time::timeout(s.idle, next).await
+        };
+        match item {
+            Ok(Some(Ok(chunk))) => Some((Ok(chunk), s)),
+            Ok(Some(Err(e))) => {
+                s.done = true;
+                Some((Err(e), s))
+            }
+            Ok(None) => None,
+            Err(_) => {
+                s.done = true;
+                Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("upstream body idle for {:?}", s.idle),
+                    )),
+                    s,
+                ))
+            }
+        }
+    }))
 }
 
 /// Build a response with an exact status, a fixed header list and a raw body.

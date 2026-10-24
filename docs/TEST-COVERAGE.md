@@ -306,7 +306,7 @@ blocks, where the crate's lint config allows them.
 
 | metric | before | after |
 |---|---|---|
-| `cargo test` (library) | 479 | **576** |
+| `cargo test` (library) | 479 | **579** (2026-10-24 audit) |
 | `cargo test` (integration, `tests/`) | 0 | 18 (added by a parallel agent) |
 | doctests | 3 ignored | 3 ignored |
 | tests added by this audit | — | **68** |
@@ -328,7 +328,7 @@ process within five seconds. That is a second suite holding the same port, the
 exact collision the "run it alone" rule exists for. The reported `PASS=38 FAIL=0`
 comes from a re-run with no other gateway, mock or suite alive.
 
-## 6. Closed in this round (was: "reported, not fixed")
+## 7. Closed in this round (was: "reported, not fixed")
 
 | # | Finding | Fix |
 | --- | --- | --- |

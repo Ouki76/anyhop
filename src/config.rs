@@ -199,7 +199,10 @@ impl Tuning {
         std::time::Duration::from_secs(self.oauth_http_timeout_secs.max(1))
     }
     pub fn token_refresh_window(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.token_refresh_window_secs.max(1))
+        // 0 is a documented value ("refresh only once expired") and the validator
+        // accepts it, but `.max(1)` silently turned it into one second — so the
+        // setting could not be expressed at all.
+        std::time::Duration::from_secs(self.token_refresh_window_secs)
     }
 
     /// Reject values that would make the gateway unusable rather than merely odd
@@ -360,7 +363,6 @@ impl Config {
                 );
             }
         }
-        self.tuning.validate()?;
         anyhow::ensure!(
             matches!(self.ratelimit.backend.as_str(), "local" | "redis"),
             "ratelimit.backend must be \"local\" or \"redis\""
@@ -543,6 +545,20 @@ impl Config {
                 }
             }
         }
+
+        // A client-key deployment is a *shared* gateway by definition, but `/api/*`
+        // is gated only by `admin_key`/`api_key`. With neither configured, the
+        // tenant keys locked `/v1/*` while the raw-TOML editor, provider CRUD and
+        // the OAuth endpoints stayed unauthenticated — `GET /api/config` handed
+        // out every provider secret. Refuse that combination outright.
+        anyhow::ensure!(
+            self.client_keys.is_empty()
+                || self.server.api_key.is_some()
+                || self.server.admin_key.is_some(),
+            "client_keys are configured but neither server.api_key nor server.admin_key is set: \
+             /api/* (raw config editor, provider keys, OAuth) would accept unauthenticated \
+             requests. Set [server] api_key (it also secures /api/*) or remove the client keys"
+        );
 
         let mut key_values = std::collections::HashSet::new();
         for (i, k) in self.client_keys.iter().enumerate() {

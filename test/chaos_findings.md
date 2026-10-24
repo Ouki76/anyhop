@@ -9,8 +9,17 @@ python3 test/chaos_test.py --only 1,6      # selected scenarios
 python3 test/chaos_test.py --keep          # keep temp dir + per-instance logs
 ```
 
-Result on the current tree (`target/release/anyhop`, built 2026-10-22):
+Result at the time of the audit (`target/release/anyhop`, built 2026-10-22):
 **CHAOS PASS=67 FAIL=10**, identical outcome across three consecutive runs.
+
+> **Status 2026-10-24: all eight findings below are fixed and the run is green.**
+> F1 `[tuning]` now reaches the pool (`providers.rs`/`pool/mod.rs`); F2 response-body
+> idle deadline (`proxy/chat/stream.rs::open_body` + `idle_body`); F3 bounded
+> shutdown (`[tuning] shutdown_grace_secs`); F4 saturation answers 429 + `Retry-After`;
+> F5 request-body read idle timeout (`[tuning] client_body_timeout_secs`); F6
+> `accept_2xx` rejects a wrong content type; F7 `Retry-After` is rounded up in both
+> limiters; F8 `/metrics` emits `# HELP`/`# TYPE` before its samples.
+> The table is kept as the historical record of the run.
 
 Nine findings are real defects; `1.14`, `1.16`, `1.17` are three symptoms of the
 same root cause, so there are **8 distinct bugs**:

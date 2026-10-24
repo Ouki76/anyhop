@@ -38,6 +38,9 @@ use self::retry::check_drain_headers;
 use self::session::session_key_with;
 use self::stream::{Accepted, success_response};
 
+/// Shared with the other /v1 handlers (embeddings, media) so every one of them
+/// accepts both `Retry-After` spellings.
+pub(crate) use self::errors::parse_retry_after as parse_retry_after_header;
 pub use self::session::session_key;
 
 pub async fn chat_completions(
@@ -49,7 +52,41 @@ pub async fn chat_completions(
     // Fast path: byte-level peek of model/stream; Value DOM only when a
     // translating provider actually needs it.
     let (model, is_stream, model_span, mut json) = match crate::scan::peek_request(&body) {
-        Some((m, s)) => (m, s, crate::scan::string_field_span(&body, b"model"), None),
+        // The byte peek stops as soon as both fields are known, so it can return a
+        // `model` the upstream will *not* use: with
+        // `{"model":"cheap","stream":false,"model":"expensive"}` it never reaches the
+        // second key. `string_field_span` walks the whole body and reports the
+        // duplicate, which is exactly the cue to let the DOM decide — serde and
+        // every mainstream upstream resolve duplicates last-one-wins, so
+        // authorizing the DOM value keeps routing, the allowlist and the upstream
+        // in agreement (this used to be an allowlist bypass for pass-through
+        // providers: authorized as "cheap", forwarded verbatim, executed as
+        // "expensive").
+        Some((m, s)) => match crate::scan::string_field_span(&body, b"model") {
+            Some(span) => (m, s, Some(span), None),
+            None => {
+                let v: Value = match serde_json::from_slice(&body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid JSON body: {e}"),
+                            "invalid_request_error",
+                        );
+                    }
+                };
+                let m = v.get("model").and_then(|m| m.as_str()).map(str::to_string);
+                let Some(m) = m else {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "missing or invalid 'model' field",
+                        "invalid_request_error",
+                    );
+                };
+                let s = v.get("stream").and_then(|v| v.as_bool()).unwrap_or(s);
+                (m, s, None, Some(v))
+            }
+        },
         None => {
             let v: Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
@@ -74,7 +111,12 @@ pub async fn chat_completions(
         }
     };
 
-    let router = state.router.load();
+    // `load_full()` (an owned Arc), not `load()` (a guard): arc-swap's `store()`
+    // waits for every outstanding guard on the old pointer, so a config save would
+    // block until this whole upstream round-trip finished — up to the provider's
+    // attempt timeout (120 s by default). The Arc is cheap and the router is
+    // immutable, so holding it across the awaits costs nothing.
+    let router = state.router.load_full();
     let Some(resolved) = router.resolve(&model) else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -196,6 +238,9 @@ pub async fn chat_completions(
     let client_key = key_perm.as_ref().and_then(|e| e.0.key_name.clone());
     let client_key = client_key.as_deref();
     let total = targets.len();
+    // Kept for the combo-exhaustion answer: the *last* target's cause and name.
+    let mut last_provider: Option<String> = None;
+    let mut last_failure: Option<TargetFailure> = None;
     for (i, (provider, upstream_model)) in targets.iter().enumerate() {
         let result = run_target(
             &state,
@@ -217,6 +262,8 @@ pub async fn chat_completions(
                 return resp;
             }
             Err(failure) if total > 1 => {
+                last_provider = Some(provider.name.clone());
+                last_failure = Some(failure.clone());
                 state.events.emit(crate::events::DashEvent::new(
                     "combo",
                     &model,
@@ -240,11 +287,17 @@ pub async fn chat_completions(
             }
         }
     }
-    error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        format!("combo '{model}': all {total} targets exhausted"),
-        "provider_unavailable",
-    )
+    // A combo used to answer a bare 503 whatever happened, dropping the last
+    // target's detail *and* its Retry-After — the client could not tell "wait 5 s"
+    // from "everything is gone". Reuse the single-target answer.
+    match (last_provider, last_failure) {
+        (Some(provider), Some(failure)) => failure_response(&provider, failure),
+        _ => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("combo '{model}': all {total} targets exhausted"),
+            "provider_unavailable",
+        ),
+    }
 }
 
 /// Public wrapper for the FIM endpoint.
@@ -369,8 +422,15 @@ async fn run_target(
     // so a hot `[tuning]` reload cannot make the loop wait for two different
     // budgets in the same request.
     let capacity_budget = state.tuning().capacity_wait();
+    // One deadline for the whole target, not one per attempt: `admit` used to re-arm
+    // a full `capacity_wait_ms` on every round, so a saturated pool took
+    // `max_retries x capacity_wait_ms` (4 x 5 s = 20 s with the defaults, x chain
+    // length for a combo) before the client got the documented 429 — long enough to
+    // hit a normal client timeout, with no upstream attempt made at all.
+    let capacity_deadline = std::time::Instant::now() + capacity_budget;
     for _ in 0..attempts.max(1) {
-        let (key, guard) = match admit(provider, model, session, capacity_budget).await {
+        let remaining = capacity_deadline.saturating_duration_since(std::time::Instant::now());
+        let (key, guard) = match admit(provider, model, session, remaining).await {
             Admission::Ready(key, guard) => (key, guard),
             Admission::Busy => {
                 // Healthy keys, no free slot: a 100 ms burst, not an outage. A
@@ -379,7 +439,13 @@ async fn run_target(
                 // debug!: a storm would otherwise write one warn line per round
                 // per request — thousands of lines describing one busy second.
                 tracing::debug!(provider = %provider.name, model, "every key is at its concurrency limit");
-                last = Some(TargetFailure::Capacity { attempts: made });
+                // keep_specific, not a hard assignment: a busy round after a real
+                // 5xx used to erase the cause, and the client was told "your key is
+                // at its concurrency limit" for a provider that had just failed.
+                keep_specific(&mut last, TargetFailure::Capacity { attempts: made });
+                if remaining.is_zero() {
+                    break;
+                }
                 continue;
             }
             Admission::Unavailable => {
@@ -401,7 +467,30 @@ async fn run_target(
                     Some(span) if raw.get(span.clone()) != Some(model.as_bytes()) => {
                         splice_model(raw, span, model)
                     }
-                    _ => raw.clone(), // Bytes::clone is a refcount bump, no copy
+                    Some(_) => raw.clone(), // Bytes::clone is a refcount bump, no copy
+                    // No unique span: the body carries a duplicate/escaped `model`
+                    // key. Forwarding `raw` would send the client's *last* value to
+                    // the upstream while `model_span` authorized the first one, so
+                    // rebuild from the DOM we already parsed and pin the value this
+                    // request was routed with.
+                    None => match payload {
+                        Some(v) => {
+                            let mut v = v.clone();
+                            v["model"] = Value::String(model.to_string());
+                            match serde_json::to_vec(&v) {
+                                Ok(out) => Bytes::from(out),
+                                Err(e) => {
+                                    warn!("cannot re-encode the request body: {e}");
+                                    return Ok(error_response(
+                                        StatusCode::BAD_REQUEST,
+                                        "invalid JSON body",
+                                        "invalid_request_error",
+                                    ));
+                                }
+                            }
+                        }
+                        None => raw.clone(),
+                    },
                 };
                 provider
                     .client
@@ -430,7 +519,7 @@ async fn run_target(
                 }
                 provider
                     .client
-                    .post(format!("{}/v1/messages", provider.base_url))
+                    .post(anthropic::messages_url(&provider.base_url))
                     .header("x-api-key", &key.secret)
                     .header("anthropic-version", anthropic::API_VERSION)
                     .json(&body)
@@ -569,8 +658,30 @@ async fn run_target(
                 stream::accept_2xx(provider.kind, is_stream, &ct)
             {
                 log_req("bad_content_type");
-                provider.pool.report_failure(&key, FailKind::Server, model);
-                warn!(provider = %provider.name, model, content_type = %ct, "upstream 2xx is not a completion, benching the key");
+                // An error *page* is the provider's fault; a JSON answer to a
+                // `stream: true` request is not — compat proxies ignore the flag,
+                // and booking that as a key failure let any client drive the
+                // exponential backoff to `max_cooldown` and take the provider out
+                // for everyone. Answer 502 (the client can retry without stream).
+                let provider_fault = !stream::is_json_like(&ct);
+                if provider_fault {
+                    provider.pool.report_failure(&key, FailKind::Server, model);
+                    warn!(provider = %provider.name, model, content_type = %ct, "upstream 2xx is not a completion, benching the key");
+                } else {
+                    warn!(provider = %provider.name, model, content_type = %ct, "upstream answered JSON to a streaming request");
+                }
+                if !provider_fault {
+                    drop(guard);
+                    return Ok(error_response(
+                        StatusCode::BAD_GATEWAY,
+                        format!(
+                            "provider '{}' answered '{ct}' to a streaming request; retry without \
+                             \"stream\": true",
+                            provider.name
+                        ),
+                        "upstream_error",
+                    ));
+                }
                 last = Some(TargetFailure::BadBody {
                     attempts: made,
                     content_type: ct,
@@ -610,11 +721,13 @@ async fn run_target(
         drop(guard);
 
         let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        // Both spellings: delta-seconds and an HTTP-date (`Retry-After: 0` is
+        // clamped to 1 s instead of producing a zero-length cooldown).
         let retry_after_secs = resp
             .headers()
             .get(header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
+            .and_then(errors::parse_retry_after);
         let text = resp.text().await.unwrap_or_default();
         let snippet: String = text.chars().take(1000).collect();
 
@@ -622,13 +735,27 @@ async fn run_target(
             ErrorAction::ModelQuota => {
                 // Antigravity quotas are per-model: parse exact reset time,
                 // fallback to a short per-model cooldown when absent.
-                let until_ms = antigravity::parse_quota_reset_ms(&text).unwrap_or_else(|| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64
-                        + 60_000
-                });
+                // Prefer the exact quota reset, then the header (a plain
+                // RESOURCE_EXHAUSTED often carries `Retry-After: 2`, and benching
+                // the model for a flat 60 s turns a 2-second hiccup into a minute
+                // of "model unavailable" on every account), then a short default.
+                let until_ms = antigravity::parse_quota_reset_ms(&text)
+                    .or_else(|| {
+                        retry_after_secs.map(|secs| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64
+                                + secs * 1000
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64
+                            + 60_000
+                    });
                 provider
                     .pool
                     .report_failure(&key, FailKind::ModelQuota { until_ms }, model);
@@ -643,6 +770,23 @@ async fn run_target(
                 warn!(provider = %provider.name, key = %key.masked(), retry_after = ?retry_after_secs, "rate limited, key on cooldown");
             }
             ErrorAction::Auth => {
+                // The upstream rejected a token we believed valid. Drop the cached
+                // access token as well as marking the key: otherwise a re-enabled
+                // account (or any later retry) replays the same rejected token until
+                // it expires, and the operator sees "still broken" after fixing it.
+                match provider.kind {
+                    ProviderKind::Antigravity => {
+                        if let Some(account) = provider.ag_account(&key.secret) {
+                            account.invalidate_access_token().await;
+                        }
+                    }
+                    ProviderKind::Codex => {
+                        if let Some(account) = provider.codex_account(&key.secret) {
+                            account.invalidate_access_token().await;
+                        }
+                    }
+                    _ => {}
+                }
                 provider.pool.report_failure(&key, FailKind::Auth, model);
                 warn!(provider = %provider.name, key = %key.masked(), "auth failed, key marked dead");
             }
@@ -720,7 +864,9 @@ async fn admit(
 ) -> Admission {
     let started = std::time::Instant::now();
     loop {
-        if let Some(key) = provider.pool.pick(model, session) {
+        // `pick_ready`, not `pick`: admission is waiting for a *slot*, so a
+        // saturated key must not be handed back (see `KeyPool::pick_ready`).
+        if let Some(key) = provider.pool.pick_ready(model, session) {
             if let Some(guard) = key.try_acquire() {
                 return Admission::Ready(key, guard);
             }
@@ -729,7 +875,7 @@ async fn admit(
             return Admission::Unavailable;
         }
         let waited = started.elapsed();
-        if waited >= budget {
+        if budget.is_zero() || waited >= budget {
             return Admission::Busy;
         }
         // Never sleep past the deadline: the budget bounds the client's latency.

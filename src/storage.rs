@@ -257,13 +257,24 @@ struct RecentEntry {
 
 impl Storage {
     pub fn open(path: &str) -> anyhow::Result<Self> {
-        let db = Arc::new(Database::create(Path::new(path))?);
         // The state file holds OAuth tokens and runtime-added keys: owner-only.
+        // Create it with 0600 *before* redb opens it — creating the database and
+        // chmod-ing afterwards left a window where the file was 0644 under the
+        // process umask (a few ms is plenty for a backup/sync agent), and the
+        // chmod error used to be discarded silently.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(path);
+            if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+                tracing::warn!("cannot set 0600 on state file '{path}': {e}");
+            }
         }
+        let db = Arc::new(Database::create(Path::new(path))?);
         // Ensure tables exist.
         let wtx = db.begin_write()?;
         {

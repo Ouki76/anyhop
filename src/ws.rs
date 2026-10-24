@@ -845,15 +845,24 @@ fn validate_close(payload: &[u8]) -> io::Result<()> {
         [_] => Err(protocol(
             "a close frame's payload must be empty or carry a 2-byte status code",
         )),
-        [hi, lo, ..] => {
+        [hi, lo, ref rest @ ..] => {
+            let reason: &[u8] = rest;
             let code = u16::from_be_bytes([hi, lo]);
-            if close_code_is_valid(code) {
-                Ok(())
-            } else {
-                Err(protocol(format!(
+            if !close_code_is_valid(code) {
+                return Err(protocol(format!(
                     "close status code {code} must not appear on the wire (RFC 6455 §7.4.1)"
-                )))
+                )));
             }
+            // §5.5.1: the reason after the code is UTF-8 text. Without this check
+            // the relay echoed an upstream close frame verbatim to the other hop,
+            // so the *gateway* emitted a frame the RFC forbids (and `close_reason`
+            // silently returned None for it).
+            if std::str::from_utf8(reason).is_err() {
+                return Err(protocol(
+                    "close reason is not valid UTF-8 (RFC 6455 §5.5.1)",
+                ));
+            }
+            Ok(())
         }
     }
 }

@@ -215,6 +215,19 @@ impl Account {
         })
     }
 
+    /// Drop the cached access token so the next call refreshes it.
+    ///
+    /// Called when the *upstream* rejects a token we believed valid (401/403):
+    /// without this, the account kept replaying the rejected token until its
+    /// `expires_at_ms` (up to an hour), so re-enabling a key in the dashboard —
+    /// or any retry after the operator fixed the account — failed again with the
+    /// same stale credential. The refresh token is kept.
+    pub async fn invalidate_access_token(&self) {
+        let mut st = self.state.lock().await;
+        st.access_token = None;
+        st.expires_at_ms = 0;
+    }
+
     /// Returns a valid access token, refreshing it if expired.
     pub async fn ensure_access_token(&self) -> Result<String, AuthError> {
         let mut st = self.state.lock().await;
@@ -1088,7 +1101,10 @@ mod oauth_state_tests {
         // races with concurrent readers; this is a single-threaded test body.
         #[allow(unsafe_code)]
         unsafe {
-            std::env::set_var("ANYHOP_ANTIGRAVITY_CLIENT_ID", "test.apps.googleusercontent.com");
+            std::env::set_var(
+                "ANYHOP_ANTIGRAVITY_CLIENT_ID",
+                "test.apps.googleusercontent.com",
+            );
             std::env::set_var("ANYHOP_ANTIGRAVITY_CLIENT_SECRET", "test-secret");
         }
         for _ in 0..8 {

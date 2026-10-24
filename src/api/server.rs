@@ -414,15 +414,27 @@ pub async fn update_server(
     // keys, OAuth flows) and `/v1/*` world-open. That is a deliberate choice for a
     // localhost gateway and never for a listening one.
     if body.clear_api_key || body.clear_admin_key {
-        let listen = body
-            .listen
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or(cur.listen.as_str());
-        if !listen_is_loopback(listen) {
+        // Check the address the process is *actually* bound to, not the one the
+        // request asks for. `listen` is restart-only, so `{clear_api_key: true,
+        // listen: "127.0.0.1:8080"}` on a live 0.0.0.0 gateway passed the old
+        // check and immediately made an unauthenticated admin API while the socket
+        // still listened publicly. Changing the listener and clearing the key in
+        // one request is therefore refused outright.
+        let requested = body.listen.as_deref().map(str::trim);
+        if let Some(requested) = requested
+            && requested != cur.listen.as_str()
+        {
+            return Err(ApiError::bad_request(
+                "listen changes take effect on restart: change the listener first, then \
+                 (with the gateway on a loopback address) clear the key"
+                    .to_string(),
+            ));
+        }
+        if !listen_is_loopback(cur.listen.as_str()) {
             return Err(ApiError::bad_request(format!(
-                "refusing to clear a key while listen = '{listen}' is reachable from the \
-                 network: bind a loopback address (127.0.0.1) first, or rotate the key instead"
+                "refusing to clear a key while listen = '{}' is reachable from the \
+                 network: bind a loopback address (127.0.0.1) first, or rotate the key instead",
+                cur.listen
             )));
         }
     }

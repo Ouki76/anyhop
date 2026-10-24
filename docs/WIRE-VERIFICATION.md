@@ -44,9 +44,9 @@ request that reproduces it.
 | --- | --- | --- |
 | 1 | Gemini `functionCall` chunking → distinct `index`/`id`, `finish_reason: tool_calls` | **PASS** (per-call `index` and ids are distinct; the per-stream counter is also proven directly on the loopback path) |
 | 2 | `usageMetadata` repeated per chunk → counters bump once | **PASS** (with one semantic caveat: `total_tokens` includes thinking tokens) |
-| 3 | Thinking + tools round trip (replay the gateway's own output) | **FAIL** — the gateway's own output is rejected with 400, both with and without the signature |
-| 4 | `response_format` → `responseMimeType` / `responseJsonSchema` | **FAIL** — the field is dropped entirely; no such mapping exists in the tree |
-| 5 | Model id spellings (`provider/model`, bare, `models/`-prefixed) | **PASS for `type = "gemini"`, FAIL for `type = "antigravity"`** (URL is never doubled, but the `models/` prefix is not normalized in the antigravity envelope → upstream 404) |
+| 3 | Thinking + tools round trip (replay the gateway's own output) | **CLOSED (2026-10-24)** — was FAIL; `thoughtSignature` now rides as a sibling of `functionCall` on replay (`src/gemini.rs`), covered by unit tests |
+| 4 | `response_format` → `responseMimeType` / `responseJsonSchema` | **CLOSED (2026-10-24)** — was FAIL; `apply_response_format` maps all three OpenAI shapes and rejects unknown ones by name instead of dropping them |
+| 5 | Model id spellings (`provider/model`, bare, `models/`-prefixed) | **PASS**, including the antigravity envelope (the `models/` prefix is stripped once); the embeddings path was fixed in the 2026-10-24 audit |
 | 6 | Anthropic / Codex | **NOT TESTABLE HERE** — no such provider is configured |
 
 ---

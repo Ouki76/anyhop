@@ -134,8 +134,12 @@ async fn save_keys(state: &Arc<AppState>) {
 }
 
 pub fn mask_key(k: &str) -> String {
+    // The head and tail slices must never overlap: with `take(7)` + `skip(n-4)` a
+    // 9-char key was printed in full (`sk-team...am-a` reconstructs it), and that
+    // mask becomes the default key *name*, which is a Prometheus label and part of
+    // the event/request feeds. Short keys get no mask at all.
     let n = k.chars().count();
-    if n <= 8 {
+    if n < 16 {
         return "***".to_string();
     }
     let head: String = k.chars().take(7).collect();

@@ -153,6 +153,18 @@ impl CodexAccount {
         }
     }
 
+    /// Drop the cached access token so the next call refreshes it.
+    ///
+    /// Called when the upstream rejects a token we believed valid (401/403):
+    /// otherwise the rejected token was replayed until `expires_at_ms` (up to an
+    /// hour), so a re-enabled account (or an operator retry) failed again with the
+    /// same stale credential. The refresh token is kept.
+    pub async fn invalidate_access_token(&self) {
+        let mut st = self.state.lock().await;
+        st.access_token = None;
+        st.expires_at_ms = 0;
+    }
+
     pub async fn ensure_access_token(&self) -> Result<String, AuthError> {
         let mut st = self.state.lock().await;
         if let Some(t) = &st.access_token {
@@ -315,15 +327,59 @@ pub fn translate_request(model: &str, body: &Value) -> Result<Value, String> {
         }
     }
     if let Some(effort) = body.get("reasoning_effort").and_then(|e| e.as_str()) {
+        // `none` used to be mapped to `minimal` — the opposite of what the client
+        // asked for — and `minimal` is itself rejected by models that only accept
+        // low/medium/high. Omit `reasoning` instead: the backend then applies the
+        // model's own default, which is the closest legal request.
         let mapped = match effort {
-            "none" | "minimal" => "minimal",
-            "xhigh" | "max" => "xhigh",
-            other => other,
+            "none" => None,
+            "minimal" => Some("minimal"),
+            "xhigh" | "max" => Some("xhigh"),
+            other => Some(other),
         };
-        req["reasoning"] = json!({"effort": mapped, "summary": "auto"});
+        if let Some(mapped) = mapped {
+            req["reasoning"] = json!({"effort": mapped, "summary": "auto"});
+        }
     }
-    if let Some(t) = body.get("temperature") {
-        req["temperature"] = t.clone();
+    // No `temperature`: every Codex backend model is a reasoning model, and the
+    // Responses API rejects sampling parameters for them — forwarding one turned
+    // any client that sets a temperature (most OpenAI SDK examples do) into a 400.
+    if body.get("temperature").is_some() {
+        tracing::debug!("codex: dropping 'temperature' (reasoning models do not sample)");
+    }
+    // Structured output: the Responses API expresses it as `text.format`, so a
+    // json_schema request used to come back as prose with HTTP 200.
+    if let Some(rf) = body.get("response_format") {
+        match rf.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "json_schema" => {
+                let js = rf.get("json_schema");
+                let name = js
+                    .and_then(|s| s.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("output");
+                let schema = js
+                    .and_then(|s| s.get("schema"))
+                    .or_else(|| rf.get("schema"))
+                    .cloned()
+                    .unwrap_or(json!({"type": "object"}));
+                let strict = js
+                    .and_then(|s| s.get("strict"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                req["text"] = json!({
+                    "format": {
+                        "type": "json_schema",
+                        "name": name,
+                        "schema": schema,
+                        "strict": strict,
+                    }
+                });
+            }
+            "json_object" => {
+                req["text"] = json!({"format": {"type": "json_object"}});
+            }
+            _ => {}
+        }
     }
     if let Some(mt) = body
         .get("max_completion_tokens")
@@ -1169,7 +1225,12 @@ mod translate_tests {
             "reasoning_effort": "max"
         });
         let out = translate_request("m", &body).expect("translates");
-        assert_eq!(out["temperature"], 0.3);
+        // Codex models are reasoning models: the Responses API rejects sampling
+        // parameters for them, so a forwarded temperature was a guaranteed 400.
+        assert!(
+            out.get("temperature").is_none(),
+            "temperature must not be forwarded to a reasoning backend: {out}"
+        );
         assert_eq!(out["max_output_tokens"], 512);
         assert_eq!(
             out["reasoning"]["effort"], "xhigh",

@@ -46,9 +46,47 @@ fn map_finish(r: &str) -> &'static str {
     match r {
         "STOP" => "stop",
         "MAX_TOKENS" => "length",
-        "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "SPII" => "content_filter",
+        "SAFETY"
+        | "RECITATION"
+        | "PROHIBITED_CONTENT"
+        | "BLOCKLIST"
+        | "SPII"
+        | "LANGUAGE"
+        | "IMAGE_SAFETY"
+        | "IMAGE_PROHIBITED_CONTENT"
+        | "NO_IMAGE" => "content_filter",
+        // These are *failed* generations: the text is missing or malformed, so
+        // mapping them to "stop" advertised an empty answer as a normal completion
+        // (the exact anti-pattern the promptFeedback branch exists to prevent).
+        "OTHER" | "MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL" | "TOO_MANY_TOOL_CALLS" => {
+            "content_filter"
+        }
         _ => "stop",
     }
+}
+
+/// The model's maximum output tokens, used to clamp an inflated
+/// `maxOutputTokens`. A budget of 24576 + 1024 headroom on an 8192-cap model
+/// (gemini-2.0-flash, 1.5) was a guaranteed 400.
+fn output_cap(model: &str) -> i64 {
+    if model.contains("gemini-1.5") || model.contains("gemini-2.0") {
+        8192
+    } else if model.contains("gemini-2.5") || model.contains("gemini-3") {
+        65536
+    } else {
+        // Unknown model: stay at the conservative cap rather than sending a value
+        // that only some models accept.
+        8192
+    }
+}
+
+/// Can this model run with thinking disabled?
+///
+/// gemini-2.5-pro rejects `thinkingBudget: 0` (minimum 128), so
+/// `reasoning_effort: "none"` used to be a hard 400 on every Pro model. Omitting
+/// `thinkingConfig` is the closest legal request (dynamic thinking).
+fn can_disable_thinking(model: &str) -> bool {
+    !(model.contains("2.5-pro") || model.contains("2.5_pro"))
 }
 
 // ---------- request translation (OpenAI -> Gemini) ----------
@@ -174,6 +212,11 @@ fn apply_response_format(
 }
 
 pub fn translate_request(body: &Value) -> Result<Value, String> {
+    // The model id drives per-model limits below (output cap, whether thinking can
+    // be disabled). It is the *client-facing* id here; a `models/` prefix is
+    // stripped so `gemini/models/gemini-2.5-pro` classifies like the bare name.
+    let model_id = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
+    let model = model_id.strip_prefix("models/").unwrap_or(model_id);
     let messages = body
         .get("messages")
         .and_then(|m| m.as_array())
@@ -346,7 +389,12 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
         // The thinking budget is spent out of maxOutputTokens: grow the ceiling
         // so the answer itself still has room (Anthropic does the same).
         let value = match (budget.filter(|b| *b > 0), mt.as_i64()) {
-            (Some(b), Some(cur)) => json!(cur.max(b.saturating_add(THINKING_HEADROOM))),
+            (Some(b), Some(cur)) => {
+                let cap = output_cap(model);
+                json!(cur.max(b.saturating_add(THINKING_HEADROOM)).min(cap))
+            }
+            // A client-supplied value above the model cap is the client's call:
+            // forward it untouched so the upstream reports the real reason.
             _ => mt.clone(),
         };
         gen_cfg.insert("maxOutputTokens".into(), value);
@@ -367,10 +415,14 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
     if let Some(b) = budget {
         // A *zero* budget must be sent explicitly: an absent `thinkingBudget`
         // means dynamic thinking, the exact opposite of `reasoning_effort: none`.
-        gen_cfg.insert(
-            "thinkingConfig".into(),
-            json!({"includeThoughts": b > 0, "thinkingBudget": b}),
-        );
+        // Except on models that cannot disable thinking at all — there, 0 is
+        // rejected, so the field is omitted (and the request stays valid).
+        if b > 0 || can_disable_thinking(model) {
+            gen_cfg.insert(
+                "thinkingConfig".into(),
+                json!({"includeThoughts": b > 0, "thinkingBudget": b}),
+            );
+        }
     }
     if let Some(rf) = body.get("response_format") {
         apply_response_format(rf, &mut gen_cfg)?;
@@ -1151,6 +1203,7 @@ mod tests {
     #[test]
     fn a_big_thinking_budget_grows_max_output_tokens() {
         let out = translate_request(&json!({
+            "model": "gemini-2.5-flash",
             "messages": [{"role": "user", "content": "hi"}],
             "reasoning_effort": "high",
             "max_tokens": 1024,
@@ -1162,6 +1215,17 @@ mod tests {
             24576 + 1024,
             "{out}"
         );
+
+        // ...but never past the model's own cap: 8192-cap models used to receive
+        // 25600, which the API rejects outright.
+        let out = translate_request(&json!({
+            "model": "gemini-2.0-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+            "max_tokens": 1024,
+        }))
+        .expect("translates");
+        assert_eq!(out["generationConfig"]["maxOutputTokens"], 8192, "{out}");
     }
 
     #[test]

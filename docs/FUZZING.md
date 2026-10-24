@@ -180,7 +180,7 @@ peak is the `$8388608\r\n` header case discussed below; nothing ever came near i
 
 **What it costs the default `cargo test`:** 0.45 s for the 18 tests in this file
 (8 fuzz targets, 10 deterministic regression/invariant tests). The library's own
-503 unit tests take 1.67 s, so this file adds roughly **+0.4 s (+25 % of test
+unit tests (579 at the 2026-10-24 audit) take ~4 s, so this file adds roughly **+0.4 s (+25 % of test
 time)**. Default iterations are 2 000 per target; `ANYHOP_FUZZ_ITERS` raises them.
 
 ## Findings
@@ -240,9 +240,9 @@ not been hardened. Regression tests: `hostile_usage_totals_saturate_instead_of_o
 in `tests/fuzz_parsers.rs`, plus `src/anthropic.rs`'s own
 `hostile_usage_counters_saturate_instead_of_overflowing` (covers both paths).
 
-**Same bug, not fixed here:** `src/codex.rs:410` has an identical
-`self.prompt_tokens + self.completion_tokens` in its per-chunk usage object. It is
-outside this task's file set; one `saturating_add` fixes it.
+**Same bug in the sibling translator — FIXED:** `src/codex.rs` had an identical
+`prompt_tokens + completion_tokens` in its per-chunk usage object; it now uses
+`saturating_add` as well.
 
 ### 2. FOUND HERE, FIXED IN PARALLEL — the scanner and the upstream disagreed about `model`
 

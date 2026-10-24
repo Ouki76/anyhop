@@ -102,6 +102,10 @@ pub async fn responses(
         // (one relaxed store) and let it do the work on its own thread.
         s.set_response_max(store_max);
     }
+    // `store: false` is a contract, not a hint: the caller asked for the
+    // conversation not to be written down, so skip persistence even though the
+    // response still gets an id (it just cannot be chained later).
+    let store = req.get("store").and_then(Value::as_bool).unwrap_or(true);
     // Who owns the stored record. `key_name` is the key's configured name, or a
     // hash-derived label for an unnamed key, so it identifies the key without
     // keeping the secret around.
@@ -130,7 +134,12 @@ pub async fn responses(
 
     // The guard pins the provider list for the whole request, exactly as
     // `chat_completions` does; reloads swap a new Arc instead of mutating this one.
-    let router = state.router.load();
+    // `load_full()` (an owned Arc), not `load()` (a guard): arc-swap's `store()`
+    // waits for every outstanding guard on the old pointer, so a config save would
+    // block until this whole upstream round-trip finished — up to the provider's
+    // attempt timeout (120 s by default). The Arc is cheap and the router is
+    // immutable, so holding it across the awaits costs nothing.
+    let router = state.router.load_full();
     let targets = match resolve_targets(&state, &router, &model, key_models) {
         Ok(t) => t,
         Err((status, message, ty)) => return error_response(status, message, ty),
@@ -149,6 +158,7 @@ pub async fn responses(
         model,
         provider,
         previous_response_id: previous.as_ref().map(|p| p.id.clone()),
+        store,
         storage: storage.cloned(),
         owner,
     };
@@ -169,6 +179,9 @@ struct ResponseContext {
     provider: String,
     /// The id this response continues, echoed back to the client.
     previous_response_id: Option<String>,
+    /// `store: false` on the request: never persist this response, and say so in
+    /// the answer. OpenAI's default is `true`, so only an explicit false opts out.
+    store: bool,
     /// `None` when the feature is off (no state file, or a zero cap).
     storage: Option<Storage>,
     /// The client key that owns the record this request stores.
@@ -185,6 +198,9 @@ impl ResponseContext {
     /// Keep a completed response so the next turn can chain to it. Silent no-op
     /// when the store is off — the client just sees `previous_response_id: null`.
     fn persist(&self, id: &str, created_at: u64, text: &str, usage: (u64, u64)) {
+        if !self.store {
+            return;
+        }
         let Some(storage) = &self.storage else {
             return;
         };
@@ -549,6 +565,11 @@ pub fn to_chat_request(v: &Value) -> Result<Value, (StatusCode, String)> {
     }
     if stream {
         chat["stream"] = Value::Bool(true);
+        // Without this every streamed call reported `usage: 0/0` (the
+        // `response.completed.usage` block and the stored record), because no
+        // OpenAI-compatible upstream sends a usage chunk unless asked. Translating
+        // providers ignore the field (they rebuild the body).
+        chat["stream_options"] = json!({"include_usage": true});
     }
     Ok(chat)
 }
@@ -875,9 +896,12 @@ struct StreamMapper {
     /// Set once the terminal event was sent, so `[DONE]` followed by EOF (the
     /// normal case) cannot complete the response twice.
     completed: bool,
-    /// True when the terminal event was `response.completed` (not `failed`):
-    /// only then is there a response worth storing.
+    /// True when the terminal event was `response.completed`/`response.incomplete`
+    /// (not `failed`): only then is there a response worth storing.
     ok: bool,
+    /// Last `finish_reason` seen upstream, so a cut-off generation is reported as
+    /// `incomplete` instead of a clean, complete answer.
+    finish_reason: Option<String>,
     sequence: u64,
 }
 
@@ -894,6 +918,7 @@ impl StreamMapper {
             item_added: false,
             completed: false,
             ok: false,
+            finish_reason: None,
             sequence: 0,
         }
     }
@@ -972,6 +997,12 @@ impl StreamMapper {
         if chunk.get("usage").is_some_and(|u| !u.is_null()) {
             self.usage = usage_pair(&chunk);
         }
+        if let Some(reason) = chunk
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            self.finish_reason = Some(reason.to_string());
+        }
         let delta = chunk
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
@@ -1042,7 +1073,7 @@ impl StreamMapper {
                 "text": text,
             }),
         ));
-        let resp = response_object(
+        let mut resp = response_object(
             &self.resp_id,
             self.created_at,
             &self.model,
@@ -1051,7 +1082,16 @@ impl StreamMapper {
             self.usage,
             self.previous_response_id.as_deref(),
         );
-        out.push(self.emit("response.completed", json!({"response": resp})));
+        // `finish_reason: "length"` means the provider stopped at the token cap.
+        // Reporting it as `completed` hid a cut-off answer from every client that
+        // retries on `incomplete`/`incomplete_details`.
+        if matches!(self.finish_reason.as_deref(), Some("length")) {
+            resp["status"] = json!("incomplete");
+            resp["incomplete_details"] = json!({"reason": "max_output_tokens"});
+            out.push(self.emit("response.incomplete", json!({"response": resp})));
+        } else {
+            out.push(self.emit("response.completed", json!({"response": resp})));
+        }
         out
     }
 
@@ -1146,9 +1186,16 @@ fn sse_response(resp: Response, ctx: ResponseContext) -> Response {
                     }
                 },
                 Some(Err(e)) => {
+                    // A reset/timeout mid-generation is a *failure*: calling
+                    // finish() here told the client `response.completed` with a
+                    // truncated answer (and stored it), so the next turn replayed
+                    // a conversation that ended mid-sentence.
                     debug!(error = %e, "upstream stream error");
                     st.ended = true;
-                    let frames = st.mapper.finish();
+                    let frames = st.mapper.fail(&json!({
+                        "type": "upstream_error",
+                        "message": format!("upstream stream error: {e}"),
+                    }));
                     st.queue.extend(frames);
                 }
                 None => {
@@ -1185,6 +1232,7 @@ mod tests {
             model: model.to_string(),
             provider: "test".to_string(),
             previous_response_id: previous.map(str::to_string),
+            store: true,
             storage: None,
             owner: None,
         }
@@ -1589,6 +1637,7 @@ mod tests {
             previous_response_id: Some("resp_prev".to_string()),
             storage: Some(store.clone()),
             owner: None,
+            store: true,
         };
         let upstream = json!({
             "choices": [{"message": {"role": "assistant", "content": "hello"}}],
@@ -1639,6 +1688,7 @@ mod tests {
             previous_response_id: None,
             storage: Some(store.clone()),
             owner: None,
+            store: true,
         };
         let upstream = futures::stream::iter(vec![
             Ok::<Bytes, std::io::Error>(Bytes::from_static(
@@ -2239,6 +2289,7 @@ mod tests {
             previous_response_id: None,
             storage: Some(store.clone()),
             owner: None,
+            store: true,
         };
         ctx.persist("resp_huge", 1, "hi", (u64::MAX, 1));
         store.flush_async().await;

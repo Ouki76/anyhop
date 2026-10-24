@@ -11,6 +11,23 @@ use serde_json::{Value, json};
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 pub const API_VERSION: &str = "2023-06-01";
 
+/// The Messages endpoint for a configured `base_url`.
+///
+/// A base that already ends in `/v1` is a normal spelling (`https://api.anthropic.com/v1`,
+/// the same convention the example config uses for openai_compat) and the model
+/// listing already tolerates it. Appending blindly here produced `/v1/v1/messages`
+/// → 404 for chat while `/v1/models` worked, which is a confusing pair of symptoms.
+pub fn messages_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.is_empty() {
+        format!("{DEFAULT_BASE_URL}/v1/messages")
+    } else if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    }
+}
+
 /// Anthropic's `content_block.*` events carry a block index. Anything past this
 /// is hostile: the index used to be fed straight into a `Vec` resize, so
 /// `index: 18446744073709551615` overflowed (panic in debug, out of bounds in
@@ -115,11 +132,49 @@ fn content_text(content: Option<&Value>) -> Option<String> {
 /// claude-3-haiku caps at 4096, 3.5/3.7 at 8192, 4.x allows far more — but a
 /// default that exceeds the cap is a hard 400, so stay conservative.
 fn default_max_tokens(model: &str) -> u64 {
+    max_output_cap(model).min(8192)
+}
+
+/// The model's *maximum* output tokens.
+///
+/// Used to clamp a `max_tokens` this module inflates to fit a thinking budget:
+/// `reasoning_effort = "high"` (24576) on a claude-3.5 (8192 cap) used to become
+/// `max_tokens: 24577`, which Anthropic rejects outright — so the feature failed
+/// with a 400 on exactly the models that need the smaller budget.
+fn max_output_cap(model: &str) -> u64 {
     if model.contains("claude-3-haiku") || model.contains("haiku-3") {
         4096
+    } else if model.contains("claude-3") {
+        8192
+    } else if model.contains("claude-4") || model.contains("sonnet-4") || model.contains("opus-4") {
+        // 4.x family allows up to 64k on the long-output variants.
+        64000
     } else {
         8192
     }
+}
+
+/// Prompt tokens actually billed for a request.
+///
+/// Anthropic *excludes* `cache_read_input_tokens` and `cache_creation_input_tokens`
+/// from `input_tokens`, so a cached conversation reported a `prompt_tokens` far
+/// below the real context — clients sizing context windows and the pool's token
+/// counters both undercounted. The cached share is also surfaced the way OpenAI
+/// does (`prompt_tokens_details.cached_tokens`).
+fn prompt_usage(u: &Value) -> (u64, u64) {
+    let plain = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+    let cache_read = u
+        .get("cache_read_input_tokens")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let cache_write = u
+        .get("cache_creation_input_tokens")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    (
+        plain.saturating_add(cache_read).saturating_add(cache_write),
+        cache_read,
+    )
 }
 
 /// Replay the thinking blocks we handed the client (text + signature) as the
@@ -280,11 +335,16 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
     if !system_texts.is_empty() {
         req["system"] = json!(system_texts.join("\n\n"));
     }
-    if let Some(t) = body.get("temperature") {
-        req["temperature"] = t.clone();
+    // OpenAI allows temperature/top_p up to 2.0; Anthropic rejects anything above
+    // 1.0 with a hard 400. A client that is perfectly valid against an OpenAI model
+    // used to fail through the gateway, so clamp (do not drop: the intent survives).
+    if let Some(t) = body.get("temperature").and_then(|t| t.as_f64()) {
+        req["temperature"] = json!(t.clamp(0.0, 1.0));
     }
-    if let Some(t) = body.get("top_p") {
-        req["top_p"] = t.clone();
+    if let Some(t) = body.get("top_p").and_then(|t| t.as_f64())
+        && t > 0.0
+    {
+        req["top_p"] = json!(t.clamp(0.0, 1.0));
     }
     if let Some(stop) = body.get("stop") {
         let seqs = match stop {
@@ -299,13 +359,21 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
     match budget {
         Some(b) if b > 0 => {
             // Anthropic 400s when max_tokens <= budget_tokens — grow max_tokens
-            // to fit the budget (clients rarely set both).
+            // to fit the budget (clients rarely set both), but never past the
+            // model's own output cap: a 24576-token budget on an 8192-cap model
+            // was a guaranteed 400. Shrink the budget instead of the request.
             // saturating: `budget_tokens` is client-supplied, and i64::MAX would
             // otherwise panic on the add (debug) or wrap (release).
+            let cap = max_output_cap(model_name);
             let cur = req["max_tokens"].as_i64().unwrap_or(0);
             if cur <= b {
-                req["max_tokens"] = json!(b.saturating_add(1));
+                let new_max = b.saturating_add(1).min(cap as i64).max(1);
+                req["max_tokens"] = json!(new_max);
             }
+            // A budget at or above max_tokens is invalid: leave room for one token
+            // of output so the request stays legal after the clamp.
+            let max_tokens = req["max_tokens"].as_i64().unwrap_or(cap as i64);
+            let b = b.min(max_tokens.saturating_sub(1)).max(1);
             // ...and rejects temperature/top_p combined with thinking — drop them.
             if let Some(o) = req.as_object_mut() {
                 o.remove("temperature");
@@ -317,6 +385,20 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
             req["thinking"] = json!({"type": "disabled"});
         }
         None => {}
+    }
+
+    // Anthropic has no JSON mode. Dropping the field silently made a schema request
+    // come back as prose with HTTP 200 (the client believed it had JSON); say so
+    // instead, so the caller can pick another provider or drop the field.
+    if let Some(rf) = body.get("response_format") {
+        let kind = rf.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if kind == "json_schema" || kind == "json_object" {
+            return Err(format!(
+                "response_format '{kind}' is not supported by the anthropic provider (the \
+                 Messages API has no JSON mode); use a provider that implements it or omit \
+                 the field"
+            ));
+        }
     }
 
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
@@ -458,7 +540,7 @@ pub fn translate_response(model: &str, v: &Value) -> Value {
     }
 
     let u = v.get("usage").cloned().unwrap_or(json!({}));
-    let prompt_tokens = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+    let (prompt_tokens, cached_tokens) = prompt_usage(&u);
     let completion_tokens = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
     json!({
         "id": v.get("id").cloned().unwrap_or_else(|| json!(gen_id())),
@@ -478,6 +560,7 @@ pub fn translate_response(model: &str, v: &Value) -> Value {
             // panic (or a wrapped 0 in release). The same rule as the Responses
             // shaping in `proxy::responses`.
             "total_tokens": prompt_tokens.saturating_add(completion_tokens),
+            "prompt_tokens_details": {"cached_tokens": cached_tokens},
         },
     })
 }
@@ -569,10 +652,9 @@ fn translate_event(v: &Value, st: &mut SseState) -> Result<Option<Value>, String
     };
     match ty {
         "message_start" => {
-            if let Some(p) = v
-                .pointer("/message/usage/input_tokens")
-                .and_then(|x| x.as_u64())
-            {
+            if let Some(u) = v.pointer("/message/usage") {
+                // Same accounting as the non-streaming path (cache buckets included).
+                let (p, _) = prompt_usage(u);
                 st.prompt_tokens = p;
             }
             if st.sent_role {

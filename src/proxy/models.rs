@@ -88,32 +88,48 @@ pub async fn list_models(
 /// GET /v1/models/{id} — the single-model variant of `list_models`.
 ///
 /// Served from the same catalogue (and the same epoch cache), so it cannot drift
-/// from the list endpoint; unknown or disabled ids are a 404.
-pub async fn get_model(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+/// from the list endpoint; unknown or disabled ids are a 404. It applies the same
+/// two filters as the list — the client-key allowlist and both spellings of a
+/// disabled entry — otherwise a restricted key could probe the catalogue one id at
+/// a time (200 vs 404) and `disabled_models = ["beta"]` would still resolve
+/// `/v1/models/provider/beta`.
+pub async fn get_model(
+    State(state): State<Arc<AppState>>,
+    key_perm: Option<axum::extract::Extension<KeyPermissions>>,
+    Path(id): Path<String>,
+) -> Response {
     let router = state.router.load();
+    let allowed = key_perm.and_then(|p| p.0.allowed_models);
     let disabled = state
         .disabled_models
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    if disabled.contains(&id) {
+    let (bare_kind, explicit_provider) = match id.split_once('/') {
+        Some((p, m)) if p != "combo" => (p, Some(m)),
+        _ => ("", None),
+    };
+    // Both spellings, exactly like `list_models` and the request path.
+    let model_part = explicit_provider.unwrap_or(id.as_str());
+    if disabled.contains(&id) || disabled.contains(model_part) {
         return super::error_response(
             axum::http::StatusCode::NOT_FOUND,
             format!("model '{id}' is disabled"),
             "not_found_error",
         );
     }
-    let (bare, explicit_provider) = match id.split_once('/') {
-        Some((p, m)) if p != "combo" => (p, Some(m)),
-        _ => ("", None),
-    };
     for p in &router.providers {
         // Combos are not provider/model pairs and are handled below.
         if let Some(model) = explicit_provider {
-            if p.name != bare {
+            if p.name != bare_kind {
                 continue;
             }
             if p.effective_models().await.iter().any(|m| m == model) {
+                if let Some(allowed_list) = &allowed
+                    && !model_allowed(allowed_list, &id, &id, model)
+                {
+                    break;
+                }
                 return Json(serde_json::json!({
                     "id": id,
                     "object": "model",
@@ -124,7 +140,13 @@ pub async fn get_model(State(state): State<Arc<AppState>>, Path(id): Path<String
         }
     }
     for c in &router.combos {
-        if c.name == id {
+        let bare = c.name.strip_prefix("combo/").unwrap_or(&c.name);
+        if c.name == id || bare == model_part {
+            if let Some(allowed_list) = &allowed
+                && !combo_allowed(allowed_list, &c.name)
+            {
+                break;
+            }
             return Json(serde_json::json!({
                 "id": c.name,
                 "object": "model",
@@ -204,7 +226,7 @@ mod tests {
         assert_eq!(list, vec!["mock/alpha", "mock/beta", "fast"], "{list:?}");
 
         // A single model resolves, with the provider that owns it.
-        let one = get_model(State(st.clone()), Path("mock/alpha".to_string())).await;
+        let one = get_model(State(st.clone()), None, Path("mock/alpha".to_string())).await;
         assert_eq!(one.status(), axum::http::StatusCode::OK);
         let bytes = axum::body::to_bytes(one.into_body(), 8192).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -213,7 +235,7 @@ mod tests {
 
         // A combo resolves too, under its bare name.
         assert_eq!(
-            get_model(State(st.clone()), Path("fast".to_string()))
+            get_model(State(st.clone()), None, Path("fast".to_string()))
                 .await
                 .status(),
             axum::http::StatusCode::OK
@@ -222,7 +244,7 @@ mod tests {
         // Unknown models and unknown providers are a 404, not an empty 200.
         for bad in ["mock/nope", "other/alpha", "nope"] {
             assert_eq!(
-                get_model(State(st.clone()), Path(bad.to_string()))
+                get_model(State(st.clone()), None, Path(bad.to_string()))
                     .await
                     .status(),
                 axum::http::StatusCode::NOT_FOUND,
@@ -256,7 +278,7 @@ mod tests {
         let after = ids(list_models(State(st.clone()), None).await).await;
         assert_eq!(after, vec!["mock/alpha", "fast"], "{after:?}");
         assert_eq!(
-            get_model(State(st.clone()), Path("mock/beta".to_string()))
+            get_model(State(st.clone()), None, Path("mock/beta".to_string()))
                 .await
                 .status(),
             axum::http::StatusCode::NOT_FOUND,

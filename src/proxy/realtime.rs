@@ -36,7 +36,7 @@
 //! * The *client* presents a gateway/client key to the normal `/v1/*` auth
 //!   middleware; this handler only sees the resulting [`KeyPermissions`].
 //! * The *provider* key is picked from the provider's pool with
-//!   [`crate::pool::KeyPool::pick`], and its in-flight slot ([`KeyGuard`]) is
+//!   [`crate::pool::KeyPool::pick_ready`], and its in-flight slot ([`KeyGuard`]) is
 //!   held for the whole session, so `max_concurrent` counts websockets the same
 //!   way it counts requests. The secret is only ever sent upstream in an
 //!   `Authorization: Bearer` header — never logged, never in a URL.
@@ -730,7 +730,7 @@ fn plan_target(
 
     let key = provider
         .pool
-        .pick(&upstream_model, None)
+        .pick_ready(&upstream_model, None)
         .ok_or_else(|| Reject::unavailable(&provider.name))?;
     let guard = key
         .try_acquire()
@@ -903,6 +903,7 @@ async fn run_session(ctx: SessionCtx, on_upgrade: hyper::upgrade::OnUpgrade) {
         upstream,
         pending,
         Limits::default(),
+        &target.upstream_model,
     )
     .await;
     debug!(
@@ -1690,6 +1691,39 @@ enum Outcome {
     Error(String),
 }
 
+/// Rewrite the client-facing model id in a frame headed upstream.
+///
+/// The gateway accepts `provider/model`, aliases and combo ids, but the provider
+/// only understands its own model name. Only the URL query was rewritten, so a
+/// `session.update` still carried `"session":{"model":"openai/gpt-realtime"}` —
+/// and `session.model` takes precedence over `?model=`, so the provider saw an
+/// unknown model. `session.update` is atomic on the provider side, which meant the
+/// instructions/voice/VAD sent in the same message were never applied either.
+fn rewrite_outbound_model(frame: &mut Frame, upstream_model: &str) {
+    if frame.opcode != OpCode::Text {
+        return;
+    }
+    let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&frame.payload) else {
+        return;
+    };
+    let mut changed = false;
+    if let Some(m) = v.get("model").and_then(|m| m.as_str())
+        && m != upstream_model
+    {
+        v["model"] = serde_json::Value::String(upstream_model.to_string());
+        changed = true;
+    }
+    if let Some(m) = v.pointer("/session/model").and_then(|m| m.as_str())
+        && m != upstream_model
+    {
+        v["session"]["model"] = serde_json::Value::String(upstream_model.to_string());
+        changed = true;
+    }
+    if changed && let Ok(out) = serde_json::to_vec(&v) {
+        frame.payload = out;
+    }
+}
+
 /// Relay frames between an already-upgraded client and the provider.
 ///
 /// Both hops are terminated here, so:
@@ -1709,6 +1743,7 @@ async fn relay_io<R, W, U>(
     upstream: U,
     pending: Vec<u8>,
     limits: Limits,
+    upstream_model: &str,
 ) -> Outcome
 where
     R: AsyncRead + Unpin,
@@ -1729,7 +1764,10 @@ where
     let lifetime_deadline = tokio::time::Instant::now() + limits.lifetime;
 
     // Frames the client sent before it named a model are replayed first.
-    for frame in initial.drain(..) {
+    for mut frame in initial.drain(..) {
+        // The buffered frames are exactly the ones that carried the client's model
+        // id, so this is where the rewrite matters most.
+        rewrite_outbound_model(&mut frame, upstream_model);
         sent_up += frame.len() as u64;
         // By value: masking is done in place instead of cloning the payload.
         if let Err(e) = write_within(
@@ -1778,7 +1816,7 @@ where
                     .await;
                     return Outcome::ClientClosed;
                 }
-                Ok(Some(frame)) => match frame.opcode {
+                Ok(Some(mut frame)) => match frame.opcode {
                     OpCode::Close => {
                         // Complete the closing handshake on both hops: the client
                         // gets its close echoed, the provider is told the session
@@ -1824,6 +1862,7 @@ where
                     }
                     OpCode::Text | OpCode::Binary | OpCode::Continuation => {
                         last_frame = Instant::now();
+                        rewrite_outbound_model(&mut frame, upstream_model);
                         sent_up += frame.len() as u64;
                         if sent_up > limits.max_bytes {
                             close_both(
@@ -2798,6 +2837,7 @@ mod tests {
                 upstream,
                 pending,
                 Limits::default(),
+                "test-model",
             )
             .await
         });
@@ -3054,7 +3094,18 @@ mod tests {
             .expect("the update was relayed and echoed")
             .expect("read")
             .expect("frame");
-        assert_eq!(echoed.payload, update.as_bytes());
+        // The provider only knows its own model name. Relaying the client's
+        // `rt/echo-model` verbatim made `session.model` (which wins over `?model=`)
+        // an unknown model for the provider — and `session.update` is atomic, so
+        // the rest of the message was dropped with it.
+        let echoed: serde_json::Value =
+            serde_json::from_slice(&echoed.payload).expect("the relayed frame is JSON");
+        assert_eq!(echoed["type"], "session.update");
+        assert_eq!(
+            echoed.pointer("/session/model").and_then(|m| m.as_str()),
+            Some("echo-model"),
+            "the upstream model id replaces the client-facing one: {echoed}"
+        );
 
         ws::write_frame_masked(&mut writer, &Frame::close(1000, ""))
             .await
@@ -3220,6 +3271,7 @@ mod tests {
                 max_bytes: 1024,
                 ..Limits::default()
             },
+            "test-model",
         )
         .await;
         assert_eq!(outcome, Outcome::Idle);
@@ -3247,6 +3299,7 @@ mod tests {
                 write_timeout: Duration::from_millis(20),
                 lifetime: Duration::from_secs(30),
             },
+            "test-model",
         ));
 
         // The provider sends one frame far larger than the client's window.
@@ -3288,6 +3341,7 @@ mod tests {
                 write_timeout: Duration::from_millis(200),
                 lifetime: Duration::from_millis(50),
             },
+            "test-model",
         ));
         let pinger = tokio::spawn(async move {
             loop {
@@ -3377,6 +3431,7 @@ mod tests {
                 max_bytes: 4,
                 ..Limits::default()
             },
+            "test-model",
         ));
         ws::write_frame_masked(&mut client_io, &Frame::text("far more than four bytes"))
             .await

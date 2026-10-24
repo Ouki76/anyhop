@@ -39,6 +39,15 @@ pub(super) enum Upstream {
     },
 }
 
+/// Upper bound on a buffered (non-stream) upstream body.
+///
+/// Only *request* bodies were bounded (`server.max_body_bytes`); a 2xx answer was
+/// read into memory with an idle deadline but no size limit, so an upstream (or a
+/// proxy in front of one) that slow-drips an endless body made the gateway
+/// accumulate gigabytes. 64 MiB is far above any chat completion but leaves room
+/// for inline base64 media.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Why a 2xx upstream had no usable body.
 #[derive(Debug)]
 pub(super) enum BodyError {
@@ -46,6 +55,8 @@ pub(super) enum BodyError {
     Idle(Duration),
     /// The connection died while reading.
     Upstream(String),
+    /// The body grew past [`MAX_RESPONSE_BYTES`].
+    TooLarge(usize),
 }
 
 impl std::fmt::Display for BodyError {
@@ -53,6 +64,10 @@ impl std::fmt::Display for BodyError {
         match self {
             Self::Idle(d) => write!(f, "upstream sent no body within {:?}", d),
             Self::Upstream(e) => write!(f, "upstream body failed: {e}"),
+            Self::TooLarge(n) => write!(
+                f,
+                "upstream body exceeds the {MAX_RESPONSE_BYTES}-byte limit ({n} bytes received)"
+            ),
         }
     }
 }
@@ -143,7 +158,12 @@ async fn read_all(mut stream: BodyStream, idle: Duration) -> Result<Bytes, BodyE
         match tokio::time::timeout(idle, stream.next()).await {
             Err(_) => return Err(BodyError::Idle(idle)),
             Ok(None) => return Ok(Bytes::from(out)),
-            Ok(Some(Ok(chunk))) => out.extend_from_slice(&chunk),
+            Ok(Some(Ok(chunk))) => {
+                if out.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                    return Err(BodyError::TooLarge(out.len().saturating_add(chunk.len())));
+                }
+                out.extend_from_slice(&chunk);
+            }
             Ok(Some(Err(e))) => return Err(BodyError::Upstream(e.to_string())),
         }
     }
@@ -201,6 +221,16 @@ pub(super) fn accept_2xx(kind: ProviderKind, is_stream: bool, raw_content_type: 
     Accepted::WrongContentType(content_type.to_string())
 }
 
+/// Is this a JSON content type (`application/json`, `*+json`)?
+///
+/// Separates "the upstream speaks JSON, not SSE" from "the upstream sent an error
+/// page". The first is a shape mismatch a client can trigger at will (send
+/// `stream: true` to a compat proxy that ignores it); it must not be booked as a
+/// key-health failure, or one client benches the provider for everyone.
+pub(super) fn is_json_like(content_type: &str) -> bool {
+    content_type == "application/json" || content_type.ends_with("+json")
+}
+
 /// Build the client response for a successful upstream call.
 ///
 /// `idle` bounds every read of the upstream body; a translator reports a stall
@@ -233,8 +263,9 @@ pub(super) async fn success_response(
                 sse_response(stream)
             } else {
                 // Codex backend is stream-only; collect the SSE stream.
+                let collected = codex::collect_non_stream(resp, model).await;
                 drop(guard);
-                match codex::collect_non_stream(resp, model).await {
+                match collected {
                     Ok(v) => {
                         if let Some(u) = v.get("usage") {
                             add_usage(
@@ -272,8 +303,11 @@ pub(super) async fn success_response(
             if is_stream {
                 pass_through(status, headers, idle_body(stream, idle), guard)
             } else {
+                // Read first, release second: dropping the guard before the read
+                // removed the pool's backpressure exactly for the unbounded part.
+                let read = read_all(stream, idle).await;
                 drop(guard);
-                match read_all(stream, idle).await {
+                match read {
                     Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                         Ok(v) => {
                             add_openai_usage(&key, &v);
@@ -330,8 +364,9 @@ pub(super) async fn success_response(
                 });
                 sse_response(stream)
             } else {
+                let read = read_all(stream, idle).await;
                 drop(guard);
-                match read_all(stream, idle).await {
+                match read {
                     Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                         Ok(v) => {
                             if matches!(provider.kind, ProviderKind::Anthropic) {

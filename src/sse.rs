@@ -82,13 +82,16 @@ impl SseParser {
             // later caller on the same error path instead of silently resuming.
             return Err(EventTooLarge { buffered: 0 });
         }
-        // A single chunk larger than the whole cap can never become a legal
-        // event, so fail before copying it in: there is no point allocating a
-        // buffer we would immediately abandon.
-        if chunk.len() > MAX_EVENT_BYTES {
+        // Guard the *buffered partial event*, not the chunk: a single read can
+        // carry megabytes of perfectly framed events (a coalescing proxy, an HTTP/2
+        // frame, or one `inlineData` image event), and refusing it aborted a healthy
+        // stream. A residual buffer past the cap still means "no line terminator in
+        // sight", which is what the cap exists to catch.
+        if self.buf.len().saturating_add(chunk.len()) > MAX_EVENT_BYTES.saturating_mul(4) {
+            // Hard bound on total buffering, well above one legal event.
             self.failed = true;
             return Err(EventTooLarge {
-                buffered: chunk.len(),
+                buffered: self.buf.len().saturating_add(chunk.len()),
             });
         }
         self.buf.extend_from_slice(chunk);

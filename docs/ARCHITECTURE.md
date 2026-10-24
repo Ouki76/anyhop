@@ -24,8 +24,8 @@ client ──HTTP──▶ axum router ──▶ auth ──▶ routing ──�
 | `src/main.rs` | Global allocator (jemalloc/mimalloc) + `anyhop::run()` |
 | `src/config.rs` | `Config` types, TOML load, `validate()`, atomic writes |
 | `src/providers.rs` | `Provider` (HTTP client, pool, model list cache), routing (`resolve`), quota probing |
-| `src/pool.rs` | Key pool: strategies, health state machine, cooldowns, sticky sessions, admission control |
-| `src/proxy/chat.rs` | `POST /v1/chat/completions`: the retry/failover core of the gateway |
+| `src/pool/{mod,key,sticky}.rs` | Key pool: strategies, health state machine, cooldowns, sticky sessions, admission control |
+| `src/proxy/chat/{mod,stream,retry,errors,session}.rs` | `POST /v1/chat/completions`: the retry/failover core of the gateway |
 | `src/proxy/responses.rs` | `POST /v1/responses`, translated onto the chat pipeline |
 | `src/proxy/embeddings.rs` | `POST /v1/embeddings`: pass-through (openai_compat) or translation (gemini) |
 | `src/ratelimit.rs` | Per-client-key token bucket |
@@ -51,7 +51,6 @@ OAuth accounts are appended to the provider named in the request (`provider`, de
 kind). The provider is created in the same write as its first account, so the file never contains
 a provider without credentials. A pending flow is keyed by kind **and** provider: asking for a
 different one cancels the stale flow and frees the local callback port.
-| `ui/` | Sycamore (Rust→WASM) dashboard, a pure client of `/api/*` |
 
 ## Request path (chat completions)
 
@@ -101,9 +100,9 @@ Both reject with `429`/`503` plus `Retry-After`, and both are visible in `/metri
 | --- | --- | --- |
 | `429` + `Retry-After` | key cooldown for that exact duration | automatic |
 | `429` on Antigravity | **per-model** cooldown (other models keep working) | automatic |
-| `x-ratelimit-remaining` below `drain_below_pct` | proactive cooldown before hitting the limit | automatic |
+| `x-ratelimit-remaining-requests` below `drain_below_pct` | proactive cooldown before hitting the limit | automatic |
 | `401/403` | credential marked dead | manual (`/api/keys/enable`) or config reload |
-| `5xx` / timeout / reset | exponential backoff (5s → 320s, capped at 1h) | automatic |
+| `5xx` / timeout / reset | exponential backoff (`[tuning] base_backoff_secs` doubling, capped at `[tuning] max_cooldown_secs`) | automatic |
 | all keys unavailable | `503` + `Retry-After` (time to the earliest recovery), `anyhop_keys_available = 0` | when a cooldown expires |
 
 Health and counters persist in `redb`, so a restart does not resurrect dead keys

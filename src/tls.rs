@@ -450,20 +450,34 @@ mod tests {
     /// Returns false when openssl is unavailable, so the tests that need a real
     /// certificate can skip instead of failing on a machine without it.
     fn ensure_certs() -> bool {
-        if std::path::Path::new(CERT).exists() && std::path::Path::new(KEY).exists() {
-            return true;
-        }
-        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/gen-test-certs.sh");
-        std::process::Command::new("sh")
-            .arg(script)
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        // Once, for the whole test binary: `cargo test` runs tests in parallel, and
+        // the previous version let several of them generate the pair at the same
+        // time — one read a half-written key and failed, while the test that owned
+        // the generation passed. That made the unit gate order-dependent: a clean
+        // checkout failed `cargo test` on 5 TLS tests.
+        static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ONCE.get_or_init(|| {
+            if std::path::Path::new(CERT).exists() && std::path::Path::new(KEY).exists() {
+                return true;
+            }
+            let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/gen-test-certs.sh");
+            std::process::Command::new("sh")
+                .arg(script)
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
     }
 
-
-
+    /// `ensure_certs()`, skipping the test (not failing) when openssl is missing.
+    fn certs_or_skip() -> bool {
+        if ensure_certs() {
+            return true;
+        }
+        eprintln!("skipping: openssl is unavailable and test/certs is empty");
+        false
+    }
 
     /// Writes a PEM file to the temp dir and removes it again on drop.
     struct TempPem {
@@ -513,7 +527,6 @@ mod tests {
         }
     }
 
-
     /// A throwaway P-256 pair in three encodings, generated with openssl.
     ///
     /// The key material is deliberately not committed: a private key — even a
@@ -525,10 +538,7 @@ mod tests {
         // rustls correctly rejects as a mismatch).
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "anyhop-tls-ec-{}-{n}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("anyhop-tls-ec-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).ok()?;
         let key = dir.join("k.pem");
         let run = |args: &[&str]| {
@@ -539,13 +549,23 @@ mod tests {
                 .unwrap_or(false)
         };
         let key_s = key.to_str()?.to_string();
-        if !run(&["ecparam", "-genkey", "-name", "prime256v1", "-noout", "-out", &key_s]) {
+        if !run(&[
+            "ecparam",
+            "-genkey",
+            "-name",
+            "prime256v1",
+            "-noout",
+            "-out",
+            &key_s,
+        ]) {
             return None;
         }
         let sec1 = std::fs::read_to_string(&key).ok()?;
         let pkcs8_path = dir.join("k8.pem");
         let pkcs8_s = pkcs8_path.to_str()?.to_string();
-        if !run(&["pkcs8", "-topk8", "-nocrypt", "-in", &key_s, "-out", &pkcs8_s]) {
+        if !run(&[
+            "pkcs8", "-topk8", "-nocrypt", "-in", &key_s, "-out", &pkcs8_s,
+        ]) {
             return None;
         }
         let pkcs8 = std::fs::read_to_string(&pkcs8_path).ok()?;
@@ -555,11 +575,21 @@ mod tests {
         // CA:FALSE + SAN=localhost: rustls refuses a CA certificate as a server
         // certificate, and the client connects with ServerName "localhost".
         if !run(&[
-            "req", "-x509", "-new", "-key", &key_s, "-days", "1",
-            "-subj", "/CN=localhost",
-            "-addext", "basicConstraints=critical,CA:FALSE",
-            "-addext", "subjectAltName=DNS:localhost",
-            "-out", &cert_s,
+            "req",
+            "-x509",
+            "-new",
+            "-key",
+            &key_s,
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "basicConstraints=critical,CA:FALSE",
+            "-addext",
+            "subjectAltName=DNS:localhost",
+            "-out",
+            &cert_s,
         ]) {
             return None;
         }
@@ -586,6 +616,9 @@ mod tests {
 
     #[test]
     fn missing_cert_file_names_the_path() {
+        if !certs_or_skip() {
+            return;
+        }
         let missing = concat!(env!("CARGO_MANIFEST_DIR"), "/test/certs/no-such-file.crt");
         let message = err(TlsConfig::from_pem_files(missing, KEY));
         assert!(message.contains("cannot read tls cert"), "{message}");
@@ -594,6 +627,9 @@ mod tests {
 
     #[test]
     fn missing_key_file_names_the_path() {
+        if !certs_or_skip() {
+            return;
+        }
         let missing = concat!(env!("CARGO_MANIFEST_DIR"), "/test/certs/no-such-file.key");
         let message = err(TlsConfig::from_pem_files(CERT, missing));
         assert!(message.contains("cannot read tls key"), "{message}");
@@ -602,6 +638,9 @@ mod tests {
 
     #[test]
     fn file_without_certificate_block_names_the_path() {
+        if !certs_or_skip() {
+            return;
+        }
         let key_pem = ok(std::fs::read_to_string(KEY));
         let certless = TempPem::new("key-as-cert", &key_pem);
         let message = err(TlsConfig::from_pem_files(certless.str(), KEY));
@@ -611,6 +650,9 @@ mod tests {
 
     #[test]
     fn file_without_key_block_names_the_path() {
+        if !certs_or_skip() {
+            return;
+        }
         let cert_pem = ok(std::fs::read_to_string(CERT));
         let keyless = TempPem::new("cert-as-key", &cert_pem);
         let message = err(TlsConfig::from_pem_files(CERT, keyless.str()));
@@ -620,6 +662,9 @@ mod tests {
 
     #[test]
     fn garbage_key_reports_the_expected_formats() {
+        if !certs_or_skip() {
+            return;
+        }
         let garbage = TempPem::new(
             "garbage",
             "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
@@ -635,6 +680,9 @@ mod tests {
 
     #[test]
     fn non_base64_key_reports_the_expected_formats() {
+        if !certs_or_skip() {
+            return;
+        }
         let garbage = TempPem::new(
             "not-base64",
             "-----BEGIN PRIVATE KEY-----\nnot base64 at all!\n-----END PRIVATE KEY-----\n",
@@ -680,10 +728,7 @@ mod tests {
         // Re-encode the generated key as PKCS#1 (`BEGIN RSA PRIVATE KEY`) with
         // openssl rather than committing a copy: a constant would silently stop
         // matching the certificate as soon as the pair is regenerated.
-        let tmp = std::env::temp_dir().join(format!(
-            "anyhop-tls-{}-pkcs1.key",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("anyhop-tls-{}-pkcs1.key", std::process::id()));
         let converted = std::process::Command::new("openssl")
             .args(["pkey", "-traditional", "-in", KEY, "-out"])
             .arg(&tmp)
@@ -703,6 +748,9 @@ mod tests {
 
     #[test]
     fn mismatched_key_is_rejected() {
+        if !certs_or_skip() {
+            return;
+        }
         // EC key against the committed RSA certificate: every parse succeeds,
         // only the public-key comparison can catch this.
         let Some((_, pkcs8, _)) = ec_pair() else {

@@ -37,12 +37,43 @@ MOCKS="$MOCKS $!"
 # RESP double so the multi-instance rate-limit check needs no real Redis.
 python3 test/mock_redis.py 6399 >/dev/null 2>&1 &
 MOCKS="$MOCKS $!"
+# Wait for every mock before touching the gateway: a fixed `sleep 2` raced a cold
+# Python start and, worse, a *stale* mock from an earlier run kept the suite green
+# against old code. Each port is probed instead.
+for p in 9100 9101 9102 9103 9104 9105 6399; do
+    for _ in $(seq 1 100); do
+        python3 - "$p" <<'PY' && break
+import socket, sys
+s = socket.socket()
+s.settimeout(0.1)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+        sleep 0.1
+    done
+done
 # Point the private config copy at the chosen port.
 sed -i "s|^listen = .*|listen = \"127.0.0.1:$PORT\"|" "$CFG"
 export ANYHOP_TEST_CONFIG="$CFG"
 ANYHOP_CONFIG="$CFG" "$BIN" > /tmp/anyhop-regress.log 2>&1 &
 AH_PID=$!
-sleep 2
+# Probe the gateway itself rather than sleeping: a binary that cannot start (bad
+# config, missing ui/dist) must fail the suite, not produce 40 confusing FAILs.
+GATEWAY_UP=0
+for _ in $(seq 1 100); do
+    if curl -sf --max-time 1 "$BASE/healthz" >/dev/null 2>&1; then GATEWAY_UP=1; break; fi
+    if ! kill -0 "$AH_PID" 2>/dev/null; then break; fi
+    sleep 0.1
+done
+if [ "$GATEWAY_UP" != 1 ]; then
+    echo "!!! FAIL: the gateway did not start — see /tmp/anyhop-regress.log"
+    tail -20 /tmp/anyhop-regress.log
+    exit 1
+fi
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   $1"; }
@@ -61,7 +92,10 @@ expect() { # name, haystack, needle
 echo "== non-stream =="
 expect "openai"      "$(chat mock/test-model hi)"             "ok via"
 expect "gemini"      "$(chat gemini/test-gemini hi)"          "sys"
-expect "antigravity" "$(chat ag/gemini-3-flash hi)"           "gemini-3-flash"
+# The needle must not be the model id: `no provider serves model 'ag/gemini-3-flash'`
+# and `model '…' is not allowed` both contain it, so a routing rejection read as a
+# served completion. The mock returns "[gemini-3-flash][sys:…".
+expect "antigravity" "$(chat ag/gemini-3-flash hi)"           "\[gemini-3-flash\]\[sys"
 expect "anthropic"   "$(chat claude/claude-test hi)"          "sys"
 expect "codex"       "$(chat codex/gpt-codex-test hi)"        "Codex"
 expect "combo"       "$(chat testcombo hi)"                   "sys"
@@ -100,8 +134,12 @@ CSP=$(curl -sI "$BASE/dashboard" | tr -d '\r' | grep -i "^content-security-polic
 echo "$CSP" | grep -q "default-src 'none'" && ok "dashboard CSP present" || fail "dashboard CSP present"
 echo "$CSP" | grep -q "sha256-" && ok "dashboard CSP hashes inline scripts" || fail "CSP script hashes"
 echo "$CSP" | grep -q "'wasm-unsafe-eval'" && ok "dashboard CSP allows wasm" || fail "dashboard CSP allows wasm"
-curl -s -o /dev/null -w '%{http_code}' "$BASE/dashboard/../anyhop.toml" | grep -q 404 \
-    && ok "path traversal rejected" || fail "path traversal rejected"
+# `--path-as-is` is required: curl otherwise squashes `../` before sending, so the
+# request never left the router and the 404 came from "no such route".
+TRAV=$(curl -s --path-as-is -o /dev/null -w '%{http_code}' "$BASE/dashboard/../anyhop.toml")
+TRAV2=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/dashboard/%2e%2e%2fanyhop.toml")
+[ "$TRAV" = 404 ] && [ "$TRAV2" = 404 ] \
+    && ok "path traversal rejected ($TRAV/$TRAV2)" || fail "path traversal rejected ($TRAV/$TRAV2)"
 
 echo "== metrics =="
 M=$(curl -s "$BASE/metrics" -H "$AUTH")
@@ -120,6 +158,32 @@ R=$(curl -s --max-time 15 -D /tmp/ah-hdr.txt -o /dev/null -w '%{http_code}' "$BA
 grep -qi "^retry-after:" /tmp/ah-hdr.txt && ok "503 carries Retry-After" || fail "503 without Retry-After"
 rm -f /tmp/ah-hdr.txt
 
+echo "== routing integrity =="
+# A duplicate `model` key used to be authorized by its FIRST value (the scanner
+# stopped once `stream` was seen) and forwarded verbatim, so the upstream executed
+# the LAST one: an allowlisted client key could spend any model. The request must
+# now be routed and authorized by the value the upstream would use.
+# Two *different* models: the reply must carry the marker of the LAST one
+# (`gemini`'s mock echoes "[sys:…]"), never the mock provider's "ok via …".
+DUP=$(curl -s --max-time 15 "$BASE/v1/chat/completions" -H "$AUTH" -H "$CT" \
+    -d '{"messages":[{"role":"user","content":"hi"}],"model":"mock/test-model","stream":false,"model":"gemini/test-gemini"}')
+if echo "$DUP" | grep -q "\[sys:" && ! echo "$DUP" | grep -q "ok via"; then
+    ok "duplicate model key routes by the last value"
+else
+    fail "duplicate model key: $(echo "$DUP" | head -c 160)"
+fi
+
+echo "== responses store flag =="
+# `store: false` is a contract: the response is still answered, but it must not be
+# persisted, so chaining to it is refused.
+RID=$(curl -s --max-time 15 "$BASE/v1/responses" -H "$AUTH" -H "$CT" \
+    -d '{"model":"mock/test-model","input":"hi","store":false}' \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
+[ -n "$RID" ] && ok "store:false still returns an id ($RID)" || fail "store:false returned no id"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$BASE/v1/responses" -H "$AUTH" -H "$CT" \
+    -d "{\"model\":\"mock/test-model\",\"input\":\"again\",\"previous_response_id\":\"$RID\"}")
+[ "$CODE" = 400 ] && ok "an unstored response cannot be chained" || fail "store:false id was replayable ($CODE)"
+
 echo "== embeddings =="
 EMB=$(curl -s --max-time 15 "$BASE/v1/embeddings" -H "$AUTH" -H "$CT" \
     -d '{"model":"mock/test-model","input":["a","b"]}')
@@ -136,6 +200,30 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/embeddings" -H "$CT" -d 
 [ "$CODE" = 401 ] && ok "embeddings requires auth" || fail "embeddings auth: $CODE"
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/embeddings" -H "$AUTH" -H "$CT" -d '{"input":"hi"}')
 [ "$CODE" = 400 ] && ok "embeddings without model -> 400" || fail "embeddings no model: $CODE"
+
+echo "== fim =="
+# FIM had no end-to-end test at all: a regression in its request shaping or stop
+# handling would ship silently.
+FIM=$(curl -s --max-time 15 "$BASE/v1/fim/completions" -H "$AUTH" -H "$CT" \
+    -d '{"model":"mock/test-model","prompt":"def add(a, b):","max_tokens":16}')
+echo "$FIM" | grep -q '"choices"' && ok "/v1/fim/completions answers" || fail "fim: $(echo "$FIM" | head -c 120)"
+FIM2=$(curl -s --max-time 15 "$BASE/v1/completions" -H "$AUTH" -H "$CT" \
+    -d '{"model":"mock/test-model","prompt":"def add(a, b):","max_tokens":16}')
+echo "$FIM2" | grep -q '"choices"' && ok "/v1/completions alias answers" || fail "fim alias: $(echo "$FIM2" | head -c 120)"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/fim/completions" -H "$CT" -d '{"model":"mock/test-model","prompt":"x"}')
+[ "$CODE" = 401 ] && ok "fim requires auth" || fail "fim auth: $CODE"
+
+echo "== hot reload (SIGHUP) =="
+# Advertised in the README, never tested: a failed reload must keep the old config
+# live instead of leaving a half-applied state.
+kill -HUP "$AH_PID" 2>/dev/null
+sleep 1
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/healthz")
+[ "$CODE" = 200 ] && ok "gateway survives SIGHUP" || fail "SIGHUP killed the gateway ($CODE)"
+grep -q "SIGHUP: config reloaded" /tmp/anyhop-regress.log \
+    && ok "SIGHUP reloaded the config" || fail "SIGHUP reload did not happen"
+R=$(chat mock/test-model hi)
+expect "requests still served after SIGHUP" "$R" "ok via"
 
 echo "== hardening (tls, lockout, concurrency, histograms) =="
 if ANYHOP_BIN="$BIN" timeout 300 python3 test/hardening_test.py; then

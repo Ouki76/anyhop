@@ -43,7 +43,12 @@ pub async fn embeddings(
     };
     let model = String::from_utf8_lossy(&body[span.clone()]).into_owned();
 
-    let router = state.router.load();
+    // `load_full()` (an owned Arc), not `load()` (a guard): arc-swap's `store()`
+    // waits for every outstanding guard on the old pointer, so a config save would
+    // block until this whole upstream round-trip finished — up to the provider's
+    // attempt timeout (120 s by default). The Arc is cheap and the router is
+    // immutable, so holding it across the awaits costs nothing.
+    let router = state.router.load_full();
     let Some(resolved) = router.resolve(&model) else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -119,7 +124,7 @@ pub async fn embeddings(
         }
         for _ in 0..max_retries {
             attempts += 1;
-            let Some(key) = provider.pool.pick(upstream_model, None) else {
+            let Some(key) = provider.pool.pick_ready(upstream_model, None) else {
                 break; // pool exhausted for this model — try the next target
             };
             let Some(guard) = key.try_acquire() else {
@@ -149,7 +154,8 @@ pub async fn embeddings(
                         .client
                         .post(format!(
                             "{}/models/{}:batchEmbedContents",
-                            provider.base_url, upstream_model
+                            provider.base_url,
+                            strip_models_prefix(upstream_model)
                         ))
                         .header("x-goog-api-key", &key.secret)
                         .json(&payload)
@@ -220,10 +226,18 @@ pub async fn embeddings(
                         ),
                     },
                     // Pass-through keeps the provider's exact JSON (usage included).
-                    _ => {
-                        let bytes = resp.bytes().await.unwrap_or_default();
-                        ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
-                    }
+                    _ => match resp.bytes().await {
+                        Ok(bytes) => {
+                            ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
+                        }
+                        // A truncated/failed read used to be served as 200 with an
+                        // empty body — a "successful" empty embedding list.
+                        Err(e) => error_response(
+                            StatusCode::BAD_GATEWAY,
+                            format!("cannot read the upstream embeddings body: {e}"),
+                            "upstream_error",
+                        ),
+                    },
                 };
             }
 
@@ -232,7 +246,7 @@ pub async fn embeddings(
                 .headers()
                 .get(header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
+                .and_then(super::chat::parse_retry_after_header);
             let text = resp.text().await.unwrap_or_default();
             let snippet: String = text.chars().take(500).collect();
             log_attempt(
@@ -304,15 +318,36 @@ fn supports_embeddings(kind: ProviderKind) -> bool {
 }
 
 /// Replace the model name in the raw body (one allocation, no JSON round-trip).
+///
+/// The replacement is JSON-escaped, exactly like `chat::splice_model`: a resolved
+/// model id containing `"` or `\` (an alias or a wildcard mapping) used to be
+/// copied in verbatim, which turned the forwarded body into invalid JSON or into a
+/// different request.
 fn rewrite_model(body: &Bytes, span: &std::ops::Range<usize>, model: &str) -> Bytes {
     if body.get(span.clone()) == Some(model.as_bytes()) {
         return body.clone();
     }
-    let mut out = Vec::with_capacity(body.len() - span.len() + model.len());
+    let encoded = serde_json::to_vec(model).unwrap_or_default();
+    // `to_vec` yields `"escaped"` and the surrounding quotes are already in `body`.
+    let inner: &[u8] = if encoded.len() >= 2 {
+        &encoded[1..encoded.len() - 1]
+    } else {
+        model.as_bytes()
+    };
+    let mut out = Vec::with_capacity(body.len() - span.len() + inner.len());
     out.extend_from_slice(&body[..span.start]);
-    out.extend_from_slice(model.as_bytes());
+    out.extend_from_slice(inner);
     out.extend_from_slice(&body[span.end..]);
     Bytes::from(out)
+}
+
+/// Strip the `models/` prefix Gemini ids are usually written with, once.
+///
+/// The chat path already does this (`gemini::endpoint`), and the embeddings path
+/// appended `models/` to the *raw* id, so a client asking for
+/// `models/text-embedding-004` (accepted by chat) got `/models/models/...` → 404.
+fn strip_models_prefix(model: &str) -> &str {
+    model.strip_prefix("models/").unwrap_or(model)
 }
 
 /// Collect `input` (string or array of strings) from an embeddings request.
@@ -339,7 +374,7 @@ fn gemini_request(body: &[u8], model: &str) -> Option<Value> {
         .iter()
         .map(|text| {
             json!({
-                "model": format!("models/{model}"),
+                "model": format!("models/{}", strip_models_prefix(model)),
                 "content": {"parts": [{"text": text}]}
             })
         })
