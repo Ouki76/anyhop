@@ -56,6 +56,15 @@ PY
         sleep 0.1
     done
 done
+# The antigravity OAuth flow reads its client id/secret from the environment; the
+# real pair lives outside the repository (~/.config/anyhop/env, loaded by
+# scripts/run.sh). Without a default the OAuth checks were unrunnable on a fresh
+# checkout *and in CI* — they asserted a 200 that the server refused with 409. The
+# flow only builds the authorization URL and binds the loopback port here, so dummy
+# values exercise the real code path without contacting Google.
+export ANYHOP_ANTIGRAVITY_CLIENT_ID="${ANYHOP_ANTIGRAVITY_CLIENT_ID:-test-client.apps.googleusercontent.com}"
+export ANYHOP_ANTIGRAVITY_CLIENT_SECRET="${ANYHOP_ANTIGRAVITY_CLIENT_SECRET:-test-client-secret}"
+
 # Point the private config copy at the chosen port.
 sed -i "s|^listen = .*|listen = \"127.0.0.1:$PORT\"|" "$CFG"
 export ANYHOP_TEST_CONFIG="$CFG"
