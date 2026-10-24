@@ -140,12 +140,20 @@ def main():
     ap.add_argument("--pid", type=int, default=None)
     ap.add_argument("--max-p99-ms", type=float, default=1000.0)
     ap.add_argument("--max-rss-growth-mb", type=float, default=150.0)
+    ap.add_argument("--allow-no-pid", action="store_true",
+                    help="sample nothing and judge only latency/errors (a load "
+                         "probe, not a leak test)")
     args = ap.parse_args()
 
     pid = args.pid or find_pid()
     if pid is None:
-        print("warning: no anyhop process found — skipping RSS/fd sampling",
-              file=sys.stderr)
+        if not args.allow_no_pid:
+            # Every leak assertion below is conditional on `pid`. Passing the run
+            # while testing nothing is exactly the failure mode this flag removes.
+            print("FAIL: no anyhop process to sample — pass --pid <pid> "
+                  "(or --allow-no-pid to run a pure load probe)", file=sys.stderr)
+            return 1
+        print("warning: --allow-no-pid: RSS/fd sampling disabled", file=sys.stderr)
 
     payloads = {
         (m, s): json.dumps(
@@ -192,7 +200,10 @@ def main():
     elapsed = time.time() - t_start
 
     lat = sorted(stats.lat)
-    n = len(lat) or 1
+    if not lat:
+        print("VERDICT: FAIL - no completed request was sampled (nothing measured)")
+        return 1
+    n = len(lat)
     p50 = lat[n // 2] * 1000
     p95 = lat[min(n - 1, max(0, int(n * 0.95) - 1))] * 1000
     p99 = lat[min(n - 1, int(n * 0.99))] * 1000

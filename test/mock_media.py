@@ -69,7 +69,10 @@ class Handler(BaseHTTPRequestHandler):
             ctype = self.headers.get("content-type", "")
             return self._json(200, {"text": "hello", "echo_content_type": ctype, "echo_len": len(body)})
         if self.path.startswith("/v1/audio/translations"):
-            return self._json(200, {"text": "hello"})
+            # Echo the content type like the transcriptions route: the test asserts
+            # the multipart boundary survived the gateway's relay.
+            ctype = self.headers.get("content-type", "")
+            return self._json(200, {"text": "hello", "echo_content_type": ctype, "echo_len": len(body)})
         return self._json(404, {"error": {"message": f"no route {self.path}", "type": "not_found_error"}})
 
     def do_GET(self):

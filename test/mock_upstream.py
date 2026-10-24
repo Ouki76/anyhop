@@ -70,6 +70,16 @@ class H(BaseHTTPRequestHandler):
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             }
             self.wfile.write(f"data: {json.dumps(done)}\n\n".encode())
+            # Real OpenAI sends a final usage-only chunk when the client asked for
+            # it; without honouring `stream_options.include_usage` here, the
+            # gateway's usage plumbing would look correct while never being fed.
+            if (body.get("stream_options") or {}).get("include_usage"):
+                usage = {
+                    "id": "chatcmpl-mock", "object": "chat.completion.chunk",
+                    "model": body.get("model"), "choices": [],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                }
+                self.wfile.write(f"data: {json.dumps(usage)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
             return
 
@@ -122,4 +132,11 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    HTTPServer(("127.0.0.1", 9100), H).serve_forever()
+    # Port is configurable so a test can run its own instance without colliding
+    # with the shared suite (which owns 9100).
+    import os
+    import sys
+
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else int(
+        os.environ.get("ANYHOP_MOCK_PORT", "9100"))
+    HTTPServer(("127.0.0.1", port), H).serve_forever()

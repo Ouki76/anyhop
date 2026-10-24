@@ -241,6 +241,28 @@ def check_tls():
         os.unlink(cfg.name)
 
 
+def responses_stream(port, model="mock/test-model"):
+    """POST /v1/responses with stream:true and return the parsed event list."""
+    url = f"http://127.0.0.1:{port}/v1/responses"
+    body = json.dumps({"model": model, "input": "hi", "stream": True}).encode()
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {KEY}"})
+    events = []
+    with urllib.request.urlopen(req, timeout=15) as r:
+        if r.status != 200:
+            raise RuntimeError(f"status {r.status}")
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload:
+                events.append(json.loads(payload))
+    return events
+
+
 def check_observability():
     """Histograms, the new endpoints and the response store on one instance."""
     port = free_port()
@@ -296,6 +318,38 @@ def check_observability():
             else:
                 ok("unknown previous_response_id is a 400")
 
+        # Streaming /v1/responses: the event sequence and the streamed usage were
+        # never exercised over HTTP (only the mapper's unit tests).
+        try:
+            events = responses_stream(port)
+        except Exception as e:  # noqa: BLE001
+            fail(f"/v1/responses stream: {e}")
+            events = []
+        if events:
+            names = [e.get("type") for e in events]
+            text = "".join(
+                e.get("delta", "") for e in events
+                if e.get("type") == "response.output_text.delta"
+            )
+            seqs = [e.get("sequence_number") for e in events]
+            final = next((e for e in events if e.get("type") == "response.completed"), None)
+            usage = ((final or {}).get("response") or {}).get("usage") or {}
+            if names[0] != "response.created":
+                fail(f"responses stream starts with {names[:3]}")
+            elif "response.output_item.added" not in names:
+                fail(f"no output_item.added in {names}")
+            elif "ok via" not in text:
+                fail(f"streamed text was {text!r}")
+            elif names[-1] != "response.completed" or final is None:
+                fail(f"responses stream ends with {names[-1]}")
+            elif seqs != sorted(seqs) or len(set(seqs)) != len(seqs):
+                fail(f"sequence_number is not strictly increasing: {seqs}")
+            elif usage.get("input_tokens") != 7 or usage.get("output_tokens") != 3:
+                fail(f"streamed usage is {usage} (include_usage not plumbed?)")
+            else:
+                ok(f"/v1/responses streams {len(events)} events with usage "
+                   f"{usage.get('input_tokens')}/{usage.get('output_tokens')}")
+
         status, body = request(port, "/metrics")
         if status != 200:
             fail(f"/metrics returned {status}")
@@ -327,6 +381,14 @@ strategy = "round_robin"
 keys = ["media-key-1"]
 models = ["test-model", "tts-1", "whisper-1", "gpt-image-1"]
 capabilities = ["images", "audio", "realtime"]
+
+[[providers]]
+name = "plain"
+type = "openai_compat"
+base_url = "http://127.0.0.1:9105/v1"
+strategy = "round_robin"
+keys = ["plain-key-1"]
+models = ["test-model"]
 """
         )
     gw = Gateway(cfg.name, port)
@@ -379,10 +441,43 @@ capabilities = ["images", "audio", "realtime"]
         else:
             ok(f"/v1/audio/speech relays {len(audio)} bytes of audio")
 
-        # Capability gating: a provider without the capability must refuse, not mis-route.
+        # Multipart audio uploads: boundary and body must survive the relay. These
+        # two routes had no end-to-end coverage at all.
+        for route, label in (("/v1/audio/transcriptions", "transcriptions"),
+                             ("/v1/audio/translations", "translations")):
+            mp = (
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n"
+                f"media/whisper-1\r\n--{boundary}\r\nContent-Disposition: form-data; "
+                f"name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+                f"RIFFDATA\r\n--{boundary}--\r\n"
+            ).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}{route}", data=mp,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                         "Authorization": f"Bearer {KEY}"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    body = json.loads(r.read().decode())
+                if body.get("text") != "hello":
+                    fail(f"/v1/audio/{label} answered {body}")
+                elif boundary not in body.get("echo_content_type", ""):
+                    fail(f"/v1/audio/{label} lost the multipart boundary: "
+                         f"{body.get('echo_content_type')}")
+                else:
+                    ok(f"/v1/audio/{label} relays a multipart upload untouched")
+            except urllib.error.HTTPError as e:
+                fail(f"/v1/audio/{label} returned {e.code}: {e.read()[:120]}")
+
+        # Capability gating: a provider that does not declare `images` must refuse
+        # the request instead of mis-routing it to a chat-only endpoint.
         status, body = request(port, "/v1/images/generations",
-                               {"model": "media/test-model", "prompt": "x"})
-        # media declares images, so this succeeds; the refusal case is exercised in unit tests.
+                               {"model": "plain/test-model", "prompt": "x"})
+        if status == 400 and "capability" in body:
+            ok("/v1/images/generations refuses a provider without the capability")
+        else:
+            fail(f"capability gating returned {status}: {body[:120]}")
 
         # WebSocket realtime through the gateway.
         try:

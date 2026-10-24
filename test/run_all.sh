@@ -75,9 +75,11 @@ if [ "$GATEWAY_UP" != 1 ]; then
     exit 1
 fi
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 ok()   { PASS=$((PASS+1)); echo "  ok   $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL $1"; }
+warn() { SKIP=$((SKIP+1)); echo "  skip $1"; }
+SKIP=0
 
 chat() { # model, user-msg, extra-json
     curl -s --max-time 15 "$BASE/v1/chat/completions" -H "$AUTH" -H "$CT" \
@@ -213,6 +215,36 @@ echo "$FIM2" | grep -q '"choices"' && ok "/v1/completions alias answers" || fail
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/fim/completions" -H "$CT" -d '{"model":"mock/test-model","prompt":"x"}')
 [ "$CODE" = 401 ] && ok "fim requires auth" || fail "fim auth: $CODE"
 
+echo "== soak (latency + leaks) =="
+# Short by default so it fits a regression run; ANYHOP_SOAK_SECS=60 for a real one.
+SOAK_SECS="${ANYHOP_SOAK_SECS:-10}"
+if timeout 300 python3 test/soak.py --url "$BASE" --key test-gw-key \
+        --duration "$SOAK_SECS" --workers 8 --pid "$AH_PID" --max-p99-ms 250 \
+        > /tmp/anyhop-soak.log 2>&1; then
+    ok "soak ${SOAK_SECS}s: $(grep -oE '[0-9,]+ req/s' /tmp/anyhop-soak.log | head -1), $(grep -oE 'p99=[0-9.]+ms' /tmp/anyhop-soak.log | head -1) p99, $(grep -oE 'delta [+-][0-9]+MB' /tmp/anyhop-soak.log | head -1) RSS"
+else
+    fail "soak (see /tmp/anyhop-soak.log): $(tail -1 /tmp/anyhop-soak.log)"
+fi
+
+echo "== redis token bucket (real server) =="
+# The shipped Lua used to be executed by nobody: the suite's RESP double and the
+# Rust fallback are two independent re-implementations, so they could only agree
+# with each other. Runs the exact script text against redis:7-alpine.
+if command -v docker >/dev/null 2>&1; then
+    if python3 test/redis_lua_test.py --binary "$BIN" > /tmp/anyhop-redis.log 2>&1; then
+        ok "redis token bucket Lua: $(grep -oE 'PASS=[0-9]+' /tmp/anyhop-redis.log | tail -1)"
+    else
+        RC=$?
+        if [ "$RC" = 2 ]; then
+            warn "redis Lua not verified (no docker/image) — see /tmp/anyhop-redis.log"
+        else
+            fail "redis token bucket Lua (see /tmp/anyhop-redis.log)"
+        fi
+    fi
+else
+    warn "redis Lua not verified (docker is not installed)"
+fi
+
 echo "== hot reload (SIGHUP) =="
 # Advertised in the README, never tested: a failed reload must keep the old config
 # live instead of leaving a half-applied state.
@@ -254,9 +286,11 @@ if command -v chromium-browser >/dev/null && python3 -c 'import websocket' 2>/de
         fail "ui navigation"; tail -5 /tmp/cdp-nav.out
     fi
 else
-    echo "  skip (chromium/websocket-client missing)"
+    warn "ui navigation (chromium/websocket-client missing)"
 fi
 
 echo
-echo "PASS=$PASS FAIL=$FAIL"
+# SKIP is reported, never folded into PASS: a run that skipped the Redis check or
+# the browser stage must be visibly different from one that ran them.
+echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" = 0 ]
