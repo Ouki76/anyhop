@@ -17,7 +17,7 @@ use super::{ApiError, ApiResult};
 pub async fn get_config(State(state): State<Arc<AppState>>) -> Response {
     match std::fs::read_to_string(&state.config_path) {
         Ok(toml) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], toml).into_response(),
-        Err(e) => ApiError::not_found(format!("cannot read config: {e}")).into_response(),
+        Err(e) => ApiError::internal(format!("cannot read the config file: {e}")).into_response(),
     }
 }
 

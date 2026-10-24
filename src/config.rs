@@ -413,11 +413,22 @@ impl Config {
             !self.server.listen.trim().is_empty(),
             "server.listen is empty"
         );
-        // A listener without a port cannot be bound.
+        // A listener without a port cannot be bound. `contains(':')` accepted
+        // `":"`, `"127.0.0.1:"` and `"127.0.0.1:notaport"`, each of which is written
+        // by the settings API, reported as restart_required, and then kills the next
+        // start at bind time.
+        let listen = self.server.listen.trim();
+        let (host, port) = listen.rsplit_once(':').ok_or_else(|| {
+            anyhow::anyhow!("server.listen must look like host:port (got '{listen}')")
+        })?;
         anyhow::ensure!(
-            self.server.listen.contains(':'),
-            "server.listen must look like host:port (got '{}')",
-            self.server.listen
+            port.parse::<u16>().map(|p| p > 0).unwrap_or(false),
+            "server.listen has an invalid port '{}' (expected 1-65535)",
+            port
+        );
+        anyhow::ensure!(
+            !host.trim().is_empty() || listen.starts_with(":["),
+            "server.listen has an empty host (use 0.0.0.0 to listen everywhere)"
         );
         // Ranges, not just types — the same ones POST /api/server/update
         // enforces. Out-of-range values are accepted by serde but break the
@@ -491,6 +502,15 @@ impl Config {
                     p.name
                 );
             }
+            // The API handler already bounds this; without the same rule here a
+            // hand-edited file (or PUT /api/config) could install a value the
+            // dashboard refuses.
+            anyhow::ensure!(
+                p.max_concurrent <= 10_000,
+                "provider '{}': max_concurrent must be 0 (unlimited) or 1..=10000 (got {})",
+                p.name,
+                p.max_concurrent
+            );
             // All name-based lookups use find() — a duplicate name would make
             // the second provider unreachable through the API.
             anyhow::ensure!(!p.name.trim().is_empty(), "provider with an empty name");
@@ -604,6 +624,10 @@ impl Config {
             anyhow::ensure!(
                 key_values.insert(k.key.as_str()),
                 "client_keys[{i}] duplicates another key's value"
+            );
+            anyhow::ensure!(
+                k.max_concurrent.unwrap_or(0) <= 10_000,
+                "client_keys[{i}]: max_concurrent must be 0 (server default) or 1..=10000"
             );
             // The name is a Prometheus label value and the Requests-tab identity:
             // two keys sharing one name emit duplicate series, which makes

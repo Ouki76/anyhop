@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
-use super::persist::persist_client_keys;
+use super::persist::save_client_keys;
 use super::{ApiError, ApiResult, ok_json};
 use crate::proxy::AppState;
 
@@ -90,6 +90,11 @@ fn check_models(models: &[String]) -> Result<Vec<String>, String> {
                 "a model name must be at most {MAX_MODEL_LEN} characters"
             ));
         }
+        // Same rule as the model-toggle endpoint: a control character in an
+        // allowlist entry ends up in a Prometheus label, the event feed and the log.
+        if m.chars().any(|c| c.is_control()) {
+            return Err("a model name must not contain control characters".to_string());
+        }
         out.push(m.to_string());
     }
     Ok(out)
@@ -111,6 +116,7 @@ fn ck_read(state: &AppState) -> RwLockReadGuard<'_, KeyMap> {
     state.client_keys.read().unwrap_or_else(|e| e.into_inner())
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // the tests seed the map directly
 fn ck_write(state: &AppState) -> RwLockWriteGuard<'_, KeyMap> {
     state.client_keys.write().unwrap_or_else(|e| e.into_inner())
 }
@@ -123,14 +129,52 @@ fn normalise_limit(rpm: Option<u32>, burst: Option<u32>) -> (Option<u32>, Option
     }
 }
 
-/// Storage feed + TOML rewrite, in that order: the feed survives a failed file
-/// rewrite, and both mutating handlers used to repeat this block verbatim.
-async fn save_keys(state: &Arc<AppState>) {
-    let all: Vec<_> = ck_read(state).values().map(|r| r.cfg.clone()).collect();
-    if let Some(s) = &state.storage {
-        s.save_feed("client_keys", &all);
+/// The live client keys as config records.
+fn current_keys(state: &Arc<AppState>) -> Vec<crate::config::ClientKeyConfig> {
+    ck_read(state).values().map(|r| r.cfg.clone()).collect()
+}
+
+/// Turn a boxed error response into something `ApiResult` can return.
+///
+/// `commit_config_text` produces a ready-made response (400 for a rejected edit,
+/// 500 for a failed write); the handlers return `ApiResult`, so the response is
+/// converted back to the equivalent typed error.
+fn boxed(resp: &axum::response::Response) -> ApiError {
+    let status = resp.status();
+    let msg = match status.as_u16() {
+        400 | 422 => "the config was rejected",
+        409 => "the config changed underneath this request, try again",
+        _ => "cannot write the config file",
+    };
+    match status.as_u16() {
+        400 | 422 => ApiError::BadRequest(msg.into()),
+        409 => ApiError::Conflict(msg.into()),
+        _ => ApiError::Internal(msg.into()),
     }
-    persist_client_keys(state).await;
+}
+
+/// Reject a name another key already uses.
+///
+/// The name is a Prometheus label and the Requests-tab identity; two keys sharing
+/// it produce duplicate series and `Config::validate` refuses the file it would have
+/// produced — which used to leave a config that every later write rejected.
+fn ensure_unique_name(
+    keys: &[crate::config::ClientKeyConfig],
+    name: Option<&str>,
+    except: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
+        return Ok(());
+    };
+    if keys
+        .iter()
+        .any(|k| Some(k.key.as_str()) != except && k.name.as_deref().map(str::trim) == Some(name))
+    {
+        return Err(ApiError::conflict(format!(
+            "another client key is already named '{name}'"
+        )));
+    }
+    Ok(())
 }
 
 pub fn mask_key(k: &str) -> String {
@@ -239,20 +283,22 @@ pub async fn client_key_add(
         max_concurrent: body.max_concurrent,
     };
 
-    // New keys follow the live [ratelimit] backend like the ones loaded from TOML.
-    let ratelimit = state.rt().ratelimit;
-    let runtime = Arc::new(crate::proxy::ClientKeyRuntime::new_with(
-        client_key.clone(),
-        &ratelimit,
-    ));
-    {
-        let mut map = ck_write(&state);
-        if map.contains_key(&key_str) {
-            return Err(ApiError::conflict("API key already exists"));
-        }
-        map.insert(key_str.clone(), runtime.clone());
+    // Compute the list this request wants and let the config writer validate,
+    // write and install it. The live map is not touched here: `install_config`
+    // rebuilds it from the file, so a rejected or failed write leaves the running
+    // gateway exactly as it was.
+    let mut keys = current_keys(&state);
+    if keys.iter().any(|k| k.key == key_str) {
+        return Err(ApiError::conflict("API key already exists"));
     }
-    save_keys(&state).await;
+    ensure_unique_name(&keys, client_key.name.as_deref(), None)?;
+    keys.push(client_key.clone());
+    save_client_keys(&state, &keys)
+        .await
+        .map_err(|r| boxed(&r))?;
+
+    // The installed runtime (with its live bucket) is the one to report.
+    let runtime = ck_read(&state).get(&key_str).cloned();
 
     state.events.emit_simple(
         "auth",
@@ -264,18 +310,26 @@ pub async fn client_key_add(
         ),
     );
 
-    ok_json(to_dto(&runtime))
+    match runtime {
+        Some(rt) => ok_json(to_dto(&rt)),
+        None => Err(ApiError::internal(
+            "the key was written but is not in the live map",
+        )),
+    }
 }
 
 pub async fn client_key_delete(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DeleteClientKey>,
 ) -> ApiResult {
-    let removed = ck_write(&state).remove(&body.key);
-    let Some(k) = removed else {
+    let keys = current_keys(&state);
+    let Some(k) = keys.iter().find(|k| k.key == body.key).cloned() else {
         return Err(ApiError::not_found("API key not found"));
     };
-    save_keys(&state).await;
+    let remaining: Vec<_> = keys.into_iter().filter(|k| k.key != body.key).collect();
+    save_client_keys(&state, &remaining)
+        .await
+        .map_err(|r| boxed(&r))?;
 
     state.events.emit_simple(
         "auth",
@@ -283,7 +337,7 @@ pub async fn client_key_delete(
         "backoff",
         format!(
             "deleted client API key '{}'",
-            k.cfg.name.as_deref().unwrap_or(&k.cfg.key)
+            k.name.as_deref().unwrap_or(&k.key)
         ),
     );
     Ok(StatusCode::OK.into_response())
@@ -319,39 +373,44 @@ pub async fn client_key_update(
         return Err(ApiError::bad_request(msg));
     }
 
-    // Snapshot before taking the map lock (no lock nesting with `cfg`).
-    let ratelimit = state.rt().ratelimit;
-    let updated = {
-        let mut map = ck_write(&state);
-        let Some(prev) = map.get(&body.key).cloned() else {
-            return Err(ApiError::not_found("API key not found"));
-        };
-        let mut cfg = prev.cfg.clone();
-        if let Some(n) = name {
-            cfg.name = Some(n);
-        }
-        // `None` = unchanged: a request that only renames the key must not wipe
-        // the allowlist it did not mention.
-        if let Some(m) = models {
-            cfg.models = m;
-        }
-        if let Some(n) = body.max_concurrent {
-            cfg.max_concurrent = Some(n);
-        }
-        // `rpm: None` keeps the current limit; `Some(0)` clears it.
-        if body.rpm.is_some() || body.burst.is_some() {
-            let (rpm, burst) = normalise_limit(body.rpm.or(cfg.rpm), body.burst.or(cfg.burst));
-            cfg.rpm = rpm;
-            cfg.burst = burst;
-        }
-        // rebind keeps the live bucket when the limits did not change.
-        let rt = Arc::new(prev.rebind(cfg, &ratelimit));
-        map.insert(body.key.clone(), rt.clone());
-        rt
+    let mut keys = current_keys(&state);
+    let Some(prev) = keys.iter().find(|k| k.key == body.key).cloned() else {
+        return Err(ApiError::not_found("API key not found"));
     };
+    let mut cfg = prev;
+    if let Some(n) = name {
+        cfg.name = Some(n);
+    }
+    // `None` = unchanged: a request that only renames the key must not wipe
+    // the allowlist it did not mention.
+    if let Some(m) = models {
+        cfg.models = m;
+    }
+    if let Some(n) = body.max_concurrent {
+        cfg.max_concurrent = Some(n);
+    }
+    // `rpm: None` keeps the current limit; `Some(0)` clears it.
+    if body.rpm.is_some() || body.burst.is_some() {
+        let (rpm, burst) = normalise_limit(body.rpm.or(cfg.rpm), body.burst.or(cfg.burst));
+        cfg.rpm = rpm;
+        cfg.burst = burst;
+    }
+    ensure_unique_name(&keys, cfg.name.as_deref(), Some(&body.key))?;
+    for k in &mut keys {
+        if k.key == body.key {
+            *k = cfg.clone();
+        }
+    }
+    save_client_keys(&state, &keys)
+        .await
+        .map_err(|r| boxed(&r))?;
 
-    save_keys(&state).await;
-    ok_json(to_dto(&updated))
+    match ck_read(&state).get(&body.key).cloned() {
+        Some(rt) => ok_json(to_dto(&rt)),
+        None => Err(ApiError::internal(
+            "the key was written but is not in the live map",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -376,6 +435,68 @@ mod tests {
             Some(&[][..]),
             "an explicit empty list still clears the allowlist"
         );
+    }
+
+    /// Adding a client key on a gateway with no admin credential must be refused.
+    ///
+    /// This handler used to splice the file directly and write it *without*
+    /// `Config::validate`, so it happily produced `[[client_keys]]` next to a
+    /// missing `[server] api_key` — a document the validator rejects. From then on
+    /// every later writer, `POST /api/reload`, SIGHUP and the next start refused the
+    /// config, i.e. the admin API locked itself out of its own file.
+    #[tokio::test]
+    async fn a_client_key_without_an_admin_credential_is_refused_and_writes_nothing() {
+        let path = temp_config(
+            r#"[[providers]]
+name = "mock"
+type = "openai_compat"
+base_url = "http://127.0.0.1:1/v1"
+keys = ["sk-test-key"]
+
+[server]
+listen = "127.0.0.1:18080"
+"#,
+        );
+        let st = state(&path);
+        let body: AddClientKey =
+            serde_json::from_str(r#"{"name":"tenant","models":[]}"#).expect("deserialize");
+        let err = client_key_add(State(st.clone()), Json(body))
+            .await
+            .expect_err("a key without an admin credential must be refused");
+        assert!(
+            format!("{err:?}").to_lowercase().contains("config"),
+            "unexpected error {err:?}"
+        );
+        // The file must still be the one that was there — and it must still validate.
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let cfg: crate::config::Config = toml::from_str(&raw).expect("parse");
+        cfg.validate().expect("the file on disk must stay valid");
+        assert!(
+            cfg.client_keys.is_empty(),
+            "nothing may have been written: {raw}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Two keys may not share a name: it is a Prometheus label value, and a
+    /// duplicate sample makes Prometheus reject the whole scrape.
+    #[tokio::test]
+    async fn a_duplicate_name_is_a_conflict() {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+        for (key, name) in [("sk-hop-one", "team"), ("sk-hop-two", "team")] {
+            let body: AddClientKey =
+                serde_json::from_str(&format!(r#"{{"key":"{key}","name":"{name}","models":[]}}"#))
+                    .expect("deserialize");
+            let res = client_key_add(State(st.clone()), Json(body)).await;
+            if key == "sk-hop-one" {
+                res.expect("the first key is added");
+            } else {
+                let err = res.expect_err("the second key must be refused");
+                assert!(format!("{err:?}").contains("already named"), "{err:?}");
+            }
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

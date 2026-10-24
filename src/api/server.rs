@@ -129,13 +129,17 @@ pub async fn get_server(State(state): State<Arc<AppState>>) -> ApiResult {
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return Err(ApiError::not_found(format!("cannot read config: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot read the config file: {e}"
+            )));
         }
     };
     let cfg: crate::config::Config = match toml::from_str(&raw) {
         Ok(c) => c,
         Err(e) => {
-            return Err(ApiError::bad_request(format!("config parse error: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot parse the config file: {e}"
+            )));
         }
     };
     let s = &cfg.server;
@@ -227,13 +231,17 @@ pub async fn update_server(
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return Err(ApiError::not_found(format!("cannot read config: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot read the config file: {e}"
+            )));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return Err(ApiError::bad_request(format!("config parse error: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot parse the config file: {e}"
+            )));
         }
     };
     // Current values: the dashboard posts every field, so "changed" must mean
@@ -241,7 +249,9 @@ pub async fn update_server(
     let current: crate::config::Config = match toml::from_str(&raw) {
         Ok(c) => c,
         Err(e) => {
-            return Err(ApiError::bad_request(format!("config parse error: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot parse the config file: {e}"
+            )));
         }
     };
     let cur = &current.server;
@@ -249,6 +259,18 @@ pub async fn update_server(
 
     if !doc.contains_key("server") {
         doc["server"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    // `server = { … }` (an inline table) is valid TOML and parses identically, but
+    // `as_table_mut` only matches `Item::Table`, so the dashboard could never edit
+    // such a file — every save answered 422. Normalise it into a real table first.
+    if !matches!(doc.get("server"), Some(toml_edit::Item::Table(_)))
+        && let Some(inline) = doc.get("server").and_then(|i| i.as_inline_table()).cloned()
+    {
+        let mut table = toml_edit::Table::new();
+        for (k, v) in inline.iter() {
+            table[k] = toml_edit::Item::Value(v.clone());
+        }
+        doc["server"] = toml_edit::Item::Table(table);
     }
     let Some(server) = doc["server"].as_table_mut() else {
         return Err(ApiError::unprocessable("'server' is not a table"));
@@ -517,14 +539,27 @@ pub async fn update_server(
         sync_num!(response_store_max, "response_store_max");
         if !table.is_empty() {
             // Merge into the existing table so comments and untouched keys survive.
-            let existing = doc.get_mut("tuning");
-            match existing.map(|i| i.as_table_mut()) {
-                Some(Some(tbl)) => {
+            //
+            // `tuning = { … }` is an inline table and `as_table_mut` does not match
+            // it, so the old `_` arm *replaced the whole table*: every tuning value
+            // the operator had set but not edited in this request was silently lost
+            // (and reverted to defaults on the next reload).
+            if !matches!(doc.get("tuning"), Some(toml_edit::Item::Table(_)))
+                && let Some(inline) = doc.get("tuning").and_then(|i| i.as_inline_table()).cloned()
+            {
+                let mut t = toml_edit::Table::new();
+                for (k, v) in inline.iter() {
+                    t[k] = toml_edit::Item::Value(v.clone());
+                }
+                doc["tuning"] = toml_edit::Item::Table(t);
+            }
+            match doc.get_mut("tuning").and_then(|i| i.as_table_mut()) {
+                Some(tbl) => {
                     for (k, v) in table.iter() {
                         tbl[k] = v.clone();
                     }
                 }
-                _ => {
+                None => {
                     doc["tuning"] = toml_edit::Item::Table(table);
                 }
             }

@@ -114,13 +114,17 @@ pub async fn combo_add(
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return Err(ApiError::not_found(format!("cannot read config: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot read the config file: {e}"
+            )));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return Err(ApiError::bad_request(format!("config parse error: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot parse the config file: {e}"
+            )));
         }
     };
     if !doc.contains_key("combos") {
@@ -164,13 +168,17 @@ pub async fn combo_update(
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return Err(ApiError::not_found(format!("cannot read config: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot read the config file: {e}"
+            )));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return Err(ApiError::bad_request(format!("config parse error: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot parse the config file: {e}"
+            )));
         }
     };
     let Some(arr) = doc
@@ -212,13 +220,17 @@ pub async fn combo_delete(
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return Err(ApiError::not_found(format!("cannot read config: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot read the config file: {e}"
+            )));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return Err(ApiError::bad_request(format!("config parse error: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot parse the config file: {e}"
+            )));
         }
     };
     let Some(arr) = doc

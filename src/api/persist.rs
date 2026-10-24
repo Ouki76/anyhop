@@ -2,34 +2,47 @@ use std::sync::Arc;
 
 use crate::proxy::AppState;
 
-pub(crate) async fn persist_client_keys(state: &Arc<AppState>) {
-    let all: Vec<_> = state
-        .client_keys
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-        .map(|r| r.cfg.clone())
-        .collect();
-    // Serialize config rewrites: a concurrent writer reading the pre-write
-    // file would silently drop this update from disk.
+/// Persist the **whole** client-key list: validate, build, write, install.
+///
+/// The caller passes the list it wants (current list ± its change); it does not
+/// mutate the live map itself. That order fixes three defects at once:
+///
+/// * the old path spliced the file with `toml_edit` and wrote it *without*
+///   running `Config::validate`, so two API-reachable inputs (a key added on a
+///   gateway with no `api_key`, two keys sharing a `name`) produced a file that
+///   every later writer, `POST /api/reload`, SIGHUP and the next start rejected —
+///   the admin API locked itself out;
+/// * the snapshot was taken *before* `config_lock`, so two concurrent editors
+///   could write each other's stale list (a revoked key came back);
+/// * a failed write was swallowed and the handler still answered 2xx.
+///
+/// Installing happens inside `commit_config_text`, which rebuilds the live map
+/// from the file — so state and disk can no longer disagree.
+pub(crate) async fn save_client_keys(
+    state: &Arc<AppState>,
+    keys: &[crate::config::ClientKeyConfig],
+) -> Result<(), Box<axum::response::Response>> {
     let _guard = state.config_lock.lock().await;
-    if let Err(e) = save_client_keys_to_toml(&state.config_path, &all) {
-        tracing::warn!("cannot persist client_keys to config: {e}");
-    }
+    let text = client_keys_text(&state.config_path, keys).map_err(io_error)?;
+    commit_config_text(state, &text).await.map(|_| ())
 }
 
-pub(crate) async fn persist_disabled_models(state: &Arc<AppState>) {
-    let all: Vec<_> = state
-        .disabled_models
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .cloned()
-        .collect();
+/// Persist the whole `disabled_models` list (same discipline as
+/// [`save_client_keys`]).
+pub(crate) async fn save_disabled_models(
+    state: &Arc<AppState>,
+    disabled: &[String],
+) -> Result<(), Box<axum::response::Response>> {
     let _guard = state.config_lock.lock().await;
-    if let Err(e) = save_disabled_models_to_toml(&state.config_path, &all) {
-        tracing::warn!("cannot persist disabled_models to config: {e}");
-    }
+    let text = disabled_models_text(&state.config_path, disabled).map_err(io_error)?;
+    commit_config_text(state, &text).await.map(|_| ())
+}
+
+/// A config-file read/parse failure is *our* problem, not the caller's: 404 used to
+/// make a permissions or ENOSPC error look like a wrong URL.
+fn io_error(e: anyhow::Error) -> Box<axum::response::Response> {
+    use axum::response::IntoResponse;
+    Box::new(super::ApiError::internal(format!("cannot read the config file: {e}")).into_response())
 }
 
 /// Validate an edited config document *before* writing it, then write + reload.
@@ -90,10 +103,10 @@ pub(crate) async fn commit_config_text(
 }
 
 /// toml_edit keeps the rest of the file (comments, key order) untouched.
-pub fn save_client_keys_to_toml(
+pub fn client_keys_text(
     path: &str,
     keys: &[crate::config::ClientKeyConfig],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let raw = std::fs::read_to_string(path)?;
     let mut doc = raw.parse::<toml_edit::DocumentMut>()?;
 
@@ -127,11 +140,10 @@ pub fn save_client_keys_to_toml(
     }
     doc["client_keys"] = toml_edit::Item::ArrayOfTables(arr);
 
-    crate::config::write_atomic(path, &doc.to_string())?;
-    Ok(())
+    Ok(doc.to_string())
 }
 
-pub fn save_disabled_models_to_toml(path: &str, disabled: &[String]) -> anyhow::Result<()> {
+pub fn disabled_models_text(path: &str, disabled: &[String]) -> anyhow::Result<String> {
     let raw = std::fs::read_to_string(path)?;
     let mut doc = raw.parse::<toml_edit::DocumentMut>()?;
 
@@ -141,8 +153,7 @@ pub fn save_disabled_models_to_toml(path: &str, disabled: &[String]) -> anyhow::
     }
     doc["disabled_models"] = toml_edit::value(arr);
 
-    crate::config::write_atomic(path, &doc.to_string())?;
-    Ok(())
+    Ok(doc.to_string())
 }
 
 #[cfg(test)]
@@ -186,7 +197,8 @@ mod tests {
     fn the_client_key_round_trip_keeps_max_concurrent() {
         let (dir, path) = scratch("max-concurrent");
         let keys = vec![key(Some(60), Some(5), Some(3))];
-        save_client_keys_to_toml(&path, &keys).expect("write");
+        let text = client_keys_text(&path, &keys).expect("build");
+        crate::config::write_atomic(&path, &text).expect("write");
 
         let raw = std::fs::read_to_string(&path).expect("read");
         let parsed: crate::config::Config = toml::from_str(&raw).expect("parse back");
@@ -202,7 +214,8 @@ mod tests {
 
         // An unset cap stays unset (no bogus 0 written).
         let keys = vec![key(None, None, None)];
-        save_client_keys_to_toml(&path, &keys).expect("write");
+        let text = client_keys_text(&path, &keys).expect("build");
+        crate::config::write_atomic(&path, &text).expect("write");
         let raw = std::fs::read_to_string(&path).expect("read");
         let parsed: crate::config::Config = toml::from_str(&raw).expect("parse back");
         assert_eq!(parsed.client_keys[0].max_concurrent, None);
@@ -218,7 +231,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (dir, path) = scratch("perms");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-        save_client_keys_to_toml(&path, &[key(None, None, Some(1))]).expect("write");
+        let text = client_keys_text(&path, &[key(None, None, Some(1))]).expect("build");
+        crate::config::write_atomic(&path, &text).expect("write");
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o077, 0, "config mode {mode:o} is not owner-only");
         let _ = std::fs::remove_dir_all(&dir);
@@ -235,9 +249,11 @@ mod tests {
             "# operator notes: keep me\nlisten = \"127.0.0.1:1\"\n",
         )
         .expect("seed");
-        save_disabled_models_to_toml(&path, &["a/model".into(), "combo/x".into()]).expect("write");
-        save_disabled_models_to_toml(&path, &["a/model".into(), "combo/x".into()])
-            .expect("write again");
+        for _ in 0..2 {
+            let text =
+                disabled_models_text(&path, &["a/model".into(), "combo/x".into()]).expect("build");
+            crate::config::write_atomic(&path, &text).expect("write");
+        }
 
         let raw = std::fs::read_to_string(&path).expect("read");
         assert_eq!(
@@ -253,7 +269,8 @@ mod tests {
         );
 
         // Removing every entry leaves an empty array, not a stale one.
-        save_disabled_models_to_toml(&path, &[]).expect("clear");
+        let text = disabled_models_text(&path, &[]).expect("build");
+        crate::config::write_atomic(&path, &text).expect("clear");
         let raw = std::fs::read_to_string(&path).expect("read");
         let parsed: crate::config::Config = toml::from_str(&raw).expect("parse back");
         assert!(parsed.disabled_models.is_empty(), "{raw}");

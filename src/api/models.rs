@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLockReadGuard};
 
 use axum::Json;
 use axum::extract::State;
@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
-use super::persist::persist_disabled_models;
+use super::persist::save_disabled_models;
 use super::{ApiResult, ok_json};
 use crate::proxy::AppState;
 
@@ -34,22 +34,31 @@ fn dm_read(state: &AppState) -> RwLockReadGuard<'_, HashSet<String>> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-fn dm_write(state: &AppState) -> RwLockWriteGuard<'_, HashSet<String>> {
-    state
-        .disabled_models
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
+/// The disabled set as a sorted list (stable output, no duplicate spellings).
+fn current_disabled(state: &Arc<AppState>) -> Vec<String> {
+    let mut all: Vec<_> = dm_read(state).iter().cloned().collect();
+    all.sort();
+    all.dedup();
+    all
 }
 
-/// Persist the disabled set: storage feed first (fast, survives restarts even if
-/// the TOML rewrite fails), then the TOML file. Every mutating handler did this.
-async fn save_disabled(state: &Arc<AppState>) {
+/// Persist the whole disabled list through the config writer (validate → write →
+/// install) and return any error to the caller.
+async fn save_disabled(
+    state: &Arc<AppState>,
+    list: &[String],
+) -> Result<(), Box<axum::response::Response>> {
+    save_disabled_models(state, list).await?;
     state.invalidate_catalog();
-    let all: Vec<_> = dm_read(state).iter().cloned().collect();
-    if let Some(s) = &state.storage {
-        s.save_feed("disabled_models", &all);
+    Ok(())
+}
+
+/// Map a boxed error response to the typed error `ApiResult` wants.
+fn boxed(resp: &axum::response::Response) -> super::ApiError {
+    match resp.status().as_u16() {
+        400 | 422 => super::ApiError::BadRequest("the config was rejected".into()),
+        _ => super::ApiError::Internal("cannot write the config file".into()),
     }
-    persist_disabled_models(state).await;
 }
 
 /// `combo/flash` and `flash` name the same model; also drop the bare half of a
@@ -180,8 +189,18 @@ pub async fn model_enable(
 ) -> ApiResult {
     validate_model_action(&a)?;
     let model = normalize(&a).to_string();
-    clear_model(&mut dm_write(&state), &model);
-    save_disabled(&state).await;
+    // Compute the list this request wants; the writer validates, writes and
+    // installs it. Mutating the live set first meant a concurrent config write
+    // could revert it while the request had already answered "enabled".
+    let mut list = current_disabled(&state);
+    {
+        let dm: HashSet<String> = list.iter().cloned().collect();
+        let mut dm = dm;
+        clear_model(&mut dm, &model);
+        list = dm.into_iter().collect();
+    }
+    list.sort();
+    save_disabled(&state, &list).await.map_err(|r| boxed(&r))?;
 
     state.events.emit_simple(
         "models",
@@ -199,8 +218,11 @@ pub async fn model_disable(
 ) -> ApiResult {
     validate_model_action(&a)?;
     let model = normalize(&a).to_string();
-    dm_write(&state).insert(model.clone());
-    save_disabled(&state).await;
+    let mut list = current_disabled(&state);
+    if !list.iter().any(|m| m == &model) {
+        list.push(model.clone());
+    }
+    save_disabled(&state, &list).await.map_err(|r| boxed(&r))?;
 
     state.events.emit_simple(
         "models",
@@ -218,19 +240,22 @@ pub async fn model_toggle(
 ) -> ApiResult {
     validate_model_action(&a)?;
     let model = normalize(&a).to_string();
+    let mut list = current_disabled(&state);
     let new_enabled = {
-        let mut dm = dm_write(&state);
+        let mut dm: HashSet<String> = list.iter().cloned().collect();
         // Toggle must agree with `models_list`/the request path: an entry in any
         // spelling counts as disabled, and enabling clears all of them.
         if is_disabled(&dm, &model) {
             clear_model(&mut dm, &model);
+            list = dm.into_iter().collect();
+            list.sort();
             true
         } else {
-            dm.insert(model.clone());
+            list.push(model.clone());
             false
         }
     };
-    save_disabled(&state).await;
+    save_disabled(&state, &list).await.map_err(|r| boxed(&r))?;
 
     let kind = if new_enabled { "backoff" } else { "dead" };
     state.events.emit_simple(
@@ -247,8 +272,7 @@ pub async fn model_toggle(
 }
 
 pub async fn models_enable_all(State(state): State<Arc<AppState>>) -> ApiResult {
-    dm_write(&state).clear();
-    save_disabled(&state).await;
+    save_disabled(&state, &[]).await.map_err(|r| boxed(&r))?;
     state
         .events
         .emit_simple("models", "", "backoff", "all models enabled".into());
@@ -267,13 +291,13 @@ pub async fn models_disable_all(State(state): State<Arc<AppState>>) -> ApiResult
         all_ids.push(c.name.clone());
     }
 
-    {
-        let mut dm = dm_write(&state);
-        for id in all_ids {
-            dm.insert(id);
+    let mut list = current_disabled(&state);
+    for id in all_ids {
+        if !list.iter().any(|m| m == &id) {
+            list.push(id);
         }
     }
-    save_disabled(&state).await;
+    save_disabled(&state, &list).await.map_err(|r| boxed(&r))?;
 
     state
         .events

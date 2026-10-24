@@ -128,13 +128,17 @@ pub async fn provider_add(
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return Err(ApiError::not_found(format!("cannot read config: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot read the config file: {e}"
+            )));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return Err(ApiError::bad_request(format!("config parse error: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot parse the config file: {e}"
+            )));
         }
     };
     if !doc.contains_key("providers") {
@@ -273,13 +277,17 @@ pub async fn provider_update(
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return Err(ApiError::not_found(format!("cannot read config: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot read the config file: {e}"
+            )));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return Err(ApiError::bad_request(format!("config parse error: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot parse the config file: {e}"
+            )));
         }
     };
     let Some(arr) = doc
@@ -372,13 +380,17 @@ pub async fn provider_delete(
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return Err(ApiError::not_found(format!("cannot read config: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot read the config file: {e}"
+            )));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return Err(ApiError::bad_request(format!("config parse error: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot parse the config file: {e}"
+            )));
         }
     };
     let Some(arr) = doc
@@ -516,13 +528,17 @@ pub async fn key_delete(State(state): State<Arc<AppState>>, Json(a): Json<KeyAct
         let raw = match std::fs::read_to_string(&state.config_path) {
             Ok(r) => r,
             Err(e) => {
-                return Err(ApiError::not_found(format!("cannot read config: {e}")));
+                return Err(ApiError::internal(format!(
+                    "cannot read the config file: {e}"
+                )));
             }
         };
         let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
             Ok(d) => d,
             Err(e) => {
-                return Err(ApiError::bad_request(format!("config parse error: {e}")));
+                return Err(ApiError::internal(format!(
+                    "cannot parse the config file: {e}"
+                )));
             }
         };
         let Some(arr) = doc
@@ -581,13 +597,17 @@ pub async fn key_delete(State(state): State<Arc<AppState>>, Json(a): Json<KeyAct
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return Err(ApiError::not_found(format!("cannot read config: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot read the config file: {e}"
+            )));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return Err(ApiError::bad_request(format!("config parse error: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot parse the config file: {e}"
+            )));
         }
     };
     // Rebuild the provider's `keys` array as the complete remaining set: the file
@@ -690,13 +710,17 @@ pub async fn key_add(State(state): State<Arc<AppState>>, Json(a): Json<AddKey>) 
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return Err(ApiError::not_found(format!("cannot read config: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot read the config file: {e}"
+            )));
         }
     };
     let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
-            return Err(ApiError::bad_request(format!("config parse error: {e}")));
+            return Err(ApiError::internal(format!(
+                "cannot parse the config file: {e}"
+            )));
         }
     };
     let Some(arr) = doc

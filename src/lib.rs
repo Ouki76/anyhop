@@ -420,7 +420,6 @@ fn prepare_config(
     }
 
     let mut list = build_providers(&cfg, state.storage.as_ref(), Some(&state.events))?;
-    let tuning = Arc::new(cfg.tuning.clone());
     {
         let live = state.router.load();
         for p in &mut list {
@@ -432,8 +431,11 @@ fn prepare_config(
             {
                 p.pool = prev.pool.clone();
             }
-            // Tuning is hot, so it applies to reused pools too.
-            p.pool.set_tuning(tuning.clone());
+            // NOTE: tuning is applied in `install_config`, *after* a successful
+            // write. Setting it here (as this used to) mutated the live pools
+            // before `write_atomic`, so a config save that failed on disk still
+            // changed runtime behaviour — file and process disagreed and the 500
+            // did not say so.
         }
     }
     // Merge keys added at runtime via the dashboard (never for OAuth providers:
@@ -467,6 +469,12 @@ fn install_config(state: &Arc<proxy::AppState>, prepared: PreparedConfig) -> usi
     let n = prepared.router.providers.len();
     // Providers, combos and model lists may all have changed.
     state.invalidate_catalog();
+    // Tuning reaches the reused pools here — after `write_atomic`, so a rejected or
+    // failed save leaves runtime behaviour untouched (see `prepare_config`).
+    let tuning = Arc::new(cfg.tuning.clone());
+    for p in &prepared.router.providers {
+        p.pool.set_tuning(tuning.clone());
+    }
     state.router.store(Arc::new(prepared.router));
     // `[tuning]` is reported as hot by /api/server/update, so it must actually
     // reach every reader — it used to stay at the value captured at startup.
