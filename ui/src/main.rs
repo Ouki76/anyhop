@@ -181,9 +181,20 @@ fn App() -> View {
                     if !providers.is_alive() {
                         break;
                     }
-                    // Skip no-op updates — a set() would rebuild the open detail
-                    // page and wipe any in-progress form state every 3 seconds.
-                    if providers.get_clone() != data {
+                    // Skip no-op updates. Comparing the whole DTO was not enough:
+                    // it carries per-key counters (in_flight/requests/failures) that
+                    // move with traffic, so the "no-op" was almost never a no-op —
+                    // and every tick rebuilt the open detail page, wiping the
+                    // settings form and a half-pasted key. Compare the *shape*.
+                    let changed = {
+                        let current = providers.get_clone();
+                        current.len() != data.len()
+                            || current
+                                .iter()
+                                .zip(data.iter())
+                                .any(|(a, b)| a.shape() != b.shape())
+                    };
+                    if changed {
                         providers.set(data);
                     }
                     loaded.set(true);

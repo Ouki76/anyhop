@@ -282,8 +282,8 @@ pub fn SettingsTab() -> View {
                         body["admin_key"] = serde_json::Value::String(a.trim().to_string());
                     }
                     spawn_local(async move {
-                        match post_json_resp::<_, serde_json::Value>("/api/server/update", &body).await {
-                            Some(v) => {
+                        match post_json_result::<_, serde_json::Value>("/api/server/update", &body).await {
+                            Ok(v) => {
                                 let rs: Vec<String> = v
                                     .get("restart_required")
                                     .and_then(|r| r.as_array())
@@ -300,9 +300,12 @@ pub fn SettingsTab() -> View {
                                     admin_key.set(String::new());
                                 }
                             }
-                            None => {
+                            // Show *why*: a rejected save used to be a generic
+                            // "saved" (the error envelope parsed as success) and the
+                            // typed api_key/admin_key were blanked afterwards.
+                            Err(e) => {
                                 if status.is_alive() {
-                                    status.set("could not save (check the values and the server log)".into());
+                                    status.set(format!("save failed: {e}"));
                                 }
                             }
                         }
@@ -350,16 +353,6 @@ pub fn SettingsTab() -> View {
                             t_body_timeout.set(t.client_body_timeout_secs.to_string());
                             t_shutdown_grace.set(t.shutdown_grace_secs.to_string());
                             t_capacity_wait.set(t.capacity_wait_ms.to_string());
-            t_capacity_wait.set(t.capacity_wait_ms.to_string());
-            t_shutdown_grace.set(t.shutdown_grace_secs.to_string());
-            t_capacity_wait.set(t.capacity_wait_ms.to_string());
-            t_body_timeout.set(t.client_body_timeout_secs.to_string());
-            t_shutdown_grace.set(t.shutdown_grace_secs.to_string());
-            t_capacity_wait.set(t.capacity_wait_ms.to_string());
-            t_resp_store.set(t.response_store_max.to_string());
-            t_body_timeout.set(t.client_body_timeout_secs.to_string());
-            t_shutdown_grace.set(t.shutdown_grace_secs.to_string());
-            t_capacity_wait.set(t.capacity_wait_ms.to_string());
                             api_key.set(String::new());
                             admin_key.set(String::new());
                             if status.is_alive() {

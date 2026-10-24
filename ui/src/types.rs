@@ -48,6 +48,25 @@ pub struct KeyDto {
     pub completion_tokens: u64,
 }
 
+/// A provider's *structure* — everything except the counters that change with
+/// traffic.
+///
+/// The page re-renders when this tuple changes; the poll loop must not use the full
+/// `ProviderDto`, because `in_flight`/`requests`/`failures` move every few seconds
+/// and rebuilding the detail page wipes whatever the operator is typing (settings
+/// form, a key being pasted).
+pub type ProviderShape = (
+    String,
+    String,
+    String,
+    String,
+    Vec<(String, String, String)>, // (key id, masked, status)
+    Vec<String>,
+    u32,
+    u32,
+    Vec<String>,
+);
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ProviderDto {
     #[serde(default)]

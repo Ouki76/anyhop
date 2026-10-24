@@ -212,17 +212,21 @@ pub fn AddProviderModal(
                 "kind": kind,
                 "provider": name_for_auth.get_clone(),
             });
-            let Ok(req) = Request::post("/api/auth/start").json(&body) else {
-                return;
-            };
-            if let Some(k) = stored_key() {
-                req.headers().set("Authorization", &format!("Bearer {k}"));
-            }
-            let Ok(resp) = req.send().await else { return };
-            let Ok(v) = resp.json::<serde_json::Value>().await else {
-                return;
+            // Report failures: a 401/409/500 used to parse into the error envelope,
+            // find no `url` and return silently — the button looked dead.
+            let v = match post_json_result::<_, serde_json::Value>("/api/auth/start", &body).await {
+                Ok(v) => v,
+                Err(e) => {
+                    if error.is_alive() {
+                        error.set(format!("cannot start sign-in: {e}"));
+                    }
+                    return;
+                }
             };
             let Some(url) = v.get("url").and_then(|u| u.as_str()).map(str::to_string) else {
+                if error.is_alive() {
+                    error.set("cannot start sign-in: the server returned no URL".into());
+                }
                 return;
             };
             let mode = v
@@ -747,12 +751,15 @@ pub fn ProviderSettings(provider: ProviderDto) -> View {
             })
             div(class="card-foot") {
                 button(class="btn btn-primary", on:click=move |_| {
+                    // A number that does not parse must be *omitted* (leave the value
+                    // alone), not sent as 0: `max_concurrent = 0` means "unlimited",
+                    // so a typo silently removed the cap.
                     let body = serde_json::json!({
                         "name": pname.clone(),
                         "base_url": base_url.get_clone(),
                         "strategy": strategy.get_clone(),
-                        "max_concurrent": max_concurrent.get_clone().trim().parse::<u32>().unwrap_or(0),
-                        "drain_below_pct": drain_pct.get_clone().trim().parse::<u32>().unwrap_or(0),
+                        "max_concurrent": max_concurrent.get_clone().trim().parse::<u32>().ok(),
+                        "drain_below_pct": drain_pct.get_clone().trim().parse::<u32>().ok(),
                         "proxy": proxy.get_clone(),
                         "timeout_secs": timeout_secs.get_clone().trim().parse::<u64>().ok(),
                         "max_retries": max_retries.get_clone().trim().parse::<usize>().ok(),
@@ -868,24 +875,71 @@ pub fn KeyDeleteButton(provider: String, id: String, masked: String) -> View {
     }
 }
 
+impl ProviderDto {
+    /// See [`crate::types::ProviderShape`]: identity + settings, no counters.
+    pub fn shape(&self) -> ProviderShape {
+        (
+            self.name.clone(),
+            self.kind.clone(),
+            self.base_url.clone(),
+            self.strategy.clone(),
+            self.keys
+                .iter()
+                .map(|k| (k.id.clone(), k.masked.clone(), k.status.clone()))
+                .collect(),
+            self.models.clone(),
+            self.max_concurrent,
+            self.drain_below_pct,
+            self.capabilities.clone(),
+        )
+    }
+}
+
 #[component(inline_props)]
 pub fn AddKeyForm(provider: String) -> View {
     let new_key = create_signal(String::new());
+    let error = create_signal(String::new());
     view! {
         div(class="addkey") {
-            input(class="input", r#type="text", placeholder="add a key…",
-                  bind:value=new_key)
+            // A provider key is a credential: masked input, like the add-provider form.
+            input(class="input", r#type="password", placeholder="add a key…",
+                  bind:value=new_key, autocomplete="off")
             button(class="btn btn-primary", on:click=move |_| {
                 let secret = new_key.get_clone();
-                if secret.len() >= 4 {
-                    new_key.set(String::new());
-                    let provider = provider.clone();
-                    spawn_local(async move {
-                        let body = serde_json::json!({"provider": provider, "secret": secret});
-                        post_json("/api/keys/add", &body).await;
-                    });
+                if secret.len() < 4 {
+                    if error.is_alive() {
+                        error.set("a key needs at least 4 characters".to_string());
+                    }
+                    return;
                 }
+                let provider = provider.clone();
+                spawn_local(async move {
+                    let body = serde_json::json!({"provider": provider, "secret": secret});
+                    // Keep the typed secret in the field on failure: it is the only
+                    // copy the operator has.
+                    match post_json_result::<_, serde_json::Value>("/api/keys/add", &body).await {
+                        Ok(_) => {
+                            new_key.set(String::new());
+                            if error.is_alive() {
+                                error.set(String::new());
+                            }
+                            if let Some(w) = web_sys::window() {
+                                let _ = w.location().reload();
+                            }
+                        }
+                        Err(e) => {
+                            if error.is_alive() {
+                                error.set(format!("could not add the key: {e}"));
+                            }
+                        }
+                    }
+                });
             }) { "Add" }
+            (if !error.get_clone().is_empty() {
+                view! { div(class="auth-banner auth-error flush") { (error.get_clone()) } }
+            } else {
+                view! {}
+            })
         }
     }
 }
@@ -894,6 +948,7 @@ pub fn AddKeyForm(provider: String) -> View {
 pub fn OAuthAddButton(kind: String, provider: String) -> View {
     let auth = create_signal(Option::<AuthStateDto>::None);
     let paste_url = create_signal(String::new());
+    let action_error = create_signal(String::new());
     let provider_name = provider.clone();
     let label = format!("Add {kind} account");
     view! {
@@ -910,13 +965,21 @@ pub fn OAuthAddButton(kind: String, provider: String) -> View {
                         // append to this provider, not to the first one of that type
                         "provider": provider_name_for_auth.clone(),
                     });
-                    let Ok(req) = Request::post("/api/auth/start").json(&body) else { return };
-                    if let Some(k) = stored_key() {
-                        req.headers().set("Authorization", &format!("Bearer {k}"));
-                    }
-                    let Ok(resp) = req.send().await else { return };
-                    let Ok(v) = resp.json::<serde_json::Value>().await else { return };
-                    let Some(url) = v.get("url").and_then(|u| u.as_str()).map(str::to_string) else { return };
+                    let v = match post_json_result::<_, serde_json::Value>("/api/auth/start", &body).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if action_error.is_alive() {
+                                action_error.set(format!("cannot start sign-in: {e}"));
+                            }
+                            return;
+                        }
+                    };
+                    let Some(url) = v.get("url").and_then(|u| u.as_str()).map(str::to_string) else {
+                        if action_error.is_alive() {
+                            action_error.set("cannot start sign-in: the server returned no URL".into());
+                        }
+                        return;
+                    };
                     let url2 = url.clone();
                     defer(move || {
                         if auth.is_alive() {
@@ -1020,6 +1083,11 @@ pub fn OAuthAddButton(kind: String, provider: String) -> View {
             }
             None => view! {},
         })
+        (if !action_error.get_clone().is_empty() {
+            view! { div(class="auth-banner auth-error flush") { (action_error.get_clone()) } }
+        } else {
+            view! {}
+        })
     }
 }
 
@@ -1033,12 +1101,26 @@ pub fn KeyActionButton(provider: String, id: String, status: String) -> View {
     } else {
         "/api/keys/disable"
     };
+    let error = create_signal(String::new());
     view! {
         button(class=class, on:click=move |_| {
             let body = serde_json::json!({"provider": provider.clone(), "id": id.clone()});
             spawn_local(async move {
-                post_json(url, &body).await;
+                // A failed enable/disable used to be indistinguishable from a click
+                // that worked (the result was dropped).
+                if let Err(e) = post_json_result::<_, serde_json::Value>(url, &body).await {
+                    if error.is_alive() {
+                        error.set(format!("{label} failed: {e}"));
+                    }
+                } else if let Some(w) = web_sys::window() {
+                    let _ = w.location().reload();
+                }
             });
         }) { (label) }
+        (if !error.get_clone().is_empty() {
+            view! { div(class="auth-banner auth-error flush") { (error.get_clone()) } }
+        } else {
+            view! {}
+        })
     }
 }

@@ -72,11 +72,21 @@ pub fn ApiKeysTab(
                         div(class="key-text") { (key_txt) }
                         div(class="row mt-4") {
                             button(class="btn btn-primary btn-sm", on:click=move |_| {
-                                copy_to_clipboard(&key_copy);
-                                copied_key.set(key_copy.clone());
-                                gloo_timers::callback::Timeout::new(2000, move || {
-                                    if copied_key.is_alive() { copied_key.set(String::new()); }
-                                }).forget();
+                                let text = key_copy.clone();
+                                let copied_key = copied_key;
+                                spawn_local(async move {
+                                    // Only claim success when the clipboard write
+                                    // actually succeeded; otherwise the operator
+                                    // dismisses the banner and the key is lost.
+                                    if copy_to_clipboard(&text).await {
+                                        copied_key.set(text);
+                                    } else {
+                                        copied_key.set("copy failed — select it".to_string());
+                                    }
+                                    gloo_timers::callback::Timeout::new(2000, move || {
+                                        if copied_key.is_alive() { copied_key.set(String::new()); }
+                                    }).forget();
+                                });
                             }) { (if is_copied.get() { "Copied!" } else { "Copy Key" }) }
                         }
                     }
@@ -208,9 +218,16 @@ pub fn ApiKeysTab(
                         button(class="btn btn-primary", on:click=move |_| {
                             let name = name_input.get_clone();
                             let key = key_input.get_clone();
-                            let rpm = rpm_input.get_clone().trim().parse::<u32>().unwrap_or(0);
-                            let burst = burst_input.get_clone().trim().parse::<u32>().unwrap_or(0);
-                            let max_concurrent = max_concurrent_input.get_clone().trim().parse::<u32>().unwrap_or(0);
+                            // `None` = leave unset (unlimited). Parsing junk into 0
+                            // used to post "unlimited" silently.
+                            let rpm = rpm_input.get_clone().trim().parse::<u32>().ok().filter(|n| *n > 0);
+                            let burst = burst_input.get_clone().trim().parse::<u32>().ok().filter(|n| *n > 0);
+                            let max_concurrent = max_concurrent_input
+                                .get_clone()
+                                .trim()
+                                .parse::<u32>()
+                                .ok()
+                                .filter(|n| *n > 0);
                             let models_vec = if restrict_models.get() {
                                 selected_models.get_clone().into_iter().collect::<Vec<_>>()
                             } else {
@@ -221,9 +238,9 @@ pub fn ApiKeysTab(
                                     "name": if name.trim().is_empty() { None } else { Some(name.trim()) },
                                     "key": if key.trim().is_empty() { None } else { Some(key.trim()) },
                                     "models": models_vec,
-                                    "rpm": if rpm > 0 { Some(rpm) } else { None },
-                                    "burst": if burst > 0 { Some(burst) } else { None },
-                                    "max_concurrent": if max_concurrent > 0 { serde_json::Value::from(max_concurrent) } else { serde_json::Value::Null },
+                                    "rpm": rpm,
+                                    "burst": burst,
+                                    "max_concurrent": max_concurrent,
                                 });
                                 let req = match Request::post("/api/client-keys/add").json(&body) {
                                     Ok(r) => r,
@@ -477,11 +494,15 @@ pub fn ApiKeysTab(
 
                                                 button(class="btn-ghost", on:click=move |_| {
                                                     let key_str = k_key_btn_cp.clone();
-                                                    copy_to_clipboard(&key_str);
-                                                    copied_key.set(key_str);
-                                                    gloo_timers::callback::Timeout::new(2000, move || {
-                                                        if copied_key.is_alive() { copied_key.set(String::new()); }
-                                                    }).forget();
+                                                    let copied_key = copied_key;
+                                                    spawn_local(async move {
+                                                        if copy_to_clipboard(&key_str).await {
+                                                            copied_key.set(key_str);
+                                                        }
+                                                        gloo_timers::callback::Timeout::new(2000, move || {
+                                                            if copied_key.is_alive() { copied_key.set(String::new()); }
+                                                        }).forget();
+                                                    });
                                                 }) { (if is_copied.get() { "Copied" } else { "Copy" }) }
 
                                                 button(class="btn-ghost", on:click=move |_| {

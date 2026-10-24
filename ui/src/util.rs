@@ -6,11 +6,23 @@ use sycamore::prelude::*;
 
 use crate::types::{ClientKeyDto, ModelItemDto};
 
-pub fn copy_to_clipboard(text: &str) {
-    if let Some(w) = web_sys::window() {
-        let clip = w.navigator().clipboard();
-        let _ = clip.write_text(text);
-    }
+/// Copy `text`, reporting whether it actually landed in the clipboard.
+///
+/// The old version fired `navigator.clipboard.write_text` and discarded the
+/// promise, so every call site printed "Copied!" even when the write was rejected —
+/// which is the normal outcome on a plain-HTTP LAN origin (the Clipboard API needs a
+/// secure context). The operator then dismissed the "API key created" banner and the
+/// key was gone.
+pub async fn copy_to_clipboard(text: &str) -> bool {
+    let Some(w) = web_sys::window() else {
+        return false;
+    };
+    // The Clipboard API needs a secure context: on a plain-HTTP LAN origin this
+    // promise rejects, and the caller must then say "copy failed" instead of
+    // claiming success (the key is still on screen to be selected by hand).
+    wasm_bindgen_futures::JsFuture::from(w.navigator().clipboard().write_text(text))
+        .await
+        .is_ok()
 }
 
 /// `HH:MM:SS` in the *browser's* local time. The old version did `ts % 86400`,
@@ -105,20 +117,46 @@ pub async fn post_json<B: serde::Serialize>(url: &str, body: &B) -> bool {
     }
 }
 
+/// POST and return the parsed body, or the server's error message.
+///
+/// The status *must* be checked: `ApiError` responses are JSON, so `resp.json()`
+/// parsed a 400/409/500 into the same type and the caller treated a rejected write
+/// as a success (the Settings save printed "saved" and then blanked the admin key the
+/// operator had just typed; a rejected combo save closed the editor).
+pub async fn post_json_result<B: serde::Serialize, R: for<'de> Deserialize<'de>>(
+    url: &str,
+    body: &B,
+) -> Result<R, String> {
+    let req = Request::post(url).json(body).map_err(|e| e.to_string())?;
+    if let Some(k) = stored_key() {
+        req.headers().set("Authorization", &format!("Bearer {k}"));
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if status == 401 {
+        NEED_AUTH.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Err("admin key required".to_string());
+    }
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !(200..300).contains(&status) {
+        // The body is our own JSON error envelope; fall back to the status when it
+        // is not (an empty 404, a proxy page).
+        let msg = error_message(&text);
+        return Err(if msg.trim().is_empty() {
+            format!("request failed (HTTP {status})")
+        } else {
+            msg
+        });
+    }
+    serde_json::from_str::<R>(&text).map_err(|e| format!("unexpected response: {e}"))
+}
+
+/// Backwards-compatible wrapper: `Some` only for a 2xx with a parsable body.
 pub async fn post_json_resp<B: serde::Serialize, R: for<'de> Deserialize<'de>>(
     url: &str,
     body: &B,
 ) -> Option<R> {
-    let req = Request::post(url).json(body).ok()?;
-    if let Some(k) = stored_key() {
-        req.headers().set("Authorization", &format!("Bearer {k}"));
-    }
-    let resp = req.send().await.ok()?;
-    if resp.status() == 401 {
-        NEED_AUTH.store(true, std::sync::atomic::Ordering::Relaxed);
-        return None;
-    }
-    resp.json::<R>().await.ok()
+    post_json_result(url, body).await.ok()
 }
 
 pub fn defer(f: impl FnOnce() + 'static) {

@@ -185,11 +185,15 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                                         div(class="model-row-actions") {
                                             button(class="btn-ghost", on:click=move |_| {
                                                 let id_str = id_copy.clone();
-                                                copy_to_clipboard(&id_str);
-                                                copied_id.set(id_str);
-                                                gloo_timers::callback::Timeout::new(2000, move || {
-                                                    if copied_id.is_alive() { copied_id.set(String::new()); }
-                                                }).forget();
+                                                let copied_id = copied_id;
+                                                spawn_local(async move {
+                                                    if copy_to_clipboard(&id_str).await {
+                                                        copied_id.set(id_str);
+                                                    }
+                                                    gloo_timers::callback::Timeout::new(2000, move || {
+                                                        if copied_id.is_alive() { copied_id.set(String::new()); }
+                                                    }).forget();
+                                                });
                                             }) { (if is_copied.get() { "Copied" } else { "Copy ID" }) }
                                             button(class="btn-ghost", on:click=move |_| {
                                                 let id = id_toggle.clone();
@@ -386,21 +390,27 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                                         };
                                         let body = serde_json::json!({"name": name, "chain": chain});
                                         spawn_local(async move {
-                                            if post_json_resp::<_, serde_json::Value>(path, &body).await.is_some() {
-                                                if let Some(list) = fetch_json::<Vec<ComboDto>>("/api/combos").await
-                                                    && combos.is_alive()
-                                                {
-                                                    combos.set(list);
+                                            // The error branch used to be unreachable:
+                                            // `post_json_resp` parsed the JSON error
+                                            // envelope and reported success, so a
+                                            // rejected combo closed the editor.
+                                            match post_json_result::<_, serde_json::Value>(path, &body).await {
+                                                Ok(_) => {
+                                                    if let Some(list) = fetch_json::<Vec<ComboDto>>("/api/combos").await
+                                                        && combos.is_alive()
+                                                    {
+                                                        combos.set(list);
+                                                    }
+                                                    if combo_editing.is_alive() {
+                                                        combo_editing.set(None);
+                                                    }
+                                                    reload_models(models).await;
                                                 }
-                                                if combo_editing.is_alive() {
-                                                    combo_editing.set(None);
+                                                Err(e) => {
+                                                    if combo_error.is_alive() {
+                                                        combo_error.set(format!("could not save: {e}"));
+                                                    }
                                                 }
-                                                reload_models(models).await;
-                                            } else if combo_error.is_alive() {
-                                                combo_error.set(
-                                                    "could not save: check the name is unique and every target is provider/model"
-                                                        .to_string(),
-                                                );
                                             }
                                         });
                                     }) { "Save combo" }
