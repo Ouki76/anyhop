@@ -16,9 +16,30 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use tracing::warn;
 
-pub const CLIENT_ID: &str =
-    "REDACTED-SET-VIA-ENV";
-pub const CLIENT_SECRET: &str = "REDACTED-SET-VIA-ENV";
+/// OAuth client credentials for the Antigravity (Google) flow.
+///
+/// These used to be hardcoded here, which put a live Google client **secret** in
+/// every clone (GitHub push protection refuses to publish a repository containing
+/// one, and rightly so) and in every backup. They now come from the environment —
+/// set both in the service unit:
+///
+/// ```text
+/// ANYHOP_ANTIGRAVITY_CLIENT_ID=…apps.googleusercontent.com
+/// ANYHOP_ANTIGRAVITY_CLIENT_SECRET=…
+/// ```
+///
+/// A missing pair fails loudly instead of silently using someone else's client.
+pub fn client_credentials() -> anyhow::Result<(String, String)> {
+    let id = std::env::var("ANYHOP_ANTIGRAVITY_CLIENT_ID").unwrap_or_default();
+    let secret = std::env::var("ANYHOP_ANTIGRAVITY_CLIENT_SECRET").unwrap_or_default();
+    if id.trim().is_empty() || secret.trim().is_empty() {
+        anyhow::bail!(
+            "antigravity OAuth needs ANYHOP_ANTIGRAVITY_CLIENT_ID and \
+             ANYHOP_ANTIGRAVITY_CLIENT_SECRET in the environment"
+        );
+    }
+    Ok((id.trim().to_string(), secret.trim().to_string()))
+}
 pub const CALLBACK_PORT: u16 = 51121;
 
 const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -209,12 +230,15 @@ impl Account {
                 "static access token rejected and no refresh token configured".into(),
             ));
         };
+        let (client_id, client_secret) = client_credentials().map_err(|e| {
+            AuthError::Permanent(format!("antigravity OAuth client is not configured: {e}"))
+        })?;
         let resp = self
             .client
             .post(TOKEN_ENDPOINT)
             .form(&[
-                ("client_id", CLIENT_ID),
-                ("client_secret", CLIENT_SECRET),
+                ("client_id", client_id.as_str()),
+                ("client_secret", client_secret.as_str()),
                 ("refresh_token", refresh_token.as_str()),
                 ("grant_type", "refresh_token"),
             ])
@@ -575,16 +599,29 @@ pub fn unwrap_response(v: Value) -> Value {
 ///
 /// Kept for callers that only need the URL to display; the PKCE challenge is part
 /// of the flow, so this now takes it explicitly.
-pub fn build_auth_url(state: &str, challenge: &str) -> String {
-    build_auth_url_with(state, &loopback_redirect_uri(), challenge)
+pub fn build_auth_url(state: &str, challenge: &str) -> anyhow::Result<String> {
+    let (client_id, _) = client_credentials()?;
+    Ok(build_auth_url_with(
+        state,
+        &loopback_redirect_uri(),
+        challenge,
+        &client_id,
+    ))
 }
 
-pub fn build_auth_url_with(state: &str, redirect_uri: &str, challenge: &str) -> String {
+/// The authorize URL for a known client. Takes the id explicitly so tests do not
+/// have to touch the process environment.
+pub fn build_auth_url_with(
+    state: &str,
+    redirect_uri: &str,
+    challenge: &str,
+    client_id: &str,
+) -> String {
     // PKCE (RFC 7636, S256). Without it, anyone who obtains a code for this public
     // client_id + redirect_uri could exchange it — the state token stops that only
     // for flows that are still pending.
     format!(
-        "{AUTH_ENDPOINT}?access_type=offline&client_id={CLIENT_ID}&prompt=consent&redirect_uri={}&response_type=code&scope={}&state={state}&code_challenge={challenge}&code_challenge_method=S256",
+        "{AUTH_ENDPOINT}?access_type=offline&client_id={client_id}&prompt=consent&redirect_uri={}&response_type=code&scope={}&state={state}&code_challenge={challenge}&code_challenge_method=S256",
         urlencoded(redirect_uri),
         urlencoded(&SCOPES.join(" ")),
     )
@@ -628,12 +665,13 @@ pub async fn exchange_code(
     redirect_uri: &str,
     verifier: &str,
 ) -> anyhow::Result<AuthTokens> {
+    let (client_id, client_secret) = client_credentials()?;
     let resp = http
         .post(TOKEN_ENDPOINT)
         .form(&[
             ("code", code),
-            ("client_id", CLIENT_ID),
-            ("client_secret", CLIENT_SECRET),
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
             ("redirect_uri", redirect_uri),
             // Proves this is the same client that started the flow (RFC 7636).
             ("code_verifier", verifier),
@@ -731,7 +769,8 @@ pub async fn start_auth_with(
     let challenge = pkce_challenge(&verifier);
     match redirect_uri {
         Some(uri) => {
-            let url = build_auth_url_with(&state, uri, &challenge);
+            let (client_id, _) = client_credentials()?;
+            let url = build_auth_url_with(&state, uri, &challenge, &client_id);
             Ok(PendingAuth {
                 url,
                 state,
@@ -743,7 +782,8 @@ pub async fn start_auth_with(
         }
         None => {
             let uri = loopback_redirect_uri();
-            let url = build_auth_url_with(&state, &uri, &challenge);
+            let (client_id, _) = client_credentials()?;
+            let url = build_auth_url_with(&state, &uri, &challenge, &client_id);
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT))
                 .await
                 .map_err(|e| {
@@ -1042,6 +1082,15 @@ mod oauth_state_tests {
         // The headless branch does not bind the loopback port, so two flows fit.
         let mut seen = std::collections::HashSet::new();
         let mut clock_hex = std::collections::HashSet::new();
+        // `start_auth_with` reads the OAuth client from the environment (a
+        // hardcoded secret made the repository unpublishable), so the test
+        // installs a dummy pair. `set_var` is unsafe in edition 2024 because it
+        // races with concurrent readers; this is a single-threaded test body.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("ANYHOP_ANTIGRAVITY_CLIENT_ID", "test.apps.googleusercontent.com");
+            std::env::set_var("ANYHOP_ANTIGRAVITY_CLIENT_SECRET", "test-secret");
+        }
         for _ in 0..8 {
             let flow = start_auth_with(
                 None,
@@ -1071,7 +1120,7 @@ mod oauth_state_tests {
         for clock in clock_hex {
             assert!(
                 !seen.contains(&clock),
-                "a state equal to the current clock in hex is predictable"
+                "a state equal to the current clock in hex is unpredictable"
             );
         }
     }
@@ -1139,7 +1188,12 @@ mod pkce_tests {
     fn the_authorize_url_carries_the_challenge_only() {
         let verifier = random_verifier().expect("csprng");
         let challenge = pkce_challenge(&verifier);
-        let url = build_auth_url_with("st4te", "http://127.0.0.1:1/cb", &challenge);
+        let url = build_auth_url_with(
+            "st4te",
+            "http://127.0.0.1:1/cb",
+            &challenge,
+            "test.apps.googleusercontent.com",
+        );
         assert!(url.contains(&format!("code_challenge={challenge}")));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(
