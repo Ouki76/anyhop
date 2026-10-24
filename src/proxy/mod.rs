@@ -68,6 +68,10 @@ pub struct AppState {
     /// Channel the authorization code is delivered through (loopback socket,
     /// public callback route or a pasted URL).
     pub auth_code_tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<(String, String)>>>,
+    /// Serialises OAuth flow setup: snapshot → channel → state → spawn must be one
+    /// critical section, or two concurrent `POST /api/auth/start` calls clobber
+    /// each other's code channel and neither flow can finish.
+    pub auth_start_lock: tokio::sync::Mutex<()>,
     /// Failed authentication attempts per client IP (window + count), so a
     /// credential-stuffing loop cannot hammer the key comparison for free.
     pub auth_fails: std::sync::Mutex<crate::middleware::AuthFailures>,

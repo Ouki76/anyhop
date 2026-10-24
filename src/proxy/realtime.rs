@@ -2927,6 +2927,7 @@ mod tests {
             auth_state: Mutex::new(None),
             auth_task: Mutex::new(None),
             auth_code_tx: Mutex::new(None),
+            auth_start_lock: tokio::sync::Mutex::new(()),
             auth_fails: Mutex::new(crate::middleware::AuthFailures::default()),
             catalog_epoch: AtomicU64::new(0),
             tls_enabled_flag: std::sync::atomic::AtomicBool::new(false),

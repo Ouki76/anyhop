@@ -201,6 +201,13 @@ pub async fn auth_start(
             existing.kind
         )));
     }
+    // Serialise the whole flow setup. Two panel tabs (or a double click) used to
+    // interleave here: both passed the "already waiting" snapshot, the second
+    // replaced `auth_code_tx`, the first's receiver then saw a closed channel and
+    // wrote status="error" over the second flow — and `deliver_code` refuses to
+    // deliver anything while the status is not "waiting", so *both* flows were
+    // unfinishable until the timeout.
+    let _flow_guard = state.auth_start_lock.lock().await;
     // Same provider already waiting: hand its URL back instead of re-binding the
     // port. A flow for a different provider is stale from the operator's point of
     // view — cancel it, otherwise "add antigravity" would open the abandoned codex

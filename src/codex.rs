@@ -887,15 +887,39 @@ pub async fn wait_for_callback(p: &PendingAuth) -> anyhow::Result<String> {
     let Some(listener) = p.listener.as_ref() else {
         anyhow::bail!("this flow is headless — supply the code with complete_with_code()");
     };
-    let (mut sock, _) = listener.accept().await?;
-    let mut buf = vec![0u8; 8192];
-    let n = sock.read(&mut buf).await?;
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let path = req
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("");
+    // Accept until a real callback arrives, and read a whole request head: one
+    // accept + one read died on a browser preconnect, a port scanner or a request
+    // line split across two reads (see the same fix in `antigravity`).
+    let (path, mut sock) = loop {
+        let (mut sock, _) = listener.accept().await?;
+        let mut buf = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = sock.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 16 * 1024 {
+                break;
+            }
+        }
+        let req = String::from_utf8_lossy(&buf);
+        let path = req
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("")
+            .to_string();
+        if path.contains("code=") || path.contains("error=") {
+            break (path, sock);
+        }
+        let _ = sock
+            .write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nnot the oauth callback\n",
+            )
+            .await;
+    };
     let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
     let mut code = None;
     let mut got_state = None;

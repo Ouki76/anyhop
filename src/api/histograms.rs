@@ -73,6 +73,8 @@ const INF_LABEL: &str = "+Inf";
 
 /// Route label for anything we do not recognise, and the overflow sink.
 const OTHER_ROUTE: &str = "other";
+/// Method label used when the cap is reached (and for unknown methods).
+const OTHER_METHOD: &str = "OTHER";
 
 /// Finite bucket boundaries in seconds — the Prometheus default bucket set.
 ///
@@ -224,6 +226,19 @@ static REGISTRY: LazyLock<RwLock<HashMap<Key, Arc<Buckets>>>> =
 /// are subsequently bumped on the `Arc` after the guard is dropped. A new series
 /// costs one write lock, once ever.
 pub fn record(route: &str, method: &str, status: u16, secs: f64) {
+    // A closed set: the raw method comes straight off the request line, so an
+    // arbitrary `-X AAAA…` must not become a label value (the cap alone would still
+    // let it allocate one series per distinct spelling until the cap trips).
+    let method = match method {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "PATCH" => "PATCH",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        _ => OTHER_METHOD,
+    };
     let key: Key = (route.to_owned(), method.to_owned(), status);
 
     // Poisoning-recoverable read, like the rest of the crate: a panicking
@@ -258,14 +273,21 @@ fn admit(mut key: Key) -> Arc<Buckets> {
     // Cardinality guard. The scan is O(n) but only runs for a brand-new series
     // (≤ MAX_SERIES times in the life of the process) and `n <= MAX_SERIES`, so
     // it never touches the per-request path.
-    if key.0 != OTHER_ROUTE {
-        let distinct = map.keys().filter(|k| k.0 != OTHER_ROUTE).count();
-        if distinct >= MAX_SERIES {
-            key.0 = OTHER_ROUTE.to_owned();
-            if let Some(buckets) = map.get(&key) {
-                return Arc::clone(buckets);
-            }
+    //
+    // The cap covers the `other` route too. It used to be skipped for exactly that
+    // label, and the key contains the (client-supplied) HTTP method, so
+    // `curl -X <random> http://gw/x` created a new series per request from
+    // unauthenticated traffic: unbounded memory and a /metrics body that grows with
+    // it. Method is normalised to a closed set in [`record`]; the status code is
+    // folded away as well once the cap is reached, so the overflow is *one* series.
+    if map.len() >= MAX_SERIES {
+        key.0 = OTHER_ROUTE.to_owned();
+        key.1 = OTHER_METHOD.to_owned();
+        key.2 = 0;
+        if let Some(buckets) = map.get(&key) {
+            return Arc::clone(buckets);
         }
+        // Fall through: creating this one overflow series past the cap is the point.
     }
 
     let buckets = Arc::new(Buckets::new());
@@ -653,18 +675,49 @@ mod tests {
             .filter(|l| !l.contains("route=\"other\""))
             .count();
         assert_eq!(distinct, MAX_SERIES, "cap is not enforced");
-        // ...and it must have absorbed all three overflow observations.
-        let other = format!("{METRIC_NAME}_count{{route=\"other\",method=\"GET\",status=\"200\"}}");
+        // ...and it must have absorbed all three overflow observations. The
+        // overflow series folds the method and the status too: the key contains both
+        // and the method is client-chosen, so keeping them would let an attacker
+        // allocate a series per request (`-X <random>`) even past the cap.
+        let other = format!("{METRIC_NAME}_count{{route=\"other\",method=\"OTHER\",status=\"0\"}}");
         assert_eq!(int_field(&body, &other), Some(3));
         // Nothing is silently lost: the buckets still sum to every observation.
         assert_eq!(
             int_field(
                 &body,
                 &format!(
-                    "{METRIC_NAME}_bucket{{route=\"other\",method=\"GET\",status=\"200\",le=\"+Inf\"}}"
+                    "{METRIC_NAME}_bucket{{route=\"other\",method=\"OTHER\",status=\"0\",le=\"+Inf\"}}"
                 )
             ),
             Some(3)
+        );
+    }
+
+    /// The `method` label is a closed set: the raw value comes off the request line,
+    /// so `-X <random>` must not become a new label (and a new series).
+    #[test]
+    fn an_unknown_method_is_folded_and_cannot_grow_the_map() {
+        let _guard = guard();
+        reset();
+        for i in 0..50 {
+            record("/v1/chat/completions", &format!("M{i}"), 200, 0.002);
+        }
+        let body = render();
+        assert!(
+            body.contains("method=\"OTHER\""),
+            "an unknown method must be folded into OTHER:\n{body}"
+        );
+        assert!(
+            !body.contains("method=\"M7\""),
+            "a raw method must never become a label"
+        );
+        let series = body
+            .lines()
+            .filter(|l| l.contains(&format!("{METRIC_NAME}_count{{")))
+            .count();
+        assert_eq!(
+            series, 1,
+            "50 spellings must produce one series, got {series}"
         );
     }
 

@@ -213,7 +213,14 @@ fn replay_thinking(msg: &Value, blocks: &mut Vec<Value>) {
     }
 }
 
-pub fn translate_request(body: &Value) -> Result<Value, String> {
+/// Translate an OpenAI chat body. `model` is the *upstream* id, which the caller
+/// resolved (it may differ from the client's spelling).
+///
+/// Taking it as an argument rather than reading `body["model"]` is what lets the
+/// caller stop cloning the whole DOM per attempt: the previous version did
+/// `p.clone(); p["model"] = …` for every retry, i.e. a full copy of a body that
+/// can be 32 MiB.
+pub fn translate_request(body: &Value, model: &str) -> Result<Value, String> {
     let messages = body
         .get("messages")
         .and_then(|m| m.as_array())
@@ -320,9 +327,9 @@ pub fn translate_request(body: &Value) -> Result<Value, String> {
         merged.push(m);
     }
 
-    let model_name = body.get("model").and_then(|m| m.as_str()).unwrap_or("");
+    let model_name = model;
     let mut req = json!({
-        "model": body.get("model").cloned().unwrap_or(json!("")),
+        "model": model,
         // Anthropic requires max_tokens; the default must fit the model's
         // output cap (32000 is rejected outright by claude-3.5/3.7/haiku-3).
         "max_tokens": body
@@ -990,11 +997,14 @@ mod translate_tests {
     /// `budget_tokens` is client-supplied: i64::MAX used to panic on `b + 1`.
     #[test]
     fn budget_tokens_of_i64_max_does_not_overflow() {
-        let out = translate_request(&json!({
-            "model": "claude-sonnet-4",
-            "messages": [{"role": "user", "content": "hi"}],
-            "thinking": {"budget_tokens": i64::MAX},
-        }))
+        let out = translate_request(
+            &json!({
+                "model": "claude-sonnet-4",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"budget_tokens": i64::MAX},
+            }),
+            "claude-sonnet-4",
+        )
         .expect("translation must not fail on a huge budget");
         assert!(out["max_tokens"].as_i64().is_some());
     }
@@ -1023,16 +1033,19 @@ mod translate_tests {
         assert_eq!(msg["thinking_blocks"][0]["signature"], "sig-abc");
 
         // Second turn: replay exactly what the client echoes back.
-        let req = translate_request(&json!({
-            "model": "claude-x",
-            "reasoning_effort": "high",
-            "messages": [
-                {"role": "user", "content": "weather in Moscow?"},
-                msg,
-                {"role": "tool", "tool_call_id": "toolu_1", "content": "sunny"},
-            ],
-            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
-        }))
+        let req = translate_request(
+            &json!({
+                "model": "claude-x",
+                "reasoning_effort": "high",
+                "messages": [
+                    {"role": "user", "content": "weather in Moscow?"},
+                    msg,
+                    {"role": "tool", "tool_call_id": "toolu_1", "content": "sunny"},
+                ],
+                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+            }),
+            "claude-x",
+        )
         .expect("the replayed turn translates");
 
         let blocks = req["messages"][1]["content"]
@@ -1052,15 +1065,18 @@ mod translate_tests {
     fn thinking_blocks_are_not_replayed_when_thinking_is_off() {
         // Anthropic rejects thinking blocks in a request that has thinking
         // disabled, so they must be dropped rather than forwarded.
-        let req = translate_request(&json!({
-            "model": "claude-x",
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "yo", "thinking_blocks": [
-                    {"type": "thinking", "thinking": "t", "signature": "sig"}
-                ]},
-            ],
-        }))
+        let req = translate_request(
+            &json!({
+                "model": "claude-x",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "yo", "thinking_blocks": [
+                        {"type": "thinking", "thinking": "t", "signature": "sig"}
+                    ]},
+                ],
+            }),
+            "claude-x",
+        )
         .expect("translates");
         let blocks = req["messages"][1]["content"]
             .as_array()
@@ -1222,19 +1238,25 @@ mod translate_tests {
 
     #[test]
     fn an_unsupported_content_part_is_a_local_error_naming_the_type() {
-        let err = translate_request(&json!({
-            "messages": [{"role": "user", "content": [
-                {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}},
-            ]}],
-        }))
+        let err = translate_request(
+            &json!({
+                "messages": [{"role": "user", "content": [
+                    {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}},
+                ]}],
+            }),
+            "claude-sonnet-4",
+        )
         .expect_err("audio is not translatable");
         assert!(err.contains("input_audio"), "{err}");
 
-        let err = translate_request(&json!({
-            "messages": [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
-            ]}],
-        }))
+        let err = translate_request(
+            &json!({
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+                ]}],
+            }),
+            "claude-sonnet-4",
+        )
         .expect_err("remote images are not supported");
         assert!(err.contains("image_url"), "{err}");
     }

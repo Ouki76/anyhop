@@ -372,11 +372,38 @@ impl Storage {
     /// Used for the records a reload reads back (health/stats): going through the
     /// batch means the read is exact, ordered, and flushable synchronously.
     fn enqueue(&self, m: StorageMsg) {
+        // If the writer task died (a panic or a fatal IO error), the receiver is
+        // gone: every later write would be accepted silently and nothing would ever
+        // reach the file, while reads keep serving stale table contents. Say so
+        // once instead of pretending the write landed.
+        if self.tx.is_closed() {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    "storage: the writer task is gone; state changes are no longer persisted"
+                );
+            }
+            return;
+        }
         let key = m.key();
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key, m);
+    }
+
+    /// Send a message to the writer, reporting a dead writer once.
+    fn send(&self, m: StorageMsg) {
+        if self.tx.send(m).is_err() {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    "storage: the writer task is gone; state changes are no longer persisted"
+                );
+            }
+        }
     }
 
     pub fn save_health(&self, provider: &str, secret: &str, rec: HealthRecord) {
@@ -400,7 +427,7 @@ impl Storage {
     }
 
     pub fn save_oauth(&self, provider: &str, secret: &str, rec: OAuthRecord) {
-        let _ = self.tx.send(StorageMsg::OAuth {
+        self.send(StorageMsg::OAuth {
             key: key_id(provider, secret),
             rec,
         });
@@ -490,10 +517,13 @@ impl Storage {
 
     /// Forget a runtime-added key (e.g. revoked in the dashboard).
     pub fn delete_extra_key(&self, provider: &str, secret: &str) {
-        let mut list = self.list_extra_keys(provider);
+        let mut extras = self.extras_now.lock().unwrap_or_else(|e| e.into_inner());
+        let list = extras.entry(provider.to_string()).or_default();
         if let Some(i) = list.iter().position(|s| s == secret) {
             list.remove(i);
-            self.set_extra_keys(provider, list);
+            let snapshot = list.clone();
+            drop(extras);
+            self.set_extra_keys(provider, snapshot);
         }
     }
 
@@ -503,7 +533,7 @@ impl Storage {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(provider.to_string(), secrets.clone());
-        let _ = self.tx.send(StorageMsg::ExtraKeys {
+        self.send(StorageMsg::ExtraKeys {
             provider: provider.to_string(),
             secrets,
         });
@@ -528,7 +558,7 @@ impl Storage {
     /// Persist a feed buffer (events / requests).
     pub fn save_feed<T: Serialize>(&self, name: &str, value: &T) {
         if let Ok(data) = serde_json::to_vec(value) {
-            let _ = self.tx.send(StorageMsg::Feed {
+            self.send(StorageMsg::Feed {
                 key: format!("feed:{name}"),
                 data,
             });
@@ -739,9 +769,11 @@ fn dispatch(
         // gone, and the config's stale token may already be revoked.
         StorageMsg::ExtraKeys { .. } => flush_extras(db, &m),
         StorageMsg::OAuth { .. } => {
-            let mut one = HashMap::new();
-            one.insert(m.key(), m);
-            flush(db, &mut one, response_max, recent);
+            // Through the shared batch: `flush` re-queues a failed commit into the
+            // map it was given, and a local map is dropped right afterwards — the
+            // rotated refresh token was lost while the log claimed it was retried.
+            pending.insert(m.key(), m);
+            flush(db, pending, response_max, recent);
         }
         StorageMsg::DeleteResponse { id } => {
             // Drop a queued write for the same id first, otherwise the next
@@ -750,6 +782,21 @@ fn dispatch(
             delete_response_now(db, &id);
         }
         other => {
+            // `MAX_PENDING_REQUEUE` used to guard only the requeue path, so when
+            // `begin_write` itself kept failing (a full or read-only disk) the map
+            // grew by one record per request forever — up to 256 KiB each for a
+            // stored `/v1/responses` reply. Bound it here as well: drop the record
+            // (a response that cannot be written is already lost) and say so.
+            if pending.len() >= MAX_PENDING_REQUEUE {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "storage: {MAX_PENDING_REQUEUE} writes are already queued for a                          state file that is not accepting them; dropping new records"
+                    );
+                }
+                return;
+            }
             pending.insert(other.key(), other);
         }
     }

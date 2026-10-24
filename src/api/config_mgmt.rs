@@ -59,7 +59,10 @@ pub async fn put_config(
 /// The success body is the plain-text `reloaded N providers`, so the signature
 /// stays `-> Response`; a failed reload is still an [`ApiError`].
 pub async fn reload(State(state): State<Arc<AppState>>) -> Response {
-    match crate::reload_config(&state) {
+    // Behind `config_lock`, like every other writer: otherwise a reload that reads
+    // the file mid read-modify-write installs the previous document and silently
+    // reverts the writer's edit in memory.
+    match crate::reload_config_locked(&state).await {
         Ok(n) => (StatusCode::OK, format!("reloaded {n} providers")).into_response(),
         Err(e) => ApiError::bad_request(format!("reload failed: {e}")).into_response(),
     }

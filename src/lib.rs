@@ -226,6 +226,7 @@ async fn async_main() -> anyhow::Result<()> {
         auth_state: std::sync::Mutex::new(None),
         auth_task: std::sync::Mutex::new(None),
         auth_code_tx: std::sync::Mutex::new(None),
+        auth_start_lock: tokio::sync::Mutex::new(()),
         auth_fails: std::sync::Mutex::new(crate::middleware::AuthFailures::default()),
         tls_enabled_flag: std::sync::atomic::AtomicBool::new(cfg.server.tls_cert.is_some()),
         catalog_epoch: std::sync::atomic::AtomicU64::new(1),
@@ -368,6 +369,18 @@ pub fn reload_config(state: &Arc<proxy::AppState>) -> anyhow::Result<usize> {
     let cfg = config::Config::load(&state.config_path)?;
     let prepared = prepare_config(state, cfg)?;
     Ok(install_config(state, prepared))
+}
+
+/// [`reload_config`] behind the config lock, for callers that run off the async
+/// runtime's hot path (SIGHUP, `POST /api/reload`).
+///
+/// Without the lock, a reload that read the file while a dashboard writer was in
+/// the middle of its read-modify-write installed the *older* document: the edit
+/// stayed on disk but was reverted in memory (a new client key answered 401, a
+/// disabled model came back, a deleted provider reappeared) until the next reload.
+pub async fn reload_config_locked(state: &Arc<proxy::AppState>) -> anyhow::Result<usize> {
+    let _guard = state.config_lock.lock().await;
+    reload_config(state)
 }
 
 /// Validate-and-write a config document: build first, write second, swap last.
@@ -737,7 +750,24 @@ where
     F: std::future::Future<Output = ()>,
 {
     let mut handle = tokio::spawn(async move { server.await });
-    signal.await;
+    // Wake on *either* a signal or the server giving up. Waiting only on the signal
+    // meant a fatal accept error (EMFILE, a closed listener) left the process
+    // running with nothing accepting and no error until someone sent a signal —
+    // a gateway that looks healthy and serves nothing.
+    tokio::select! {
+        _ = signal => {}
+        early = &mut handle => {
+            let e = match early {
+                Ok(Ok(())) => "axum::serve returned without an error".to_string(),
+                Ok(Err(e)) => format!("{e}"),
+                Err(join) => format!("server task panicked: {join}"),
+            };
+            // Tell the writer to stop too, then report: exiting is the honest
+            // answer (a supervisor restarts us), silence is not.
+            let _ = stop.send(true);
+            return Err(anyhow::anyhow!("server stopped accepting: {e}"));
+        }
+    }
     let _ = stop.send(true);
     match tokio::time::timeout(grace, &mut handle).await {
         Ok(Ok(Ok(()))) => Ok(()),
@@ -802,7 +832,7 @@ fn spawn_background_tasks(state: Arc<proxy::AppState>, cfg: &config::Config) {
                 };
             loop {
                 sig.recv().await;
-                match reload_config(&st) {
+                match reload_config_locked(&st).await {
                     Ok(n) => info!("SIGHUP: config reloaded ({n} providers)"),
                     Err(e) => tracing::warn!("SIGHUP: reload failed, keeping current config: {e}"),
                 }
@@ -953,6 +983,7 @@ mod tests {
             auth_state: std::sync::Mutex::new(None),
             auth_task: std::sync::Mutex::new(None),
             auth_code_tx: std::sync::Mutex::new(None),
+            auth_start_lock: tokio::sync::Mutex::new(()),
             auth_fails: std::sync::Mutex::new(crate::middleware::AuthFailures::default()),
             catalog_epoch: std::sync::atomic::AtomicU64::new(1),
             tls_enabled_flag: AtomicBool::new(false),

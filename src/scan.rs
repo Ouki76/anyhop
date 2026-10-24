@@ -53,7 +53,17 @@ pub fn peek_request(body: &[u8]) -> Option<(String, bool)> {
             if stream_seen > 1 {
                 return Some(true);
             }
-            stream = bool_value(body, content_end);
+            match bool_value(body, content_end) {
+                // `"stream": 1` (a Python-ish truthy value) is not the JSON the
+                // spec allows: the fast path used to read it as `false`, forward the
+                // body verbatim, and then mishandle a streamed reply. Bail out so the
+                // DOM path can reject it.
+                None => {
+                    bail = true;
+                    return Some(true);
+                }
+                value => stream = value,
+            }
         }
         // Stop as soon as both fields are known — the tail of a large body is
         // usually the message history, which we do not need.
@@ -130,7 +140,14 @@ where
                 let Some((content, next)) = scan_string(body, i) else {
                     return;
                 };
-                if depth == 1 && f(&body[content], next) == Some(true) {
+                // Only a *key* may be reported: a string at depth 1 is a key only
+                // when the next structural byte is ':'. Without this check every
+                // depth-1 *value* was treated as a key, so a body carrying the
+                // literal "model" as a value (e.g. `"content":"model"` at top level)
+                // looked like a duplicate key and lost the byte fast path — and on
+                // malformed input (`{"a":"model":"evil"}`) the value was spliced as
+                // the model.
+                if depth == 1 && is_key_at(body, next) && f(&body[content], next) == Some(true) {
                     return;
                 }
                 i = next;
@@ -150,6 +167,12 @@ where
             _ => i = next_structural(body, i),
         }
     }
+}
+
+/// Is the string that ends at `after` followed by `:` (i.e. is it an object key)?
+#[inline]
+fn is_key_at(body: &[u8], after: usize) -> bool {
+    body.get(skip_ws(body, after)) == Some(&b':')
 }
 
 /// Index of the next `"`, `{`, `}`, `[` or `]` at or after `i` (or `body.len()`).
@@ -252,6 +275,27 @@ fn scan_string(body: &[u8], start: usize) -> Option<(Range<usize>, usize)> {
 
 #[cfg(test)]
 mod tests {
+    /// A depth-1 string *value* is not a key, even when it spells "model".
+    ///
+    /// The walk reported every depth-1 string to its callback, so a body carrying
+    /// the literal `"model"` as a value looked like a duplicate key: the fast path
+    /// was abandoned (full DOM parse per request) and, on malformed input, a value
+    /// could be spliced as the model.
+    #[test]
+    fn a_value_that_spells_a_field_name_is_not_a_key() {
+        let body = br#"{"note":"model","model":"gpt-x","stream":false}"#;
+        assert_eq!(
+            peek_request(body),
+            Some(("gpt-x".to_string(), false)),
+            "the value 'model' must not count as the model key"
+        );
+        let span = string_field_span(body, b"model").expect("the real key has a unique span");
+        assert_eq!(&body[span], b"gpt-x");
+        // Same for a value that spells "stream".
+        let body = br#"{"note":"stream","model":"m","stream":true}"#;
+        assert_eq!(peek_request(body), Some(("m".to_string(), true)));
+    }
+
     use super::*;
 
     #[test]

@@ -55,8 +55,13 @@ if raw then
     last = tonumber(string.sub(raw, sep + 1)) or now
   end
 end
+-- A caller clock that jumped backwards must not hand out extra credit, and one
+-- that jumped forwards must not mint a full bucket out of thin air: clamp the
+-- observation to [last, last + one full refill]. (The comment below used to claim
+-- skew could not do this; a forward jump used to refill to `cap` instantly.)
 local elapsed = (now - last) / 1000
 if elapsed < 0 then elapsed = 0 end
+if cap > 0 and elapsed * rate > cap then elapsed = cap / rate end
 tokens = tokens + elapsed * rate
 if tokens > cap then tokens = cap end
 local allowed = 0
@@ -193,9 +198,10 @@ impl RedisLimiter {
     /// Consume one request, or report how long the caller should wait.
     ///
     /// Time comes from this host's clock rather than `redis.call('TIME')`: the
-    /// script stays valid on every Redis version and the call needs no extra
-    /// round trip. Hosts are expected to be NTP-synced; skew only shifts a
-    /// bucket by the skew, it cannot mint tokens faster than `rpm`.
+    /// script stays valid on every Redis version and the call needs no extra round
+    /// trip. Hosts are expected to be NTP-synced; a skewed clock can shift a bucket
+    /// by the skew, and the script clamps a single observation to at most one full
+    /// refill so a forward jump cannot mint more than `burst` tokens at once.
     pub async fn try_acquire(&self) -> Result<(), u64> {
         let now = now_ms();
         let cap = format!("{:.6}", self.capacity);

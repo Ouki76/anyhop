@@ -272,10 +272,14 @@ impl Provider {
                     return Err("no account for key".into());
                 };
                 let token = acc.ensure_access_token().await.map_err(|e| e.to_string())?;
-                let list =
-                    antigravity::fetch_available_models(acc.client(), &self.base_url, &token)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                let list = antigravity::fetch_available_models(
+                    acc.client(),
+                    &self.base_url,
+                    &token,
+                    self.tuning.meta_timeout(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
                 Ok(list.into_iter().map(|m| m.id).collect())
             }
             ProviderKind::OpenaiCompat => {
@@ -499,8 +503,13 @@ impl Provider {
             let Ok(token) = acc.ensure_access_token().await else {
                 continue;
             };
-            if let Ok(models) =
-                antigravity::fetch_available_models(acc.client(), &self.base_url, &token).await
+            if let Ok(models) = antigravity::fetch_available_models(
+                acc.client(),
+                &self.base_url,
+                &token,
+                self.tuning.meta_timeout(),
+            )
+            .await
             {
                 out.push((acc.label(), models));
             }

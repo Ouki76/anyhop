@@ -246,18 +246,35 @@ impl Account {
         let (client_id, client_secret) = client_credentials().map_err(|e| {
             AuthError::Permanent(format!("antigravity OAuth client is not configured: {e}"))
         })?;
-        let resp = self
-            .client
-            .post(TOKEN_ENDPOINT)
-            .form(&[
-                ("client_id", client_id.as_str()),
-                ("client_secret", client_secret.as_str()),
-                ("refresh_token", refresh_token.as_str()),
-                ("grant_type", "refresh_token"),
-            ])
-            .send()
-            .await
-            .map_err(|e| AuthError::Transient(format!("token refresh request failed: {e}")))?;
+        // Deadline on the refresh too: this call holds `state.lock().await`, so a
+        // silent endpoint would block every other request that needs a token for
+        // this account (and the whole `/v1/models` path behind it).
+        let refresh = async {
+            self.client
+                .post(TOKEN_ENDPOINT)
+                .form(&[
+                    ("client_id", client_id.as_str()),
+                    ("client_secret", client_secret.as_str()),
+                    ("refresh_token", refresh_token.as_str()),
+                    ("grant_type", "refresh_token"),
+                ])
+                .send()
+                .await
+        };
+        let resp = match tokio::time::timeout(self.tuning.oauth_http_timeout(), refresh).await {
+            Err(_) => {
+                return Err(AuthError::Transient(format!(
+                    "token refresh timed out after {:?}",
+                    self.tuning.oauth_http_timeout()
+                )));
+            }
+            Ok(Err(e)) => {
+                return Err(AuthError::Transient(format!(
+                    "token refresh request failed: {e}"
+                )));
+            }
+            Ok(Ok(resp)) => resp,
+        };
 
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -377,15 +394,35 @@ pub async fn fetch_available_models(
     http: &reqwest::Client,
     base_url: &str,
     access_token: &str,
+    timeout: std::time::Duration,
 ) -> Result<Vec<ModelQuota>, AuthError> {
-    let resp = http
-        .post(format!("{base_url}/{API_VERSION}:fetchAvailableModels"))
-        .bearer_auth(access_token)
-        .header("User-Agent", USER_AGENT)
-        .json(&json!({}))
-        .send()
-        .await
-        .map_err(|e| AuthError::Transient(format!("fetchAvailableModels failed: {e}")))?;
+    // Explicit deadline, like every other provider's model fetch. The client only
+    // carries a *connect* timeout, so an upstream that accepted the TCP connection
+    // and went silent held `/v1/models` forever — and because the cache is only
+    // written on success, every concurrent request started its own fetch (no
+    // single-flight), i.e. an unbounded number of stuck requests.
+    let resp = match tokio::time::timeout(timeout, async {
+        http.post(format!("{base_url}/{API_VERSION}:fetchAvailableModels"))
+            .bearer_auth(access_token)
+            .header("User-Agent", USER_AGENT)
+            .json(&json!({}))
+            .send()
+            .await
+    })
+    .await
+    {
+        Err(_) => {
+            return Err(AuthError::Transient(format!(
+                "fetchAvailableModels timed out after {timeout:?}"
+            )));
+        }
+        Ok(Err(e)) => {
+            return Err(AuthError::Transient(format!(
+                "fetchAvailableModels failed: {e}"
+            )));
+        }
+        Ok(Ok(resp)) => resp,
+    };
 
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
@@ -849,15 +886,42 @@ pub async fn wait_for_callback(p: &PendingAuth) -> anyhow::Result<String> {
     let Some(listener) = p.listener.as_ref() else {
         anyhow::bail!("this flow is headless — supply the code with complete_with_code()");
     };
-    let (mut sock, _) = listener.accept().await?;
-    let mut buf = vec![0u8; 8192];
-    let n = sock.read(&mut buf).await?;
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let path = req
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("");
+    // Accept until a request that actually carries a callback arrives. A single
+    // `accept` + single `read` killed the whole flow whenever something else
+    // connected first (a browser preconnect, a port scanner on 127.0.0.1, a HEAD
+    // /favicon.ico) or when the request line was split across two reads.
+    let (path, mut sock) = loop {
+        let (mut sock, _) = listener.accept().await?;
+        let mut buf = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        // Read until the request head is complete (or the peer stops talking).
+        loop {
+            let n = sock.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 16 * 1024 {
+                break;
+            }
+        }
+        let req = String::from_utf8_lossy(&buf);
+        let path = req
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("")
+            .to_string();
+        if path.contains("code=") || path.contains("error=") {
+            break (path, sock);
+        }
+        // Not the callback: answer politely and keep waiting for the real one.
+        let _ = sock
+            .write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nnot the oauth callback\n",
+            )
+            .await;
+    };
     let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
     let mut code = None;
     let mut got_state = None;

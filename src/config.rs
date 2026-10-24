@@ -391,6 +391,24 @@ impl Config {
                 p.name
             );
         }
+        // A cert without a key (or vice versa) used to validate and then fall
+        // through to *plaintext* HTTP while `tls_enabled` stayed true: bearer keys
+        // and OAuth callbacks travelled in clear text, HSTS was advertised, and the
+        // dashboard reported TLS on. Refuse the half-configuration.
+        anyhow::ensure!(
+            self.server.tls_cert.is_some() == self.server.tls_key.is_some(),
+            "server.tls_cert and server.tls_key must be set together (now: cert {}, key {})",
+            if self.server.tls_cert.is_some() {
+                "set"
+            } else {
+                "unset"
+            },
+            if self.server.tls_key.is_some() {
+                "set"
+            } else {
+                "unset"
+            }
+        );
         anyhow::ensure!(
             !self.server.listen.trim().is_empty(),
             "server.listen is empty"
@@ -455,6 +473,24 @@ impl Config {
 
         let mut names = std::collections::HashSet::new();
         for p in &self.providers {
+            // The per-provider override wins over `server.max_retries`, which is
+            // range-checked (1..=32) — an unbounded value here turned one client
+            // request into a near-endless upstream loop that held a client-key slot
+            // and a provider key.
+            if let Some(n) = p.max_retries {
+                anyhow::ensure!(
+                    (1..=32).contains(&n),
+                    "provider '{}': max_retries must be between 1 and 32 (got {n})",
+                    p.name
+                );
+            }
+            if let Some(t) = p.timeout_secs {
+                anyhow::ensure!(
+                    (1..=3600).contains(&t),
+                    "provider '{}': timeout_secs must be between 1 and 3600 (got {t})",
+                    p.name
+                );
+            }
             // All name-based lookups use find() — a duplicate name would make
             // the second provider unreachable through the API.
             anyhow::ensure!(!p.name.trim().is_empty(), "provider with an empty name");
@@ -561,6 +597,7 @@ impl Config {
         );
 
         let mut key_values = std::collections::HashSet::new();
+        let mut key_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (i, k) in self.client_keys.iter().enumerate() {
             // An empty key would be matched by an empty bearer token.
             anyhow::ensure!(!k.key.is_empty(), "client_keys[{i}] has an empty key");
@@ -568,6 +605,15 @@ impl Config {
                 key_values.insert(k.key.as_str()),
                 "client_keys[{i}] duplicates another key's value"
             );
+            // The name is a Prometheus label value and the Requests-tab identity:
+            // two keys sharing one name emit duplicate series, which makes
+            // Prometheus reject the *whole* scrape.
+            if let Some(name) = k.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                anyhow::ensure!(
+                    key_names.insert(name.to_string()),
+                    "client_keys[{i}] duplicates the name '{name}'"
+                );
+            }
             // A zero rpm is "unlimited"; a burst below the sustained rate would
             // make the limit meaningless, so reject the contradictory combination
             // instead of silently ignoring it at runtime.
@@ -901,6 +947,72 @@ mod tests {
             .validate()
             .expect_err("this config must be rejected")
             .to_string()
+    }
+
+    /// TLS is a pair: a cert without a key used to validate and then serve
+    /// *plaintext* while `tls_enabled` stayed true (bearer keys in clear text,
+    /// HSTS advertised, the dashboard reporting TLS on).
+    #[test]
+    fn a_half_configured_tls_pair_is_rejected() {
+        let cert_only = VALID.replace("[server]", "[server]\ntls_cert = \"/etc/anyhop/tls.crt\"");
+        let msg = error_of(&cert_only);
+        assert!(msg.contains("set together"), "{msg}");
+        let key_only = VALID.replace("[server]", "[server]\ntls_key = \"/etc/anyhop/tls.key\"");
+        let msg = error_of(&key_only);
+        assert!(msg.contains("set together"), "{msg}");
+        // Both together are accepted (the file itself is only opened at startup).
+        let both = VALID.replace(
+            "[server]",
+            "[server]\ntls_cert = \"/etc/anyhop/tls.crt\"\ntls_key = \"/etc/anyhop/tls.key\"",
+        );
+        parse(&both).validate().expect("a complete pair is valid");
+    }
+
+    /// The per-provider override wins over `server.max_retries`, which is bounded —
+    /// so an unbounded override turned one request into a near-endless retry loop.
+    #[test]
+    fn per_provider_retry_and_timeout_bounds_are_enforced() {
+        for (field, value) in [
+            ("max_retries = 0", "max_retries"),
+            ("max_retries = 1000", "max_retries"),
+            ("timeout_secs = 0", "timeout_secs"),
+            ("timeout_secs = 999999", "timeout_secs"),
+        ] {
+            let cfg = VALID.replace("keys = [\"sk-1\"]", &format!("keys = [\"sk-1\"]\n{field}"));
+            let msg = error_of(&cfg);
+            assert!(msg.contains(value), "{field}: {msg}");
+        }
+        let ok = VALID.replace(
+            "keys = [\"sk-1\"]",
+            "keys = [\"sk-1\"]\nmax_retries = 2\ntimeout_secs = 60",
+        );
+        parse(&ok).validate().expect("in-range overrides are valid");
+    }
+
+    /// Two client keys with the same name emit duplicate Prometheus series, and a
+    /// duplicate sample makes Prometheus reject the whole scrape.
+    #[test]
+    fn duplicate_client_key_names_are_rejected() {
+        let cfg = format!(
+            r#"{VALID}
+            api_key = "master-key-1"
+
+            [[client_keys]]
+            key = "ck-1"
+            name = "team"
+
+            [[client_keys]]
+            key = "ck-2"
+            name = "team"
+            "#
+        );
+        // `api_key` belongs to [server]; splice it there.
+        let cfg = cfg.replace(
+            "listen = \"127.0.0.1:8080\"",
+            "listen = \"127.0.0.1:8080\"\napi_key = \"master-key-1\"",
+        );
+        let msg = error_of(&cfg);
+        assert!(msg.contains("duplicates the name"), "{msg}");
     }
 
     // ----- A: validate() mirrors Provider::from_config -----

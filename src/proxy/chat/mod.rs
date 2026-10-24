@@ -83,7 +83,17 @@ pub async fn chat_completions(
                         "invalid_request_error",
                     );
                 };
-                let s = v.get("stream").and_then(|v| v.as_bool()).unwrap_or(s);
+                let s = match v.get("stream") {
+                    None | Some(Value::Null) => s,
+                    Some(Value::Bool(b)) => *b,
+                    Some(_) => {
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "'stream' must be a boolean",
+                            "invalid_request_error",
+                        );
+                    }
+                };
                 (m, s, None, Some(v))
             }
         },
@@ -106,7 +116,17 @@ pub async fn chat_completions(
                     "invalid_request_error",
                 );
             };
-            let s = v.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+            let s = match v.get("stream") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "'stream' must be a boolean",
+                        "invalid_request_error",
+                    );
+                }
+            };
             (m, s, None, Some(v))
         }
     };
@@ -384,11 +404,10 @@ async fn run_target(
         (ProviderKind::Gemini | ProviderKind::Antigravity, Some(p)) => {
             Some(gemini::translate_request(p))
         }
-        (ProviderKind::Anthropic, Some(p)) => {
-            let mut p = p.clone();
-            p["model"] = Value::String(model.to_string());
-            Some(anthropic::translate_request(&p))
-        }
+        // No DOM clone: `translate_request` takes the resolved upstream model as an
+        // argument. The old `p.clone(); p["model"] = …` copied the whole body (up to
+        // 32 MiB) once per attempt.
+        (ProviderKind::Anthropic, Some(p)) => Some(anthropic::translate_request(p, model)),
         (ProviderKind::Codex, Some(p)) => Some(codex::translate_request(model, p)),
     };
     let translated = match translated {

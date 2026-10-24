@@ -78,6 +78,15 @@ impl RedisError {
     pub fn keeps_connection(&self) -> bool {
         matches!(self, Self::Server(_))
     }
+
+    /// A failure that says "the peer/socket is gone", not "the server refused us".
+    ///
+    /// Used to decide whether replaying an idempotent command on a fresh
+    /// connection is worthwhile: a reused socket whose peer restarted fails here,
+    /// while `-WRONGPASS`/`-MOVED`/timeouts (a genuinely overloaded server) do not.
+    pub fn is_transport(&self) -> bool {
+        matches!(self, Self::Io(_) | Self::Protocol(_))
+    }
 }
 
 impl fmt::Display for RedisError {
@@ -676,8 +685,14 @@ impl RedisPool {
     }
 
     /// Pool identity (host/port/db/credentials digest) for sharing decisions.
+    /// Everything that changes how the pool behaves — the URL *and* the timeout.
+    ///
+    /// The timeout used to be missing, so `rebind` treated a limiter built with a
+    /// new `[ratelimit] timeout_ms` as identical, kept the old pool, and silently
+    /// ignored the setting until a restart (while a second, unused pool with the
+    /// new timeout was left behind).
     pub fn identity(&self) -> String {
-        self.url.identity()
+        format!("{}@{}ms", self.url.identity(), self.timeout.as_millis())
     }
 
     pub fn redacted(&self) -> String {
@@ -704,6 +719,7 @@ impl RedisPool {
         // Holding the idle lock across `connect` would serialize every new
         // connection (and worse, across an await); pop and release instead.
         let pooled = self.idle.lock().await.pop();
+        let reuse = pooled.is_some();
         let mut conn = match pooled {
             Some(c) => c,
             None => Conn::connect(&self.url, self.timeout).await?,
@@ -717,6 +733,28 @@ impl RedisPool {
             Err(e) if e.keeps_connection() => {
                 self.release(conn).await;
                 Err(e)
+            }
+            // A *reused* socket that fails at the IO level is almost always a peer
+            // that restarted or failed over while the socket sat idle: it is not
+            // evidence that Redis is unavailable. Reconnect once and replay the
+            // command (every command sent through this pool is idempotent). Without
+            // this, the first requests after a Redis restart got a spurious 429
+            // (`fail_open = false`) even though the server was healthy again.
+            Err(e) if reuse && e.is_transport() => {
+                drop(conn);
+                let mut fresh = Conn::connect(&self.url, self.timeout).await?;
+                let retry = fresh.call(self.timeout, args).await;
+                match retry {
+                    Ok(reply) => {
+                        self.release(fresh).await;
+                        Ok(reply)
+                    }
+                    Err(e) if e.keeps_connection() => {
+                        self.release(fresh).await;
+                        Err(e)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             // Unknown socket state: drop the connection (closing the socket).
             Err(e) => Err(e),
@@ -1478,21 +1516,34 @@ mod tests {
         assert_eq!(p.get("k").await.expect("get deleted"), None);
     }
 
+    /// A reused socket whose peer went away is repaired transparently: the command
+    /// is replayed once on a fresh connection.
+    ///
+    /// This used to surface as an error to the caller. With `fail_open = false`
+    /// that meant the first requests after a Redis restart were answered `429`
+    /// although Redis was healthy again; with `fail_open = true` it silently
+    /// over-granted.
     #[tokio::test]
-    async fn pool_reconnects_after_the_server_drops_the_connection() {
+    async fn pool_replays_a_command_on_a_dead_reused_socket() {
         let fake = FakeRedis::start().await;
         let p = pool(&fake, 500);
         p.ping().await.expect("warm up");
         fake.drop_after(1);
-        let err = p.ping().await.expect_err("the socket died mid-command");
+        // The command still succeeds (one transparent reconnect + replay)…
+        p.ping().await.expect("replayed on a fresh connection");
         assert!(
-            matches!(err, RedisError::Io(_) | RedisError::Timeout(_)),
-            "unexpected error {err:?}"
+            fake.connections() >= 2,
+            "the dead socket must be replaced ({} connections)",
+            fake.connections()
         );
-        assert!(!err.keeps_connection(), "a dead socket must be dropped");
-        // The next command transparently opens a fresh connection.
-        p.ping().await.expect("reconnected");
-        assert_eq!(fake.connections(), 2);
+        // …and the classification the retry depends on: a transport failure is
+        // retryable and drops the socket, a server reply is neither.
+        assert!(!RedisError::Io("reset".into()).keeps_connection());
+        assert!(RedisError::Io("reset".into()).is_transport());
+        assert!(!RedisError::Protocol("junk".into()).keeps_connection());
+        assert!(RedisError::Server("ERR bad".into()).keeps_connection());
+        assert!(!RedisError::Server("ERR bad".into()).is_transport());
+        assert!(!RedisError::Timeout("slow".into()).is_transport());
     }
 
     #[tokio::test]

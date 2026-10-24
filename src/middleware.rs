@@ -141,18 +141,24 @@ pub async fn require_api_key(
     // An upgrade is served by a task that outlives the response, so the
     // concurrency slot must follow the request rather than the response.
     // Split on commas: `Upgrade` is a list-valued header, and the realtime
-    // handler accepts `websocket` anywhere in it. Matching the whole value here
-    // meant `Upgrade: websocket, foo` got a 101 while this layer classified it as
-    // a normal response — the guard then died with the (empty) response head and
-    // `max_concurrent` did not bound the session.
-    let upgrade = if req
+    // handler accepts `websocket` anywhere in it.
+    //
+    // …but the slot handoff (guard travels with the *request*, the session task
+    // takes it) only applies to the one route that really upgrades. Keying it on
+    // the header alone was a cap bypass: `Upgrade: websocket` on a normal
+    // POST /v1/chat/completions parked the guard in the request extensions, that
+    // handler never takes it, and the guard died with the request parts *before*
+    // the handler body ran — so `max_concurrent` bounded nothing while the SSE
+    // stream kept holding a provider slot.
+    let wants_upgrade = req
         .headers()
         .get(header::UPGRADE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| {
             v.split(',')
                 .any(|t| t.trim().eq_ignore_ascii_case("websocket"))
-        }) {
+        });
+    let upgrade = if wants_upgrade && req.uri().path() == "/v1/realtime" {
         Upgrade::WebSocket
     } else {
         Upgrade::Normal
@@ -388,14 +394,34 @@ pub struct AuthFailures {
     seen: std::collections::HashMap<String, (u32, std::time::Instant)>,
 }
 
+/// Hard cap on the distinct source addresses the failed-auth limiter tracks.
+///
+/// The map is keyed by client IP, whose *breadth* the attacker controls; without a
+/// hard cap a spray inside one window grew it without bound.
+const MAX_FAIL_ENTRIES: usize = 10_000;
+
 impl AuthFailures {
     /// Count one failure; returns true when this IP is now locked out.
     pub fn note(&mut self, ip: &str, burst: u32, window: std::time::Duration) -> bool {
         let now = std::time::Instant::now();
-        // Keep the map from growing without bound when someone sprays spoofed IPs.
-        if self.seen.len() > 10_000 {
+        // Bound the map for real. `retain` alone only drops *expired* entries, so a
+        // spray inside one window (an IPv6 /64 supplies the addresses cheaply) grew
+        // it without limit and made every `note` O(n). Sweep first, then evict the
+        // oldest quarter if it is still at the cap.
+        if self.seen.len() >= MAX_FAIL_ENTRIES {
             self.seen
                 .retain(|_, (_, t)| now.duration_since(*t) < window);
+            if self.seen.len() >= MAX_FAIL_ENTRIES {
+                let mut ages: Vec<(std::time::Instant, String)> = self
+                    .seen
+                    .iter()
+                    .map(|(k, (_, t))| (*t, k.clone()))
+                    .collect();
+                ages.sort_unstable_by_key(|(t, _)| *t);
+                for (_, k) in ages.into_iter().take(MAX_FAIL_ENTRIES / 4) {
+                    self.seen.remove(&k);
+                }
+            }
         }
         let e = self.seen.entry(ip.to_string()).or_insert((0, now));
         if now.duration_since(e.1) > window {
@@ -565,8 +591,10 @@ pub async fn json_errors(req: Request, next: Next) -> Response {
     }
     let (parts, body) = resp.into_parts();
     let Ok(bytes) = axum::body::to_bytes(body, 64 * 1024).await else {
-        // Body unreadable: keep the status, do not manufacture a payload.
-        return (parts.status, "").into_response();
+        // Body unreadable or over the rewrite cap: keep the status *and the
+        // headers*. Dropping them lost `Retry-After` / `x-ratelimit-*` /
+        // `x-request-id` on relayed upstream errors (>64 KiB text bodies).
+        return (parts.status, parts.headers, "").into_response();
     };
     let message = String::from_utf8_lossy(&bytes).trim().to_string();
     let message = if message.is_empty() {
@@ -1001,6 +1029,8 @@ mod auth_tests {
         use axum::routing::get;
         axum::Router::new()
             .route("/probe", get(probe))
+            // The handoff is only wired for the route that really upgrades.
+            .route("/v1/realtime", get(probe))
             .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_api_key,
@@ -1220,7 +1250,7 @@ mod auth_tests {
         let addr = serve(router(st, gate)).await;
 
         let resp = reqwest::Client::new()
-            .get(format!("http://{addr}/probe"))
+            .get(format!("http://{addr}/v1/realtime"))
             .bearer_auth("ck-tenant")
             .header("connection", "upgrade")
             .header("upgrade", "websocket")
@@ -1237,6 +1267,60 @@ mod auth_tests {
             rt.in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0
         })
         .await;
+    }
+
+    /// A fake `Upgrade` header on a normal route must NOT hand the slot to the
+    /// request.
+    ///
+    /// The handoff exists because a 101 leaves the response behind; on any other
+    /// route nothing removes the guard from the request extensions, so it died with
+    /// the request parts *before* the handler ran — `max_concurrent` bounded nothing
+    /// while the stream went on holding a provider slot.
+    #[tokio::test]
+    async fn an_upgrade_header_on_a_normal_route_does_not_skip_the_slot() {
+        let rt = key_runtime(1);
+        let st = state_with_key(rt.clone());
+        let (release, held) = tokio::sync::oneshot::channel();
+        let gate = Gate(std::sync::Arc::new(tokio::sync::Mutex::new(Some(held))));
+        let addr = serve(router(st, gate)).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/probe");
+        let first = {
+            let client = client.clone();
+            let url = url.clone();
+            tokio::spawn(async move {
+                client
+                    .get(url)
+                    .bearer_auth("ck-tenant")
+                    .header("connection", "upgrade")
+                    .header("upgrade", "websocket")
+                    .send()
+                    .await
+            })
+        };
+        wait_until("the fake-upgrade request to take its slot", || {
+            rt.in_flight.load(std::sync::atomic::Ordering::Relaxed) == 1
+        })
+        .await;
+        let second = client
+            .get(&url)
+            .bearer_auth("ck-tenant")
+            .send()
+            .await
+            .expect("second request");
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the header must not release the slot early"
+        );
+        release.send(()).expect("release");
+        let first = first.await.expect("join").expect("response");
+        assert_eq!(
+            first.text().await.expect("body"),
+            "guard-on-response",
+            "a normal route must keep the guard on the response"
+        );
     }
 
     /// Hardening headers are applied by the outermost layer, so they are present
