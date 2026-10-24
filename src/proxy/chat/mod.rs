@@ -554,10 +554,7 @@ async fn run_target(
                 let token = match account.ensure_access_token().await {
                     Ok(t) => t,
                     Err(e) => {
-                        let kind = match &e {
-                            AuthError::Permanent(_) => FailKind::Auth,
-                            AuthError::Transient(_) => FailKind::Network,
-                        };
+                        let kind = auth_fail_kind(&e);
                         warn!(provider = %provider.name, account = %account.label(), error = %e, "codex token refresh failed");
                         provider.pool.report_failure(&key, kind, model);
                         continue;
@@ -584,10 +581,7 @@ async fn run_target(
                 let token = match account.ensure_access_token().await {
                     Ok(t) => t,
                     Err(e) => {
-                        let kind = match &e {
-                            AuthError::Permanent(_) => FailKind::Auth,
-                            AuthError::Transient(_) => FailKind::Network,
-                        };
+                        let kind = auth_fail_kind(&e);
                         warn!(provider = %provider.name, account = %account.label(), error = %e, "token refresh failed");
                         provider.pool.report_failure(&key, kind, model);
                         continue;
@@ -596,10 +590,7 @@ async fn run_target(
                 let project = match account.ensure_project_id(&token).await {
                     Ok(p) => p,
                     Err(e) => {
-                        let kind = match &e {
-                            AuthError::Permanent(_) => FailKind::Auth,
-                            AuthError::Transient(_) => FailKind::Network,
-                        };
+                        let kind = auth_fail_kind(&e);
                         warn!(provider = %provider.name, account = %account.label(), error = %e, "project resolution failed");
                         provider.pool.report_failure(&key, kind, model);
                         continue;
@@ -846,6 +837,21 @@ async fn run_target(
 fn keep_specific(last: &mut Option<TargetFailure>, fallback: TargetFailure) {
     if last.is_none() {
         *last = Some(fallback);
+    }
+}
+
+/// Map an [`AuthError`] to key-pool bookkeeping.
+///
+/// `Config` is a *deployment* problem (no OAuth client id/secret in the
+/// environment): retiring the credential for it marked every account DEAD —
+/// persisted — so fixing the environment still left them looking revoked. It is
+/// treated as a transient server-side failure instead: cooled down, retried, and the
+/// exit path is a clear log line.
+fn auth_fail_kind(e: &AuthError) -> FailKind {
+    match e {
+        AuthError::Permanent(_) => FailKind::Auth,
+        AuthError::Transient(_) => FailKind::Network,
+        AuthError::Config(_) => FailKind::Server,
     }
 }
 

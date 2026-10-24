@@ -78,6 +78,10 @@ pub enum AuthError {
     Permanent(String),
     /// Network / 5xx — worth retrying later.
     Transient(String),
+    /// The *local* configuration is incomplete (no OAuth client id/secret in the
+    /// environment, no state file). Nothing is wrong with the credential itself, so
+    /// it must not be retired the way a rejected token is.
+    Config(String),
 }
 
 impl std::fmt::Display for AuthError {
@@ -85,6 +89,7 @@ impl std::fmt::Display for AuthError {
         match self {
             AuthError::Permanent(m) => write!(f, "permanent: {m}"),
             AuthError::Transient(m) => write!(f, "transient: {m}"),
+            AuthError::Config(m) => write!(f, "config: {m}"),
         }
     }
 }
@@ -243,8 +248,12 @@ impl Account {
                 "static access token rejected and no refresh token configured".into(),
             ));
         };
+        // A missing client id/secret is a deployment mistake, not a rejected
+        // credential: reporting it as `Permanent` marked every account DEAD (and
+        // persisted that), so after fixing the environment the accounts still looked
+        // revoked until an operator re-enabled them by hand.
         let (client_id, client_secret) = client_credentials().map_err(|e| {
-            AuthError::Permanent(format!("antigravity OAuth client is not configured: {e}"))
+            AuthError::Config(format!("antigravity OAuth client is not configured: {e}"))
         })?;
         // Deadline on the refresh too: this call holds `state.lock().await`, so a
         // silent endpoint would block every other request that needs a token for
