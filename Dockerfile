@@ -22,10 +22,21 @@ RUN rustup target add wasm32-unknown-unknown
 
 # Pinned: trunk's output layout (and therefore the CSP hashes computed at runtime)
 # is tied to the version that built dist/.
+#
+# The release asset name carries the *host* architecture, so it must follow the
+# build platform: an arm64 build that downloaded the x86_64 binary would fail (or,
+# worse under emulation, silently run the wrong one).
 ARG TRUNK_VERSION=v0.21.14
-RUN curl -fsSL \
-      "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
-    | tar -xz -C /usr/local/bin trunk
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) TRUNK_ARCH=x86_64-unknown-linux-gnu ;; \
+      arm64) TRUNK_ARCH=aarch64-unknown-linux-gnu ;; \
+      *) echo "unsupported build platform '$TARGETARCH' (amd64 and arm64 only)" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL \
+      "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-${TRUNK_ARCH}.tar.gz" \
+    | tar -xz -C /usr/local/bin trunk \
+ && trunk --version
 
 WORKDIR /src/ui
 COPY ui/ ./

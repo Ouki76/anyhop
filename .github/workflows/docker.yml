@@ -1,12 +1,20 @@
 name: docker
 
-# Builds the image described by ./Dockerfile and publishes it to GHCR.
+# Builds the image described by ./Dockerfile and publishes it to GHCR as a
+# multi-arch manifest (linux/amd64 + linux/arm64):
 #
-#   docker pull ghcr.io/ouki76/anyhop:latest
+#   docker pull ghcr.io/ouki76/anyhop:latest     # resolves to the host's arch
 #
-# Published on every push to the default branch and on `v*` tags. Pull requests
-# build the image and boot it (without pushing), so a broken Dockerfile fails
-# review instead of the release. Multi-arch: see the note at the bottom.
+# Both architectures are built on *native* runners (GitHub's arm64 hosted runner).
+# The alternative — one QEMU job — works but compiles Rust and jemalloc under
+# emulation at roughly 40 minutes per build; native arm is a normal 5-8 minutes.
+#
+#   push to the default branch -> latest + sha-<short>
+#   tag v1.2.3                 -> 1.2.3, 1.2, sha-<short>
+#   pull request               -> amd64 only, built and booted, never pushed
+#
+# If the arm64 runner label is unavailable here, drop that matrix entry: the merge
+# job then publishes a single-arch image without further changes.
 
 on:
   push:
@@ -27,67 +35,63 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  build:
+  # One place that decides the image name (GHCR paths must be lowercase) and the
+  # tags, so both arch builds and the merge agree on them.
+  meta:
     runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      tags: ${{ steps.tags.outputs.list }}
     steps:
-      - uses: actions/checkout@v4
-
-      # GHCR paths must be lowercase; <owner>/<repo> is not.
       - name: Image name
         id: image
         run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Tag list
+        id: tags
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository }}
+        run: |
+          set -eu
+          image=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          short="${GITHUB_SHA::7}"
+          tags="$image:sha-$short"
+          if [ "$GITHUB_REF" = "refs/heads/${{ github.event.repository.default_branch }}" ]; then
+            tags="$tags,$image:latest"
+          fi
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              v="${GITHUB_REF#refs/tags/v}"
+              tags="$tags,$image:$v"
+              case "$v" in
+                *.*.*) tags="$tags,$image:${v%.*}" ;;
+              esac
+              ;;
+          esac
+          echo "list=$tags" >> "$GITHUB_OUTPUT"
+          echo "tags: $tags"
 
-      - name: Log in to GHCR
-        # A PR from a fork gets a read-only token: only log in when we may push.
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+  # Pull requests: one architecture, loaded into the daemon and booted. A
+  # Dockerfile that builds but cannot run is the classic release-day surprise.
+  pr-image:
+    needs: meta
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Image metadata (tags and labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
-          tags: |
-            # default branch -> latest
-            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-            # v1.2.3 -> 1.2.3 and 1.2
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            # every build gets a commit-addressed tag, so a server can pin one image
-            type=sha,prefix=sha-,format=short
-            # a stable name for the local smoke test below (PRs only)
-            type=raw,value=smoke,enable=${{ github.event_name == 'pull_request' }}
-          labels: |
-            org.opencontainers.image.title=anyhop
-            org.opencontainers.image.description=OpenAI-compatible LLM gateway with account and API-key rotation
-            org.opencontainers.image.licenses=MIT
-
-      - name: Build and push
+      - name: Build (amd64, local)
         uses: docker/build-push-action@v6
         with:
           context: .
-          # On a PR the image is loaded into the daemon instead of pushed, so the
-          # smoke test below can run it.
-          push: ${{ github.event_name != 'pull_request' }}
-          load: ${{ github.event_name == 'pull_request' }}
           platforms: linux/amd64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          load: true
+          tags: ${{ needs.meta.outputs.image }}:smoke
+          cache-from: type=gha,scope=amd64
           provenance: false
 
-      # A Dockerfile that builds but cannot run is the classic release-day surprise:
-      # boot the image with a minimal config and require /healthz.
-      - name: Smoke-test the image (pull requests)
-        if: github.event_name == 'pull_request'
+      - name: Boot the image and check it
         run: |
           set -eu
           cfg=$(mktemp)
@@ -108,7 +112,7 @@ jobs:
           keys = ["sk-smoke"]
           models = ["smoke-model"]
           TOML
-          image="${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:smoke"
+          image="${{ needs.meta.outputs.image }}:smoke"
           docker rm -f anyhop-smoke >/dev/null 2>&1 || true
           docker run -d --name anyhop-smoke -p 8080:8080 \
             -v "$cfg:/etc/anyhop/anyhop.toml:ro" "$image"
@@ -118,6 +122,9 @@ jobs:
               curl -fsS -H "Authorization: Bearer smoke-test-key" \
                 http://127.0.0.1:8080/v1/models >/dev/null
               echo "OK: /v1/models answers with the gateway key"
+              code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/dashboard)
+              test "$code" = 200
+              echo "OK: the dashboard is embedded"
               docker rm -f anyhop-smoke >/dev/null
               exit 0
             fi
@@ -128,8 +135,119 @@ jobs:
           docker rm -f anyhop-smoke >/dev/null
           exit 1
 
-# arm64 (Raspberry Pi, Ampere, Apple-silicon servers): add
-#   - uses: docker/setup-qemu-action@v3
-# before Buildx and `linux/arm64` to `platforms:`. It works, but the Rust +
-# jemalloc build runs emulated at roughly 40 min per build, which is why it is not
-# on by default.
+  # One native runner per architecture; each pushes a single-arch image *by digest*
+  # (no tag yet) and hands the digest to the merge job.
+  build:
+    needs: meta
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            # GitHub's native arm64 hosted runner (public repositories).
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.meta.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=anyhop
+            org.opencontainers.image.description=OpenAI-compatible LLM gateway with account and API-key rotation
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          provenance: false
+
+      - name: Record the digest
+        run: |
+          set -eu
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+          echo "${{ matrix.arch }} -> $digest"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Join the per-arch digests into one manifest per tag, so `docker pull` on either
+  # architecture resolves to a native image.
+  merge:
+    needs: [meta, build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assemble the multi-arch manifest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.meta.outputs.image }}
+          TAGS: ${{ needs.meta.outputs.tags }}
+        run: |
+          set -eu
+          refs=""
+          for f in /tmp/digests/*; do
+            [ -f "$f" ] || continue
+            refs="$refs $IMAGE@sha256:$(basename "$f")"
+          done
+          echo "arch digests:$refs"
+          args=""
+          old_ifs="$IFS"
+          IFS=','
+          for t in $TAGS; do
+            args="$args -t $t"
+          done
+          IFS="$old_ifs"
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $args $refs
+
+      - name: Verify the published manifest
+        env:
+          TAGS: ${{ needs.meta.outputs.tags }}
+        run: |
+          set -eu
+          first="${TAGS%%,*}"
+          docker buildx imagetools inspect "$first" | sed -n '1,40p'
+
+# Local arm64 builds without the hosted runner:
+#   docker buildx create --use --name arm --driver docker-container
+#   docker buildx build --platform linux/arm64 -t anyhop:arm64 . --load
+# Works on an amd64 host through QEMU, at roughly 40 minutes for a cold build.
