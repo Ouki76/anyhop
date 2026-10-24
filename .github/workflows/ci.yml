@@ -5,6 +5,11 @@ on:
     branches: [main, master]
   pull_request:
 
+# `contents: write` is only so the integration job can publish its failure log to a
+# throwaway branch (otherwise a failed e2e run is unreadable without a token).
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -67,7 +72,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -eu
+          set -u
           mkdir -p ci-logs
           {
             echo "# integration failure — $(date -u +%FT%TZ) — ${GITHUB_SHA}"
