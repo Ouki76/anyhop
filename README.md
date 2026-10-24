@@ -83,10 +83,12 @@ without the proxy.
 
 ### 2. Docker
 
-A prebuilt image is published to the GitHub Container Registry by
+A prebuilt multi-arch image (`linux/amd64` + `linux/arm64`) is published to the
+GitHub Container Registry by
 [`.github/workflows/docker.yml`](.github/workflows/docker.yml) on every push to
-`main` and on `v*` tags (`linux/amd64`; the workflow documents the one-line change
-for arm64):
+`main` and on `v*` tags — both architectures are built on native runners and
+joined into one manifest, so `docker pull` picks the right one on an x86 server, an
+ARM VPS or a Raspberry Pi:
 
 ```bash
 # pull the published image (public package; on an older GHCR setup run
