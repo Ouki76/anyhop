@@ -1,0 +1,93 @@
+# anyhop — server deployment from the published image.
+#
+#   # 1. config directory (a *directory*, not a single file: the gateway rewrites
+#   #    the config when you use the dashboard — models, client keys, providers —
+#   #    and an atomic rewrite needs to create a temp file next to it)
+#   mkdir -p config && cp anyhop.example.toml config/anyhop.toml && chmod 600 config/anyhop.toml
+#   sed -i 's|^listen = .*|listen = "0.0.0.0:8080"|' config/anyhop.toml
+#   #    …and set [server] api_key = "a-long-secret" (without it /api/* is open)
+#   sudo chown -R 10001:10001 config        # uid 10001 = the image's `anyhop` user
+#
+#   # 2. run
+#   docker compose -f docker-compose.server.yml up -d
+#   docker compose -f docker-compose.server.yml logs -f
+#
+#   curl -s localhost:8080/healthz          # -> ok
+#   open http://<host>:8080/dashboard       # the UI asks for the admin key
+#
+# Prefer an immutable config and never edit it from the dashboard? Replace the two
+# mounts below with a read-only single file:
+#     - ./config/anyhop.toml:/etc/anyhop/anyhop.toml:ro,z
+# and change settings by editing the file + `docker kill -s HUP anyhop`
+# (SIGHUP reloads without a restart). Any dashboard write then answers 500.
+#
+# TLS: this file publishes the port on loopback only. Put nginx/caddy/traefik in
+# front (packaging/nginx.conf.example) — or switch to in-process TLS
+# ([server] tls_cert/tls_key) and publish the port directly.
+#
+# Updating:  docker compose -f docker-compose.server.yml pull && \
+#            docker compose -f docker-compose.server.yml up -d
+# Pin a build:  image: ghcr.io/ouki76/anyhop:sha-14bf087   (or a release tag :1.2.3)
+
+services:
+  anyhop:
+    image: ghcr.io/ouki76/anyhop:latest
+    container_name: anyhop
+    restart: unless-stopped
+
+    ports:
+      # Loopback only: the gateway speaks plain HTTP, so it must not be reachable
+      # from the network without TLS in front of it.
+      - "127.0.0.1:8080:8080"
+
+    volumes:
+      # The configuration *directory* (see the header). `,z` relabels it for the
+      # container's SELinux domain — required on Fedora/RHEL/CentOS (enforcing),
+      # harmless elsewhere. Without it the gateway exits with
+      # "cannot read config: Permission denied".
+      - ./config:/etc/anyhop:z
+      # OAuth tokens, key health, stats and stored /v1/responses live here.
+      - anyhop-data:/data
+
+    environment:
+      RUST_LOG: info
+      # Worker threads. Default is min(4, cores); raise it only if the gateway
+      # itself is the bottleneck (see the benchmark section of the README).
+      # ANYHOP_WORKERS: "4"
+      # Google OAuth client for `antigravity` accounts. They are never written to
+      # the config, so they belong here (or in an env_file):
+      # ANYHOP_ANTIGRAVITY_CLIENT_ID: "…apps.googleusercontent.com"
+      # ANYHOP_ANTIGRAVITY_CLIENT_SECRET: "…"
+
+    # The image ships a HEALTHCHECK too; this copy keeps `docker compose ps` honest
+    # even if the image is replaced by one without it.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+
+    deploy:
+      resources:
+        limits:
+          # Idles at ~10 MB, stays under ~20 MB at 4k rps; the cap is a safety net
+          # against a pathological provider stream.
+          memory: 256M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  anyhop-data:

@@ -106,8 +106,36 @@ docker run -d --name anyhop --restart unless-stopped \
   ghcr.io/ouki76/anyhop:latest
 ```
 
-`docker compose up -d` also works and builds from the checkout instead (the compose
-file mounts the config read-only and keeps state in the `anyhop-data` volume).
+#### Docker Compose on a server
+
+[`docker-compose.server.yml`](docker-compose.server.yml) runs the published image:
+
+```bash
+mkdir -p config
+cp anyhop.example.toml config/anyhop.toml && chmod 600 config/anyhop.toml
+sed -i 's|^listen = .*|listen = "0.0.0.0:8080"|' config/anyhop.toml
+# set [server] api_key = "a-long-secret" — without it /api/* is open
+sudo chown -R 10001:10001 config     # uid 10001 = the image's `anyhop` user
+
+docker compose -f docker-compose.server.yml up -d
+docker compose -f docker-compose.server.yml logs -f
+curl -s localhost:8080/healthz       # ok
+```
+
+Two details that are easy to get wrong:
+
+* **Mount the config as a directory** (`./config:/etc/anyhop`), not as a single
+  file. The dashboard rewrites the config (enable/disable a model, add a client
+  key, edit a provider) and the rewrite is atomic — it creates a temp file next to
+  the config, which is impossible through a single-file mount (the parent is the
+  image's own read-only directory). A single-file mount still works for a
+  *static* config: use `./config/anyhop.toml:/etc/anyhop/anyhop.toml:ro,z` and
+  reload with `docker kill -s HUP anyhop`; dashboard writes will answer `500`.
+* The directory must be **writable by uid 10001** (the image runs as that user,
+  never as root) — that is the `chown` above.
+
+`docker compose up -d` (the plain [`docker-compose.yml`](docker-compose.yml))
+builds from the checkout instead, which is the developer path.
 
 The `,z` on the config mount relabels it for the container's SELinux domain. On a
 host with SELinux enforcing (Fedora, RHEL, CentOS) the `z` is required — without it
