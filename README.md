@@ -481,20 +481,27 @@ mocks are the bottleneck there, not the gateway):
 
 | Scenario | Throughput | p50 | p99 |
 | --- | --- | --- | --- |
-| Chat, mixed providers | ~4,800 req/s | 0.92 ms | 1.4 ms |
-| Chat, streaming | ~4,500 req/s | 0.95 ms | 1.5 ms |
+| Chat, mixed providers (Python mocks) | ~6,700 req/s | 1.9 ms | 2.2 ms |
+| Chat, streaming (Python mocks) | included above | — | — |
 
-**Hot-path micro-benchmarks** (`cargo bench`):
+**Hot-path micro-benchmarks** (`cargo bench`, measured 2026-10-24 on a Xeon
+E5-2670 v3 @ 2.3 GHz — a core *without* SHA extensions, i.e. the slow case for
+hashing; a SHA-NI machine is several times faster):
 
 | Operation | Time | Throughput |
 | --- | --- | --- |
-| `peek_request`, 172 B body | 140 ns | — |
-| `peek_request`, 64 KiB body | 2.4 µs | 26 GB/s |
-| `peek_request`, 1 MiB body | 45 µs | 22 GB/s |
-| `session_key` (4 KiB hash) | 1.8 µs | 2.1 GB/s (SHA-NI) |
-| SSE parse, one event | 80 ns | — |
-| `pool.pick`, round robin | 12 ns | — |
-| `pool.pick`, sticky session | 54 ns | — |
+| `peek_request`, 172 B body | 344 ns | — |
+| `peek_request`, 64 KiB body | 7.2 µs | 8.7 GB/s |
+| `peek_request`, 1 MiB body | 158 µs | 6.3 GB/s |
+| `session_key` (4 KiB of sticky-session hashing) | 2.4 µs | 1.6 GB/s |
+| SSE parse, one event | 282 ns | — |
+| `pool.pick`, round robin | 65 ns | — |
+| `pool.pick`, sticky session | 191 ns | — |
+
+The sticky-session hash is a non-cryptographic 64-bit hash (FNV-1a + splitmix64
+finaliser): it only chooses which key serves a conversation, is never compared
+against a secret, and SHA-256 over 4 KiB cost 23 µs on this CPU — 15 % of a core at
+6 k rps for a cache-affinity decision.
 
 **Memory**: 9 MB idle, 16–22 MB under sustained load, flat over a 90 s soak with
 ~360k requests (`test/soak.py`, no leak, no fd growth).
