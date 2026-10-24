@@ -16,6 +16,9 @@ QUICK=0
 ok()   { printf '  \033[32mok\033[0m   %s\n' "$1"; }
 warn() { printf '  \033[33mwarn\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAILED=1; }
+# Exit 97 is this workstation's cargo wrapper ("do not compile here"): the check
+# did not run, so report that loudly instead of a green or a red.
+skipped_toolchain() { printf '  \033[33mskip\033[0m %s\n' "$1"; }
 FAILED=0
 
 echo "== formatting =="
@@ -32,17 +35,23 @@ echo "== lints =="
 CLIPPY_LOG=$(cargo clippy --all-targets 2>&1)
 CLIPPY_STATUS=$?
 CLIPPY=$(echo "$CLIPPY_LOG" | grep -cE "^(warning|error)")
-if [ "$CLIPPY_STATUS" -ne 0 ]; then
+if [ "$CLIPPY_STATUS" = "97" ]; then
+    skipped_toolchain "clippy: the local cargo wrapper refuses to compile (run it on the build box or in CI)"
+elif [ "$CLIPPY_STATUS" -ne 0 ]; then
     fail "clippy did not run cleanly (exit $CLIPPY_STATUS): $(echo "$CLIPPY_LOG" | tail -3 | tr '\n' ' ')"
 elif [ "$CLIPPY" = "0" ]; then
     ok "clippy --all-targets: clean"
 else
     fail "clippy: $CLIPPY diagnostics"
 fi
-if cargo build --no-default-features >/dev/null 2>&1; then
+cargo build --no-default-features >/dev/null 2>&1
+NODEF=$?
+if [ "$NODEF" = "0" ]; then
     ok "build without the dashboard feature"
+elif [ "$NODEF" = "97" ]; then
+    skipped_toolchain "build without the dashboard feature: cargo wrapper refuses to compile here"
 else
-    fail "the --no-default-features build broke"
+    fail "the --no-default-features build broke (exit $NODEF)"
 fi
 
 echo "== tests =="
@@ -53,7 +62,9 @@ TEST_LOG=$(cargo test 2>&1)
 TEST_STATUS=$?
 TOTAL=$(echo "$TEST_LOG" | grep -oE "^test result: [A-Z]+" | grep -c "ok")
 FAILED_BIN=$(echo "$TEST_LOG" | grep -cE "^test result: FAILED")
-if [ "$TEST_STATUS" -ne 0 ] || [ "$FAILED_BIN" -ne 0 ]; then
+if [ "$TEST_STATUS" = "97" ]; then
+    skipped_toolchain "cargo test: the local cargo wrapper refuses to compile (run it on the build box or in CI)"
+elif [ "$TEST_STATUS" -ne 0 ] || [ "$FAILED_BIN" -ne 0 ]; then
     fail "cargo test (exit $TEST_STATUS, $FAILED_BIN failing binary(ies)): $(echo "$TEST_LOG" | grep -E '^(test result|failures:)' | tail -3 | tr '\n' ' ')"
 else
     PASSED=$(echo "$TEST_LOG" | grep -oE "[0-9]+ passed" | awk -F' ' '{s+=$1} END {print s+0}')
@@ -85,9 +96,17 @@ fi
 echo "== dependencies =="
 if command -v cargo-audit >/dev/null 2>&1; then
     # A dependency advisory is a real vulnerability in this binary, not a style
-    # issue: fail the audit when the tree carries one.
-    ADV=$(cargo audit 2>/dev/null | grep -cE "^Crate:")
-    if [ "$ADV" = "0" ]; then
+    # issue: fail the audit when the tree carries one. The exit status matters —
+    # counting "Crate:" lines alone read a *failed* run (no network, no advisory
+    # db) as "no advisories".
+    AUDIT_LOG=$(cargo audit 2>&1)
+    AUDIT_STATUS=$?
+    ADV=$(echo "$AUDIT_LOG" | grep -cE "^Crate:")
+    if [ "$AUDIT_STATUS" = "97" ]; then
+        skipped_toolchain "cargo audit: the local cargo wrapper refuses to run it here"
+    elif [ "$AUDIT_STATUS" -ne 0 ] && [ "$ADV" = "0" ]; then
+        fail "cargo audit did not run (exit $AUDIT_STATUS): $(echo "$AUDIT_LOG" | tail -2 | tr '\n' ' ')"
+    elif [ "$ADV" = "0" ]; then
         ok "cargo audit: no known advisories"
     else
         fail "cargo audit: $ADV advisory(ies) in the dependency tree"
@@ -109,7 +128,14 @@ fi
 echo "== secrets =="
 # Patterns cover the shapes this project actually issues: Google refresh tokens,
 # OpenAI-style `sk-…`/`sk-proj-…`, and the gateway's own `sk-hop-…` client keys.
-SECRETS=$(git ls-files -z | xargs -0 grep -lE "1//0[0-9A-Za-z_-]{25,}|sk-(proj-|ant-|hop-)?[A-Za-z0-9_-]{24,}" 2>/dev/null)
+#
+# A line carrying the `not-a-secret` marker is a deliberate test fixture (a value
+# that must look real to exercise masking/redaction). Everything else that matches
+# is a leak. The marker is a plain word so it reads as a comment in Rust and shell.
+SECRETS=$(git ls-files -z \
+    | xargs -0 grep -nE "1//0[0-9A-Za-z_-]{25,}|sk-(proj-|ant-|hop-)?[A-Za-z0-9_-]{24,}" 2>/dev/null \
+    | grep -v "not-a-secret" \
+    | cut -d: -f1 | sort -u)
 if [ -n "$SECRETS" ]; then
     fail "a credential-looking string is tracked by git: $(echo "$SECRETS" | head -3 | tr '\n' ' ')"
 else

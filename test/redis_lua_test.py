@@ -348,8 +348,14 @@ def main():
         print("SKIP: docker is not available")
         return 2
     if probe.returncode != 0:
-        print(f"SKIP: {IMAGE} is not pulled (run: docker pull {IMAGE})")
-        return 2
+        # CI has network: pull the server instead of silently skipping the only test
+        # that ever executes the shipped Lua.
+        print(f"pulling {IMAGE} …")
+        pull = subprocess.run(["docker", "pull", IMAGE],
+                              capture_output=True, text=True, timeout=300)
+        if pull.returncode != 0:
+            print(f"SKIP: cannot pull {IMAGE}: {pull.stderr.strip()[:200]}")
+            return 2
 
     port = free_port()
     name = f"anyhop-lua-{port}"

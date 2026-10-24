@@ -626,7 +626,9 @@ mod secret_tests {
     /// A mask must keep enough to recognise a key and never enough to use it.
     #[test]
     fn a_mask_never_reveals_the_middle_of_a_key() {
-        let key = "sk-hop-0123456789abcdef0123456789abcdef";
+        // A synthetic value that must *look* like a key so the mask and the
+        // default-name logic are actually exercised.
+        let key = "sk-hop-0123456789abcdef0123456789abcdef"; // not-a-secret
         let masked = mask_key(key);
         assert!(masked.contains("..."), "{masked}");
         assert!(
