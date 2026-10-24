@@ -44,11 +44,17 @@ jobs:
   # End-to-end: real HTTP against mock providers, including access control and the UI.
   integration:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, ui]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Without this the embedded dashboard is the "ui not built" placeholder and
+      # the CSP assertions cannot pass (see the ui job).
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
       - name: Build release binary
         run: cargo build --release --locked
       # run_all.sh skips the CDP/browser part when chromium is absent; the API
@@ -119,3 +125,12 @@ jobs:
       # still produce a working app. Fail the job if the bundle is missing.
       - name: Check bundle
         run: test -s ui/dist/index.html && test -n "$(ls ui/dist/*_bg.wasm)"
+      # `ui/dist` is git-ignored, so an integration checkout has no dashboard and
+      # `build.rs` embeds its placeholder — that is exactly how the e2e job failed:
+      # the binary served "ui not built", so there were no inline scripts and no
+      # CSP hashes. Hand the real bundle to the job that builds the tested binary.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          retention-days: 1
