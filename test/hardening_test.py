@@ -207,8 +207,13 @@ def check_tls():
     """The gateway must speak HTTPS itself when cert/key are configured."""
     port = free_port()
     cfg = tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False)
+    # A private key is not committed (see scripts/gen-test-certs.sh): make sure the
+    # throwaway pair exists before starting the TLS instance.
     cert = os.path.join(ROOT, "test/certs/localhost.crt")
     key = os.path.join(ROOT, "test/certs/localhost.key")
+    if not (os.path.exists(cert) and os.path.exists(key)):
+        subprocess.run(["sh", os.path.join(ROOT, "scripts/gen-test-certs.sh")],
+                       cwd=ROOT, check=False, capture_output=True)
     write_config(cfg.name, port, f'tls_cert = "{cert}"\ntls_key = "{key}"')
     gw = Gateway(cfg.name, port)
     try:

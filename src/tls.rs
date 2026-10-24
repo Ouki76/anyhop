@@ -440,51 +440,30 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// The certificate/key pair that ships in the repository.
+    /// The throwaway certificate pair, generated on demand (see
+    /// `scripts/gen-test-certs.sh`): a private key is deliberately not committed.
     const CERT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/certs/localhost.crt");
     const KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/certs/localhost.key");
 
-    /// Self-signed P-256 pair used to exercise the EC branches. It is a leaf
-    /// certificate (`CA:FALSE`) with `SAN=DNS:localhost`, so the end-to-end test
-    /// can also use it as its own trust anchor.
-    /* test certificate generated at run time */
+    /// Ensure the pair exists, generating it with `openssl` when it does not.
+    ///
+    /// Returns false when openssl is unavailable, so the tests that need a real
+    /// certificate can skip instead of failing on a machine without it.
+    fn ensure_certs() -> bool {
+        if std::path::Path::new(CERT).exists() && std::path::Path::new(KEY).exists() {
+            return true;
+        }
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/gen-test-certs.sh");
+        std::process::Command::new("sh")
+            .arg(script)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
 
-    /// The same EC key as PKCS#8 (`PRIVATE KEY`).
-    /* generated */
 
-    /// The same EC key as SEC1 (`EC PRIVATE KEY`).
-    /* generated */
 
-    /// `test/certs/localhost.key` re-encoded as PKCS#1 (`RSA PRIVATE KEY`):
-    /// the same key, so it must load against the committed certificate.
-    const RSA_KEY_PKCS1: &str = "-----BEGIN RSA PRIVATE KEY-----
-MIIEpAIBAAKCAQEAz8z+EOWujT0z5WdpyKbC59FsRjiRy4IZall/cZlKG+3X3+Rw
-9ytBEl2MnidCop0VxPjcfZWkrOPT5ITy2I3UQIIR35mblGchvhd8KH0LkWS13N24
-Dgzf1udG1mWx5V1e2R/FbzM3VNz22Z5EP409ffhSeUpJNHtBzzFgumDRQf+RhOpx
-LlHdjMgpxU3ii9jsoUUyUXUUg6x2YE64lK/EJRGwRcs8N76oMibKo+pdI49Ia7cX
-at22GRstDSCr/2MBt1r0yyrvVvfRcV8tO0xor7IirBPuJibzAEXznjk+6B6fbUIp
-cgUwS1BOPvdGZAtIYNgz1putYnMp+k+E+Ed2PwIDAQABAoIBAFtW6Op2ewZcO55/
-mVD4dD2/oQ8wuG0yz4cetdUyIxApuLUSTdFnct/mvPOboD+oOrRtC0Ysa8kPD8mn
-4rLrjLuaMM8PTwKpXnyXCB0n8djD4uilkMykPhPRbyK4ary+EP3xaDBb29tykRLQ
-7YDdzYS8jUwBKjJmZ2PyeWkTO4f9Sebb9nM9LSNwYLrJaZsiS8yH8GtRiEOXtU8n
-UmTjW0PdJ5spOk86MBqZ8mAZ80iflFWj3aqqeduNWXt32Ng1ibE1XNhT3zJeDnHp
-sYW+vhVMejoIBYGkLvYXNmlfrdMPonsqtYF2X7xnp2yslm6eCqcmD46bkplyUMQ8
-1H2JlTECgYEA+82iFOgAl9pK/Z5B1vcoVqcw5IsWqoEyShpVSkzxQlD7CO50MOCy
-H/3Ml6ahFPcvFXTss5+jtAOnnKwBxRsE7NPZAXkqSXADmXqMRA3mGPe/ILfX+3kg
-FQ9/IDEJv478jgjSvICRxDHq5JwrFYnJilE5EcLzxW6kE0+6OvH8O3cCgYEA00Od
-PB7mNeHcCWv2XfS4fJtXGM7EZuOqzU+cX3tjHVpoXOu/9zmuyrk57DubIlio2TTD
-zVGsMq0aAxmLSBzEpzFz35gziaYtJg7Dc/UeHfzw2jVD2jRvyYZ42Wk0FxLYBxy1
-cm8DNTCoe3f7M1/kJ2TLaM8n5BGW0N10UmI8PXkCgYEAipQtM5xLV0dIJjRGv+ve
-Q3JYMi9qFgRsjOPZNL8LuBehUNULFStUXM7tHjkSRduUChcDfgfJrHSmdk8j2jp4
-h24/69OnNitzj7AmKf4MOImAop0LPNb4lR6mNC1I1Cf5TqIEeMG5d2SRhad8/qmK
-RZlV8zR7vJibrBUgxPgQfRkCgYAHjy7MHOrt2KQP7j4FhKEpTEGkkJl0eQb+i6+z
-tu2H+lkrof/fb7/yXwhUjJlzdCqugvXSne6Eba81ly9lqCndNabIxGBrt3d8GiEi
-QA4Q0qEnnapM3310f4xJczs67CCwuHVBn/lEaPZOXK+vWeoHAtNIb8kknwB/fr0P
-yZYQOQKBgQCXs+2hQP+S1CdUiRONGLBthn+cE35wOAXD9Mn5bqjl6jO3eOTrD2hn
-CcbyiadJNou6HH9KrAXo1iaykK3FzyjET+rU0BZHyWEkcLEALBVO0aXR7XfhS4zu
-2dASSLZTfu6JYxnVPx5SHCd0MbxMPTYmTQl2fF8Q+M7UED1AUIpVLg==
------END RSA PRIVATE KEY-----
-";
 
     /// Writes a PEM file to the temp dir and removes it again on drop.
     struct TempPem {
@@ -534,8 +513,67 @@ CcbyiadJNou6HH9KrAXo1iaykK3FzyjET+rU0BZHyWEkcLEALBVO0aXR7XfhS4zu
         }
     }
 
+
+    /// A throwaway P-256 pair in three encodings, generated with openssl.
+    ///
+    /// The key material is deliberately not committed: a private key — even a
+    /// self-signed test one — makes a repository unpublishable and asks to be
+    /// copied into production. Skipped when openssl is unavailable.
+    fn ec_pair() -> Option<(String, String, String)> {
+        // Unique per call: tests run in parallel within one process, and a shared
+        // directory let one test's certificate pair with another test's key (which
+        // rustls correctly rejects as a mismatch).
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "anyhop-tls-ec-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).ok()?;
+        let key = dir.join("k.pem");
+        let run = |args: &[&str]| {
+            std::process::Command::new("openssl")
+                .args(args)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let key_s = key.to_str()?.to_string();
+        if !run(&["ecparam", "-genkey", "-name", "prime256v1", "-noout", "-out", &key_s]) {
+            return None;
+        }
+        let sec1 = std::fs::read_to_string(&key).ok()?;
+        let pkcs8_path = dir.join("k8.pem");
+        let pkcs8_s = pkcs8_path.to_str()?.to_string();
+        if !run(&["pkcs8", "-topk8", "-nocrypt", "-in", &key_s, "-out", &pkcs8_s]) {
+            return None;
+        }
+        let pkcs8 = std::fs::read_to_string(&pkcs8_path).ok()?;
+        // A self-signed certificate for this key, so the mismatch test has a cert.
+        let cert_path = dir.join("c.pem");
+        let cert_s = cert_path.to_str()?.to_string();
+        // CA:FALSE + SAN=localhost: rustls refuses a CA certificate as a server
+        // certificate, and the client connects with ServerName "localhost".
+        if !run(&[
+            "req", "-x509", "-new", "-key", &key_s, "-days", "1",
+            "-subj", "/CN=localhost",
+            "-addext", "basicConstraints=critical,CA:FALSE",
+            "-addext", "subjectAltName=DNS:localhost",
+            "-out", &cert_s,
+        ]) {
+            return None;
+        }
+        let cert = std::fs::read_to_string(&cert_path).ok()?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Some((cert, pkcs8, sec1))
+    }
+
     #[test]
-    fn loads_the_committed_localhost_pair() {
+    fn loads_the_generated_localhost_pair() {
+        if !ensure_certs() {
+            eprintln!("skipping: openssl is unavailable and test/certs is empty");
+            return;
+        }
         let tls = ok(TlsConfig::from_pem_files(CERT, KEY));
         // The acceptor is what `serve` hands to the connection loop.
         let _acceptor = tls.acceptor();
@@ -611,23 +649,54 @@ CcbyiadJNou6HH9KrAXo1iaykK3FzyjET+rU0BZHyWEkcLEALBVO0aXR7XfhS4zu
 
     #[test]
     fn ec_pkcs8_pair_is_accepted() {
-        let cert = TempPem::new("ec-pkcs8-cert", EC_CERT);
-        let key = TempPem::new("ec-pkcs8-key", EC_KEY_PKCS8);
+        let Some((cert_pem, pkcs8, _)) = ec_pair() else {
+            eprintln!("skipping: openssl is unavailable");
+            return;
+        };
+        let cert = TempPem::new("ec-pkcs8-cert", &cert_pem);
+        let key = TempPem::new("ec-pkcs8-key", &pkcs8);
         let tls = ok(TlsConfig::from_pem_files(cert.str(), key.str()));
         let _acceptor = tls.acceptor();
     }
 
     #[test]
     fn ec_sec1_key_is_accepted() {
-        let cert = TempPem::new("ec-sec1-cert", EC_CERT);
-        let key = TempPem::new("ec-sec1-key", EC_KEY_SEC1);
+        let Some((cert_pem, _, sec1)) = ec_pair() else {
+            eprintln!("skipping: openssl is unavailable");
+            return;
+        };
+        let cert = TempPem::new("ec-sec1-cert", &cert_pem);
+        let key = TempPem::new("ec-sec1-key", &sec1);
         let tls = ok(TlsConfig::from_pem_files(cert.str(), key.str()));
         let _acceptor = tls.acceptor();
     }
 
     #[test]
     fn rsa_pkcs1_key_is_accepted() {
-        let key = TempPem::new("rsa-pkcs1-key", RSA_KEY_PKCS1);
+        if !ensure_certs() {
+            eprintln!("skipping: openssl is unavailable and test/certs is empty");
+            return;
+        }
+        // Re-encode the generated key as PKCS#1 (`BEGIN RSA PRIVATE KEY`) with
+        // openssl rather than committing a copy: a constant would silently stop
+        // matching the certificate as soon as the pair is regenerated.
+        let tmp = std::env::temp_dir().join(format!(
+            "anyhop-tls-{}-pkcs1.key",
+            std::process::id()
+        ));
+        let converted = std::process::Command::new("openssl")
+            .args(["pkey", "-traditional", "-in", KEY, "-out"])
+            .arg(&tmp)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !converted {
+            eprintln!("skipping: openssl cannot convert the key to PKCS#1");
+            return;
+        }
+        let pem = ok(std::fs::read_to_string(&tmp));
+        let _ = std::fs::remove_file(&tmp);
+        let key = TempPem::new("rsa-pkcs1-key", &pem);
         let tls = ok(TlsConfig::from_pem_files(CERT, key.str()));
         let _acceptor = tls.acceptor();
     }
@@ -636,7 +705,11 @@ CcbyiadJNou6HH9KrAXo1iaykK3FzyjET+rU0BZHyWEkcLEALBVO0aXR7XfhS4zu
     fn mismatched_key_is_rejected() {
         // EC key against the committed RSA certificate: every parse succeeds,
         // only the public-key comparison can catch this.
-        let key = TempPem::new("ec-mismatch", EC_KEY_PKCS8);
+        let Some((_, pkcs8, _)) = ec_pair() else {
+            eprintln!("skipping: openssl is unavailable");
+            return;
+        };
+        let key = TempPem::new("ec-mismatch", &pkcs8);
         let message = err(TlsConfig::from_pem_files(CERT, key.str()));
         assert!(
             message.contains("cannot use the certificate chain"),
@@ -648,7 +721,11 @@ CcbyiadJNou6HH9KrAXo1iaykK3FzyjET+rU0BZHyWEkcLEALBVO0aXR7XfhS4zu
 
     #[test]
     fn parses_every_certificate_block_in_order() {
-        let pem = format!("{EC_CERT}{EC_CERT}");
+        let Some((cert_pem, _, _)) = ec_pair() else {
+            eprintln!("skipping: openssl is unavailable");
+            return;
+        };
+        let pem = format!("{cert_pem}{cert_pem}");
         let certs = ok(parse_cert_chain(&pem, "inline.pem"));
         assert_eq!(certs.len(), 2, "both blocks must be kept for the chain");
         assert_eq!(certs[0], certs[1]);
@@ -661,8 +738,12 @@ CcbyiadJNou6HH9KrAXo1iaykK3FzyjET+rU0BZHyWEkcLEALBVO0aXR7XfhS4zu
         use axum::routing::get;
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-        let cert = TempPem::new("e2e-cert", EC_CERT);
-        let key = TempPem::new("e2e-key", EC_KEY_PKCS8);
+        let Some((cert_pem, pkcs8, _)) = ec_pair() else {
+            eprintln!("skipping: openssl is unavailable");
+            return;
+        };
+        let cert = TempPem::new("e2e-cert", &cert_pem);
+        let key = TempPem::new("e2e-key", &pkcs8);
         let tls = ok(TlsConfig::from_pem_files(cert.str(), key.str()));
 
         let listener = ok(tokio::net::TcpListener::bind("127.0.0.1:0").await);
@@ -671,7 +752,7 @@ CcbyiadJNou6HH9KrAXo1iaykK3FzyjET+rU0BZHyWEkcLEALBVO0aXR7XfhS4zu
         let server = tokio::spawn(serve(listener, app, tls));
 
         let mut roots = rustls::RootCertStore::empty();
-        let der = ok(pem_blocks(EC_CERT, "CERTIFICATE")).remove(0);
+        let der = ok(pem_blocks(&cert_pem, "CERTIFICATE")).remove(0);
         ok(roots.add(CertificateDer::from(der)));
         let client = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
@@ -700,7 +781,11 @@ CcbyiadJNou6HH9KrAXo1iaykK3FzyjET+rU0BZHyWEkcLEALBVO0aXR7XfhS4zu
 
     #[test]
     fn pem_blocks_ignores_other_labels() {
-        let pem = format!("{EC_CERT}{EC_KEY_PKCS8}");
+        let Some((cert_pem, pkcs8, _)) = ec_pair() else {
+            eprintln!("skipping: openssl is unavailable");
+            return;
+        };
+        let pem = format!("{cert_pem}{pkcs8}");
         let certs = ok(pem_blocks(&pem, "CERTIFICATE"));
         let keys = ok(pem_blocks(&pem, "PRIVATE KEY"));
         assert_eq!(certs.len(), 1);
