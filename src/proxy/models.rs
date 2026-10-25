@@ -171,14 +171,40 @@ fn model_json(limits: crate::limits::Limits, id: &str, owner: &str) -> serde_jso
         "object": "model",
         "owned_by": owner,
     });
+    // One number, every spelling a client actually reads. Publishing only
+    // `context_length`/`max_completion_tokens` left the clients that look for
+    // `context_window`, `maxTokens`, `max_output_tokens` or OpenRouter's
+    // `limit.context` / `top_provider.max_completion_tokens` with empty fields —
+    // the numbers were there, the names were not.
+    let mut limit = serde_json::Map::new();
     if limits.context_window > 0 {
-        v["context_length"] = serde_json::json!(limits.context_window);
+        let n = serde_json::json!(limits.context_window);
+        v["context_length"] = n.clone();
+        v["context_window"] = n;
+        limit.insert(
+            "context".to_string(),
+            serde_json::json!(limits.context_window),
+        );
     }
     if limits.max_output_tokens > 0 {
-        v["max_completion_tokens"] = serde_json::json!(limits.max_output_tokens);
+        let n = serde_json::json!(limits.max_output_tokens);
+        v["max_completion_tokens"] = n.clone();
+        v["max_output_tokens"] = n.clone();
+        v["maxTokens"] = n;
+        v["top_provider"] = serde_json::json!({
+            "context_length": limits.context_window,
+            "max_completion_tokens": limits.max_output_tokens,
+        });
+        limit.insert(
+            "output".to_string(),
+            serde_json::json!(limits.max_output_tokens),
+        );
     }
     if limits.max_input_tokens > 0 {
         v["max_input_tokens"] = serde_json::json!(limits.max_input_tokens);
+    }
+    if !limit.is_empty() {
+        v["limit"] = serde_json::Value::Object(limit);
     }
     v
 }

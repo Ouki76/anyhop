@@ -756,6 +756,64 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The catalogue has to speak every spelling a client reads, not just the
+    /// OpenAI one: DeepSeek Harness reads `context_length`/`context_window` and
+    /// `maxOutputTokens`/`max_output_tokens`/`maxTokens`/`limit.output`/
+    /// `top_provider.max_completion_tokens`, and never `max_completion_tokens` —
+    /// which was the only name published, so its form stayed empty.
+    #[tokio::test]
+    async fn the_catalogue_speaks_every_spelling_of_a_limit() {
+        let (st, path) = state_with_catalogue();
+        models_limits_set(
+            State(st.clone()),
+            limits_update(serde_json::json!({
+                "model": "mock/m",
+                "context_window": 200_000,
+                "max_output_tokens": 64_000,
+            })),
+        )
+        .await
+        .expect("set");
+        install_catalogue(&st);
+        let listed = crate::proxy::list_models(State(st.clone()), None).await;
+        let listed: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        // Also check the single-model endpoint: clients probe both.
+        let one = crate::proxy::get_model(
+            State(st.clone()),
+            None,
+            axum::extract::Path("mock/m".to_string()),
+        )
+        .await;
+        let one: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(one.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        for body in [&listed["data"][0], &one] {
+            assert_eq!(body["id"], "mock/m", "{body}");
+            // context window, four spellings
+            assert_eq!(body["context_length"], 200_000, "{body}");
+            assert_eq!(body["context_window"], 200_000, "{body}");
+            assert_eq!(body["limit"]["context"], 200_000, "{body}");
+            // output cap, four spellings
+            assert_eq!(body["max_completion_tokens"], 64_000, "{body}");
+            assert_eq!(body["max_output_tokens"], 64_000, "{body}");
+            assert_eq!(body["maxTokens"], 64_000, "{body}");
+            assert_eq!(body["limit"]["output"], 64_000, "{body}");
+            assert_eq!(
+                body["top_provider"]["max_completion_tokens"], 64_000,
+                "{body}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// `disable-all` must cover provider models *and* combos; `enable-all` must
     /// clear everything again.
     #[tokio::test]
