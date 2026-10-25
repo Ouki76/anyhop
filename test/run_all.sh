@@ -152,6 +152,26 @@ TRAV2=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/dashboard/%2e%2e%2fanyhop.
 [ "$TRAV" = 404 ] && [ "$TRAV2" = 404 ] \
     && ok "path traversal rejected ($TRAV/$TRAV2)" || fail "path traversal rejected ($TRAV/$TRAV2)"
 
+echo "== cors =="
+# A browser client on another origin sends a preflight first; without an answer the
+# browser never sends the real request. A listed origin is allowed, an unlisted one
+# gets no CORS headers at all.
+PRE=$(curl -s -o /dev/null -D - -X OPTIONS "$BASE/v1/models" \
+  -H 'Origin: https://ui.example' -H 'Access-Control-Request-Method: GET' -H 'Access-Control-Request-Headers: authorization' 2>&1)
+echo "$PRE" | grep -qi '^access-control-allow-origin: https://ui.example' \
+  && ok "CORS preflight answers a listed origin" || fail "cors preflight: $(echo "$PRE" | head -c 120)"
+echo "$PRE" | grep -qi '^access-control-allow-methods:' \
+  && ok "CORS preflight advertises methods" || fail "cors methods missing"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X OPTIONS "$BASE/v1/models" -H 'Origin: https://ui.example' -H 'Access-Control-Request-Method: POST')
+[ "$CODE" = 204 ] && ok "CORS preflight is 204 (not the router's 405)" || fail "cors preflight status $CODE"
+GET_H=$(curl -s -o /dev/null -D - "$BASE/v1/models" -H "$AUTH" -H 'Origin: https://ui.example' 2>&1)
+echo "$GET_H" | grep -qi '^access-control-allow-origin: https://ui.example' \
+  && ok "CORS header on a real request" || fail "cors: no allow-origin on GET"
+echo "$GET_H" | grep -qi '^vary: origin' && ok "CORS varies on origin" || fail "cors: missing Vary: origin"
+DENY=$(curl -s -o /dev/null -D - -X OPTIONS "$BASE/v1/models" -H 'Origin: https://evil.example' -H 'Access-Control-Request-Method: GET' 2>&1)
+echo "$DENY" | grep -qi '^access-control-allow-origin' \
+  && fail "cors: an unlisted origin was allowed" || ok "CORS refuses an unlisted origin"
+
 echo "== metrics =="
 M=$(curl -s "$BASE/metrics" -H "$AUTH")
 echo "$M" | grep -q "^anyhop_up 1$" && ok "/metrics up" || fail "/metrics up"

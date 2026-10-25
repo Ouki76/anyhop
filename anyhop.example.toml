@@ -1,4 +1,9 @@
 [server]
+# Browser-based clients (Open WebUI, LobeChat, Chatbox…) on another origin need
+# CORS: list those origins here. Empty = same-origin only (the bundled dashboard).
+# "*" allows every origin (the API key is still required; cookies are never allowed
+# cross-origin, so a hostile page cannot borrow a stored credential).
+# cors_origins = ["https://chat.example.com", "http://localhost:3000"]
 # Public URL of this gateway (no trailing slash). Set it when the dashboard is
 # opened from another machine or a domain: OAuth sign-in then redirects to
 # <public_url>/api/auth/callback instead of a loopback port.

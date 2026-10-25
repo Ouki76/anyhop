@@ -6,7 +6,7 @@ use axum::extract::{FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 
 use crate::proxy;
@@ -647,6 +647,91 @@ pub fn error_type(status: StatusCode) -> &'static str {
 /// MIME sniffing (`nosniff`), clickjacking/framing (`DENY`), and leaking the
 /// `?key=` query to third parties via the `Referer` header (`no-referrer`).
 /// The dashboard document additionally gets a strict CSP (see `dashboard::csp`).
+/// Cross-origin access for browser-based clients (`[server] cors_origins`).
+///
+/// The gateway ships a same-origin dashboard, so CORS is off unless the operator
+/// lists an origin. A preflight (`OPTIONS` with `Access-Control-Request-Method`)
+/// is answered here and never reaches the API: without this a browser client on
+/// another origin cannot send a single request, and the dashboard's own `405`
+/// from the router would look like a broken endpoint.
+///
+/// `Access-Control-Allow-Credentials` is deliberately never sent: the API takes a
+/// bearer key, so no cookie or stored credential should ever travel cross-origin.
+pub async fn cors(State(state): State<Arc<proxy::AppState>>, req: Request, next: Next) -> Response {
+    let origins = state.rt().cors_origins.clone();
+    if origins.is_empty() {
+        return next.run(req).await;
+    }
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok());
+    let allowed = cors_allow(&origins, origin);
+
+    let preflight = req.method() == axum::http::Method::OPTIONS
+        && req
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
+
+    let mut resp = if preflight {
+        // Answer here: the router has no OPTIONS routes, so forwarding would
+        // produce the very 405 the browser shows as a CORS failure.
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(req).await
+    };
+
+    if let Some(origin) = allowed {
+        let h = resp.headers_mut();
+        if let Ok(v) = header::HeaderValue::from_str(&origin) {
+            h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+        }
+        // A shared cache must not serve one origin's response to another.
+        h.insert(header::VARY, header::HeaderValue::from_static("origin"));
+        if preflight {
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                header::HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, OPTIONS"),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                header::HeaderValue::from_static(
+                    "authorization, content-type, x-api-key, anthropic-version,                      openai-organization, openai-beta",
+                ),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_MAX_AGE,
+                header::HeaderValue::from_static("600"),
+            );
+        }
+        // Without this a browser client cannot read the cool-down hint.
+        h.insert(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            header::HeaderValue::from_static("retry-after, x-request-id"),
+        );
+    }
+    resp
+}
+
+/// Which origin, if any, may read this response.
+///
+/// `None` means "no CORS headers at all": an origin the operator did not list must
+/// not learn anything from us, not even that CORS exists. `"*"` allows every origin
+/// (the request still needs a key — credentials are never allowed).
+fn cors_allow(origins: &[String], origin: Option<&str>) -> Option<String> {
+    let origin = origin?.trim();
+    if origin.is_empty() {
+        return None;
+    }
+    if origins.iter().any(|o| o.trim() == "*") {
+        return Some("*".to_string());
+    }
+    origins
+        .iter()
+        .find(|o| o.trim().eq_ignore_ascii_case(origin))
+        .map(|_| origin.to_string())
+}
+
 pub async fn security_headers(
     State(state): State<Arc<proxy::AppState>>,
     req: Request,
@@ -693,6 +778,38 @@ pub async fn security_headers(
 #[cfg(test)]
 mod json_error_tests {
     use super::*;
+
+    /// CORS is opt-in per origin: an unlisted origin gets *no* header (not a
+    /// rejected one), `"*"` allows everything, and matching ignores case because
+    /// browsers may normalise the scheme/host.
+    #[test]
+    fn only_listed_origins_are_allowed() {
+        let list = vec![
+            "https://ui.example".to_string(),
+            "http://localhost:3000".to_string(),
+        ];
+        assert_eq!(
+            cors_allow(&list, Some("https://ui.example")).as_deref(),
+            Some("https://ui.example")
+        );
+        assert_eq!(
+            cors_allow(&list, Some("HTTPS://UI.EXAMPLE")).as_deref(),
+            Some("HTTPS://UI.EXAMPLE"),
+            "the echoed origin keeps the client's spelling"
+        );
+        assert_eq!(cors_allow(&list, Some("https://evil.example")), None);
+        assert_eq!(cors_allow(&list, None), None);
+        assert_eq!(cors_allow(&list, Some("   ")), None);
+
+        // `"*"` answers with `*`, not with the request origin: no credentials are
+        // allowed either way, so the wildcard is safe.
+        assert_eq!(
+            cors_allow(&["*".to_string()], Some("https://any.example")).as_deref(),
+            Some("*")
+        );
+        // An empty list (the default) never answers.
+        assert_eq!(cors_allow(&[], Some("https://ui.example")), None);
+    }
 
     /// The lockout used to answer a static `Retry-After: 5` while the block
     /// lasts `auth_fail_window_secs` (60 by default): a client that obeyed it

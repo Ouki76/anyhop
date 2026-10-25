@@ -662,6 +662,26 @@ impl Config {
             matches!(self.server.log_format.as_str(), "text" | "json"),
             "server.log_format must be \"text\" or \"json\""
         );
+        // Each CORS entry becomes an `Access-Control-Allow-Origin` value: a bare
+        // "*" mixed with real origins is ambiguous, and anything with a space or a
+        // newline cannot be a header value at all.
+        for o in &self.server.cors_origins {
+            let o = o.trim();
+            anyhow::ensure!(!o.is_empty(), "server.cors_origins has an empty entry");
+            anyhow::ensure!(
+                o == "*" || o.starts_with("http://") || o.starts_with("https://"),
+                "server.cors_origins entry '{o}' must be '*' or start with http:// or https://"
+            );
+            anyhow::ensure!(
+                !o.chars().any(|c| c.is_control() || c == ' '),
+                "server.cors_origins entry '{o}' must not contain spaces or control characters"
+            );
+        }
+        anyhow::ensure!(
+            !(self.server.cors_origins.iter().any(|o| o.trim() == "*")
+                && self.server.cors_origins.len() > 1),
+            "server.cors_origins: \"*\" cannot be combined with other origins"
+        );
 
         let mut names = std::collections::HashSet::new();
         for p in &self.providers {
@@ -946,6 +966,16 @@ pub struct ServerConfig {
     /// Periodic models refresh interval from providers (secs). Default: 300 (5 min). 0 = disabled.
     #[serde(default = "default_models_refresh_secs")]
     pub models_refresh_secs: u64,
+    /// Browser origins allowed to call `/v1/*` and `/api/*` cross-origin.
+    ///
+    /// Empty (the default) means same-origin only, which is what the bundled
+    /// dashboard needs. A browser-based client (Open WebUI, LobeChat, Chatbox…)
+    /// served from another origin sends a preflight `OPTIONS` request and is
+    /// refused without an entry here — `"*"` allows any origin (the key is still
+    /// required, and `Access-Control-Allow-Credentials` stays off, so a hostile
+    /// page cannot borrow a stored credential).
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
 }
 
 fn default_models_refresh_secs() -> u64 {
@@ -1002,6 +1032,7 @@ impl Default for ServerConfig {
             auth_fail_window_secs: default_auth_fail_window_secs(),
             max_body_bytes: default_max_body(),
             models_refresh_secs: default_models_refresh_secs(),
+            cors_origins: Vec::new(),
         }
     }
 }
@@ -1264,6 +1295,36 @@ mod tests {
             "[server]\ntls_cert = \"/etc/anyhop/tls.crt\"\ntls_key = \"/etc/anyhop/tls.key\"",
         );
         parse(&both).validate().expect("a complete pair is valid");
+    }
+
+    /// CORS entries become response headers: a wildcard mixed with real origins is
+    /// ambiguous, and a value with a space or a control character cannot be a
+    /// header at all.
+    #[test]
+    fn cors_origins_are_validated_as_header_values() {
+        let ok = VALID.replace(
+            "[server]",
+            "[server]\ncors_origins = [\"https://ui.example\", \"http://localhost:3000\"]",
+        );
+        parse(&ok).validate().expect("listed origins are valid");
+
+        let wildcard = VALID.replace("[server]", "[server]\ncors_origins = [\"*\"]");
+        parse(&wildcard)
+            .validate()
+            .expect("a lone wildcard is valid");
+
+        for (entry, needle) in [
+            ("[\"*\", \"https://ui.example\"]", "cannot be combined"),
+            ("[\"ui.example\"]", "must be"),
+            ("[\"\"]", "empty entry"),
+            // Interior whitespace cannot be a header value; a stray
+            // leading/trailing space is trimmed instead of refused.
+            ("[\"https://ui example\"]", "spaces"),
+        ] {
+            let cfg = VALID.replace("[server]", &format!("[server]\ncors_origins = {entry}"));
+            let msg = error_of(&cfg);
+            assert!(msg.contains(needle), "{entry}: {msg}");
+        }
     }
 
     /// Per-model limits: the numbers the dashboard offers are the numbers the

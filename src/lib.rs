@@ -220,6 +220,7 @@ async fn async_main() -> anyhow::Result<()> {
             client_key_max_concurrent: cfg.server.client_key_max_concurrent,
             tls_enabled: cfg.server.tls_cert.is_some(),
             ratelimit: cfg.ratelimit.clone(),
+            cors_origins: std::sync::Arc::new(cfg.server.cors_origins.clone()),
         }),
         storage: storage.clone(),
         config_path: config_path.clone(),
@@ -501,6 +502,7 @@ fn install_config(state: &Arc<proxy::AppState>, prepared: PreparedConfig) -> usi
         client_key_max_concurrent: cfg.server.client_key_max_concurrent,
         tls_enabled: cfg.server.tls_cert.is_some(),
         ratelimit: cfg.ratelimit.clone(),
+        cors_origins: std::sync::Arc::new(cfg.server.cors_origins.clone()),
     };
     state.events.set_cap(cfg.server.events_history);
     if let Some(s) = &state.storage {
@@ -730,8 +732,15 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
     };
 
     app.with_state(state.clone())
-        // Outermost layer: hardening headers on every response, including 401s
-        // and errors produced by the auth middlewares inside.
+        // CORS is the outermost layer: a preflight is answered before anything
+        // else (the router has no OPTIONS routes) and the headers have to be on
+        // error responses too, or the browser hides the real status.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::cors,
+        ))
+        // Hardening headers on every response, including 401s and errors produced
+        // by the auth middlewares inside.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::security_headers,
@@ -1003,6 +1012,7 @@ mod tests {
                 client_key_max_concurrent: 0,
                 tls_enabled: false,
                 ratelimit: cfg.ratelimit.clone(),
+                cors_origins: std::sync::Arc::new(Vec::new()),
             }),
             storage,
             config_path: path.clone(),

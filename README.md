@@ -56,6 +56,9 @@ Single binary (~6MB), minimal resource footprint.
 - **Hot reload**: `kill -HUP` re-reads the config without a restart
 - **Persistence** (redb): key health, OAuth tokens, stats, runtime-added keys
 - **JSON API** `/api/*`: providers, quotas, SSE events, key management — always on
+- **CORS**: opt-in per origin (`[server] cors_origins`), with real preflight
+  handling, so a browser-based client on another origin works; unlisted origins get
+  no CORS headers at all
 - **Metrics**: `GET /metrics` in Prometheus text format — counters per key, plus latency
   histograms (`anyhop_http_request_duration_seconds`) per route/method/status
 - **TLS**: in-process via `rustls` (`[server] tls_cert`/`tls_key`) or terminated at a

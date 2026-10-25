@@ -1,4 +1,5 @@
 [server]
+cors_origins = ["https://ui.example"]
 listen = "127.0.0.1:18080"
 max_retries = 4
 attempt_timeout_secs = 10

@@ -2920,6 +2920,7 @@ mod tests {
                 client_key_max_concurrent: 0,
                 tls_enabled: false,
                 ratelimit: crate::config::RateLimitConfig::default(),
+                cors_origins: std::sync::Arc::new(Vec::new()),
             }),
             storage: None,
             config_path: String::new(),

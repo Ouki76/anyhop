@@ -366,6 +366,18 @@ pub struct DeleteProvider {
     name: String,
 }
 
+/// The model ids the provider served just before it was removed, so entries that
+/// referred to a bare model name (`beta` and `beta` alone) can be recognised too.
+fn provider_model_ids(state: &Arc<AppState>, name: &str) -> Vec<String> {
+    let router = state.router.load();
+    router
+        .providers
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| p.models.as_ref().clone())
+        .unwrap_or_default()
+}
+
 /// POST /api/providers/delete — remove a provider from the config.
 pub async fn provider_delete(
     State(state): State<Arc<AppState>>,
@@ -439,17 +451,65 @@ pub async fn provider_delete(
         *combos = keep;
     }
 
+    // Stale references would outlive the provider: a `disabled_models` entry naming
+    // it keeps a model that no longer exists in the "disabled" list for ever, and a
+    // client-key allowlist entry for it silently removes a model from that key's
+    // access. Both are dropped in the same edit.
+    let bare_models = provider_model_ids(&state, name);
+    let stale = |v: &str| {
+        let bare = v.strip_prefix("combo/").unwrap_or(v);
+        match bare.split_once('/') {
+            Some((p, m)) => p == name || (p.is_empty() && bare_models.iter().any(|x| x == m)),
+            None => bare_models.iter().any(|x| x == bare),
+        }
+    };
+    let mut cleaned: Vec<String> = Vec::new();
+    if let Some(arr) = doc
+        .get_mut("disabled_models")
+        .and_then(|i| i.as_array_mut())
+    {
+        let mut keep = toml_edit::Array::new();
+        for v in arr.iter() {
+            match v.as_str() {
+                Some(m) if stale(m) => cleaned.push(m.to_string()),
+                Some(m) => keep.push(m),
+                None => {}
+            }
+        }
+        *arr = keep;
+    }
+    if let Some(keys) = doc
+        .get_mut("client_keys")
+        .and_then(|i| i.as_array_of_tables_mut())
+    {
+        for k in keys.iter_mut() {
+            if let Some(models) = k.get_mut("models").and_then(|m| m.as_array_mut()) {
+                let mut keep = toml_edit::Array::new();
+                for v in models.iter() {
+                    match v.as_str() {
+                        Some(m) if stale(m) => cleaned.push(format!("key:{m}")),
+                        Some(m) => keep.push(m),
+                        None => {}
+                    }
+                }
+                *models = keep;
+            }
+        }
+    }
+
     if let Err(resp) = write_validated(&state, &doc).await {
         return Ok(*resp);
     }
-    let detail = if dropped.is_empty() {
-        format!("provider '{name}' deleted")
-    } else {
-        format!(
-            "provider '{name}' deleted, removed from combos: {}",
-            dropped.join(", ")
-        )
-    };
+    let mut detail = format!("provider '{name}' deleted");
+    if !dropped.is_empty() {
+        detail.push_str(&format!(", removed from combos: {}", dropped.join(", ")));
+    }
+    if !cleaned.is_empty() {
+        detail.push_str(&format!(
+            ", dropped stale references: {}",
+            cleaned.join(", ")
+        ));
+    }
     state.events.emit_simple("config", "", "backoff", detail);
     Ok(StatusCode::OK.into_response())
 }
@@ -867,6 +927,10 @@ mod edit_tests {
     /// Two providers and a combo that spans them, so deletion has something to
     /// clean up and the config stays valid afterwards.
     const TWO: &str = r#"
+        # A bare key after a [[table]] belongs to that table, so these root-level
+        # lists have to come first.
+        disabled_models = ["mock/m", "spare/m2", "gone-thing"]
+
         [[providers]]
         name = "mock"
         type = "openai_compat"
@@ -888,6 +952,11 @@ mod edit_tests {
         [[combos]]
         name = "alone"
         chain = ["spare/m2"]
+
+        [[client_keys]]
+        key = "sk-tenant"
+        name = "tenant"
+        models = ["mock/m", "spare/m2"]
 
         [server]
         listen = "127.0.0.1:18080"
@@ -1009,6 +1078,22 @@ mod edit_tests {
             "the combo that referenced 'mock' had to go, the other one stays"
         );
         assert_eq!(st.router.load().providers.len(), 1);
+
+        // Every stale reference left in the same edit: a disabled entry naming the
+        // provider (or its bare model), and a client-key allowlist entry doing the
+        // same. Entries that name a *live* provider stay.
+        assert_eq!(
+            cfg.disabled_models,
+            vec!["spare/m2".to_string(), "gone-thing".to_string()],
+            "{:?}",
+            cfg.disabled_models
+        );
+        assert_eq!(
+            cfg.client_keys[0].models,
+            vec!["spare/m2".to_string()],
+            "{:?}",
+            cfg.client_keys[0].models
+        );
 
         // Unknown provider: a 404, and nothing changes.
         assert!(

@@ -53,6 +53,10 @@ pub struct RtConfig {
     /// Client-key rate-limit backend (`local` or `redis`), see
     /// [`crate::distributed`]. Cloned per key on construction/rebind.
     pub ratelimit: crate::config::RateLimitConfig,
+    /// Browser origins allowed cross-origin access (`[server] cors_origins`).
+    /// Shared as an `Arc`: the CORS middleware reads it on every request and a
+    /// reload swaps the whole vector.
+    pub cors_origins: std::sync::Arc<Vec<String>>,
 }
 
 pub struct AppState {
