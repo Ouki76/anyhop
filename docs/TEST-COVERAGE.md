@@ -1,5 +1,12 @@
 # Test coverage of the anyhop gateway
 
+> **Update (2026-10-26):** the audit below was written against 479 library tests.
+> The tree now has **617** library tests plus 18 fuzz targets and the e2e suite
+> (`test/run_all.sh`, 58 checks), all of which are re-run on every commit by the
+> `ci` workflow. The method described here still applies; the per-module table
+> below is the audit's snapshot and lists only the gaps it found then — every one
+> of them is covered now.
+
 Audit date: 2026-10-22. Baseline commit `c19e6ef` (479 library tests). Three
 commits from a parallel agent landed while the audit ran — `ae418d8` (PKCE),
 `3a0f5cc` (wire/fuzz fixes) and `512ae88` — and this audit's tests are part of

@@ -545,6 +545,60 @@ burst = 20       # optional spike allowance (default: same as rpm)
 - The per-key concurrency cap (`max_concurrent`) counts a request until its **body** is done,
   so a long SSE stream holds its slot for as long as it is open.
 
+## Connecting clients
+
+Everything speaks the OpenAI wire format, so most clients only need a base URL and a key.
+
+### OpenAI Responses clients (including DSH)
+
+- Base URL: `https://<host>/v1`, key: a client key (`sk-hop-…`) or `[server] api_key`.
+- Model: any id from `GET /v1/models` (`dashscope/qwen3.8-max`, a combo name, …).
+- Function tools work end to end: `tools` (function tools only), `tool_choice`,
+  `parallel_tool_calls`, `function_call` / `function_call_output` items in `input`,
+  `reasoning.effort`. The answer carries `function_call` output items, in streaming
+  too, and `previous_response_id` replays a stored turn — tool calls included.
+
+```bash
+curl -s https://<host>/v1/responses \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"model":"dashscope/qwen3.8-max","input":"weather in Omsk?",
+       "tools":[{"type":"function","name":"get_weather",
+                 "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}]}'
+```
+
+### Browser clients (Open WebUI, LobeChat, Chatbox)
+
+A page on another origin needs CORS. Add its origin to the config and restart:
+
+```toml
+[server]
+cors_origins = ["https://chat.example.com"]
+```
+
+The preflight is answered by the gateway itself, so the client's own "test
+connection" button works. `"*"` allows every origin; the API key is still required
+and credentials are never allowed cross-origin.
+
+### IDE autocomplete (Continue, Cline, Zed)
+
+Point the FIM/autocomplete endpoint at `/v1/fim/completions` (alias `/v1/completions`)
+with `{"model": "...", "prompt": "...", "suffix": "..."}`:
+
+- an `openai_compat` provider gets the request forwarded to its own `/completions`,
+  so code models keep their native `<|fim_prefix|>…<|fim_suffix|>…<|fim_middle|>`
+  tokens (vLLM, SGLang, Together, LM Studio, llama.cpp);
+- providers without that endpoint (Gemini, Anthropic, Antigravity's `tab_*`
+  completion models) are asked through a `<FILL_HERE>` marker, and the answer is
+  cleaned of fences and of the text that already exists around the cursor.
+
+### Plain chat
+
+```bash
+curl -s https://<host>/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"model":"dashscope/qwen3.8-max","messages":[{"role":"user","content":"hi"}]}'
+```
+
 ## Benchmarks
 
 All numbers below were measured on a 16-core machine, gateway in release mode,
@@ -680,3 +734,10 @@ Honest list — none of these are accidents:
   manager integration.
 - **Upstream format coverage is best-effort.** Provider APIs drift; the translation
   layers are covered by mocks in CI, not by live-provider canary tests.
+- **Hosted tools are refused, not emulated.** `web_search`, `file_search` and
+  `code_interpreter` run on the provider's side; a request naming one gets a 400 that
+  says so, because forwarding the name without the service would change the meaning.
+- **Anthropic JSON mode and Gemini `responseSchema`** are not translated: a request
+  asking for structured output gets a 400 rather than silently unconstrained text.
+- **SSE parsing expects `\n` or `\r\n` line endings.** A bare `\r` (some exotic
+  proxies rewrite the stream) is not treated as a line break.

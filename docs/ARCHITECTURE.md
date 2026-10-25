@@ -38,7 +38,9 @@ client ──HTTP──▶ axum router ──▶ auth ──▶ routing ──�
 | `src/tls.rs` | rustls PEM loading + an `axum::serve::Listener` that decrypts per connection |
 | `src/dashboard.rs` | Embedded dashboard assets + per-request CSP |
 | `ui/` | Sycamore (Rust→WASM) SPA: a thin client over `/api/*` (no logic of its own) |
-| `src/middleware.rs` | Auth middlewares, constant-time compare, security headers |
+| `src/middleware.rs` | Auth middlewares, constant-time compare, security headers, CORS |
+| `src/limits.rs` | Model limits: parsing a provider's catalogue, the resolve order (override → provider), provenance per field |
+| `src/fim.rs` | `POST /v1/fim/completions`: native pass-through to a provider's `/completions`, marker-wrapped chat for the rest |
 | `src/storage.rs` | `redb` persistence (health, OAuth tokens, stats, runtime keys, event feed) |
 | `src/api/client_keys.rs` | Client key CRUD; the runtime struct holds the key's live rate-limit bucket |
 | `src/api/combos.rs` | Combo (fallback chain) CRUD, written into `[[combos]]` |
@@ -51,6 +53,14 @@ OAuth accounts are appended to the provider named in the request (`provider`, de
 kind). The provider is created in the same write as its first account, so the file never contains
 a provider without credentials. A pending flow is keyed by kind **and** provider: asking for a
 different one cancels the stale flow and frees the local callback port.
+
+## Layer order (outermost first)
+
+`cors` → `security_headers` → `record_metrics` → `request_body_deadline` →
+`json_errors` → auth (`/v1/*` and `/api/*` are separate routers with their own
+auth) → handler. CORS is outermost because a preflight must be answered before
+the routers see it (they have no OPTIONS routes) and because the headers must be
+on error responses too, or the browser hides the real status from the client.
 
 ## Request path (chat completions)
 
