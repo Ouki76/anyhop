@@ -492,16 +492,8 @@ pub fn to_chat_request(v: &Value) -> Result<Value, (StatusCode, String)> {
     // Reject what we cannot honour, by name. Dropping `tools` would silently
     // change the meaning of the request; `previous_response_id` is resolved (and
     // replayed) by the handler, so it is not this function's business.
-    if let Some(tools) = v.get("tools")
-        && !is_inert_array(tools)
-    {
-        return Err(unsupported("tools"));
-    }
-    if let Some(choice) = v.get("tool_choice")
-        && !is_inert_tool_choice(choice)
-    {
-        return Err(unsupported("tool_choice"));
-    }
+    let tools = translate_tools(v.get("tools"))?;
+    let tool_choice = translate_tool_choice(v.get("tool_choice"))?;
     if let Some(reasoning) = v.get("reasoning")
         && reasoning
             .as_object()
@@ -553,6 +545,20 @@ pub fn to_chat_request(v: &Value) -> Result<Value, (StatusCode, String)> {
     if let Some(n) = max_tokens {
         chat["max_tokens"] = json!(n);
     }
+    if let Some(tools) = tools {
+        chat["tools"] = tools;
+    }
+    if let Some(choice) = tool_choice {
+        chat["tool_choice"] = choice;
+    }
+    if let Some(p) = v.get("parallel_tool_calls")
+        && !p.is_null()
+    {
+        if p.as_bool().is_none() {
+            return Err(bad_request("'parallel_tool_calls' must be a boolean"));
+        }
+        chat["parallel_tool_calls"] = p.clone();
+    }
     if let Some(t) = v.get("temperature")
         && !t.is_null()
     {
@@ -574,14 +580,93 @@ pub fn to_chat_request(v: &Value) -> Result<Value, (StatusCode, String)> {
     Ok(chat)
 }
 
+/// Responses `tools` -> chat-completions `tools`.
+///
+/// The function shape differs (Responses puts `name`/`parameters` at the top of the
+/// tool object, chat nests them under `function`), and only function tools can be
+/// forwarded: a hosted tool (`web_search`, `file_search`, `code_interpreter`) runs
+/// on the provider's side, so silently dropping it would change what the model was
+/// asked to do.
+fn translate_tools(tools: Option<&Value>) -> Result<Option<Value>, (StatusCode, String)> {
+    let Some(tools) = tools else { return Ok(None) };
+    if is_inert_array(tools) {
+        return Ok(None);
+    }
+    let Some(arr) = tools.as_array() else {
+        return Err(bad_request("'tools' must be an array"));
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for t in arr {
+        let ty = t.get("type").and_then(Value::as_str).unwrap_or("function");
+        if ty != "function" {
+            return Err(bad_request(format!(
+                "'tools' entry of type '{ty}' is not supported by this gateway (only function tools)"
+            )));
+        }
+        let name = t
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| bad_request("each function tool needs a 'name'"))?;
+        let mut f = json!({"name": name});
+        if let Some(d) = t.get("description").filter(|d| !d.is_null()) {
+            f["description"] = d.clone();
+        }
+        if let Some(p) = t.get("parameters").filter(|p| !p.is_null()) {
+            f["parameters"] = p.clone();
+        }
+        if let Some(st) = t.get("strict").filter(|s| !s.is_null()) {
+            f["strict"] = st.clone();
+        }
+        out.push(json!({"type": "function", "function": f}));
+    }
+    Ok(Some(json!(out)))
+}
+
+/// Responses `tool_choice` -> chat `tool_choice`.
+fn translate_tool_choice(choice: Option<&Value>) -> Result<Option<Value>, (StatusCode, String)> {
+    let Some(choice) = choice else {
+        return Ok(None);
+    };
+    if choice.is_null() {
+        return Ok(None);
+    }
+    if let Some(s) = choice.as_str() {
+        return match s {
+            "auto" | "none" | "required" => Ok(Some(json!(s))),
+            other => Err(bad_request(format!(
+                "unsupported 'tool_choice' value '{other}'"
+            ))),
+        };
+    }
+    // A named function: {"type":"function","name":"lookup"} -> nested form.
+    if let Some(obj) = choice.as_object() {
+        let ty = obj
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function");
+        if ty != "function" {
+            return Err(bad_request(format!(
+                "'tool_choice' of type '{ty}' is not supported by this gateway"
+            )));
+        }
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| bad_request("'tool_choice' function needs a 'name'"))?;
+        return Ok(Some(
+            json!({"type": "function", "function": {"name": name}}),
+        ));
+    }
+    Err(bad_request("'tool_choice' must be a string or an object"))
+}
+
 /// A field whose only meaningful value is "nothing": `null` or an empty array.
 fn is_inert_array(v: &Value) -> bool {
     v.is_null() || v.as_array().is_some_and(Vec::is_empty)
-}
-
-/// `auto`/`none` are what the client sends when it has no tool preference at all.
-fn is_inert_tool_choice(v: &Value) -> bool {
-    v.is_null() || matches!(v.as_str(), Some("auto" | "none"))
 }
 
 /// The default text format carries no constraint; anything else is a request for
@@ -683,9 +768,100 @@ fn push_input_item(
             out.push(user_message(text));
             Ok(())
         }
+        // The tool-call half of a turn: what the model asked for last time. Chat
+        // wants it on an assistant message with `tool_calls`; consecutive calls are
+        // one assistant turn, so they are merged.
+        "function_call" => {
+            let name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| bad_request("'function_call' item needs a 'name'"))?;
+            let arguments = stringify_arguments(obj.get("arguments"));
+            charge_input(used, arguments.len())?;
+            let call_id = obj
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| random_id("call_"));
+            let call = json!({
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            });
+            match out.last_mut() {
+                Some(last)
+                    if last.get("role").and_then(Value::as_str) == Some("assistant")
+                        && last.get("tool_calls").is_some() =>
+                {
+                    if let Some(arr) = last.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                        arr.push(call);
+                    }
+                }
+                _ => out.push(json!({
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [call],
+                })),
+            }
+            Ok(())
+        }
+        // The tool's answer, which chat carries as a `tool` role message.
+        "function_call_output" => {
+            let call_id = obj
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| bad_request("'function_call_output' item needs a 'call_id'"))?;
+            let output = flatten_tool_output(obj.get("output"));
+            charge_input(used, output.len())?;
+            out.push(json!({"role": "tool", "tool_call_id": call_id, "content": output}));
+            Ok(())
+        }
+        // Reasoning items are the model's own scratchpad and have no chat
+        // equivalent. They appear in the history DSH replays, so dropping them keeps
+        // a tool-using conversation working; rejecting the turn would be worse.
+        "reasoning" => {
+            debug!("dropping a 'reasoning' input item (no chat equivalent)");
+            Ok(())
+        }
         other => Err(bad_request(format!(
             "'input' item type '{other}' is not supported"
         ))),
+    }
+}
+
+/// Tool arguments, which Responses sends as a JSON *string* but a hand-written
+/// client may send as an object.
+fn stringify_arguments(v: Option<&Value>) -> String {
+    match v {
+        None | Some(Value::Null) => "{}".to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// A tool's output: a string, or an array of content parts (`input_text`).
+fn flatten_tool_output(v: Option<&Value>) -> String {
+    match v {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => {
+            let mut out = String::new();
+            for p in parts {
+                if let Some(t) = p.get("text").and_then(Value::as_str).or_else(|| p.as_str()) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(t);
+                }
+            }
+            out
+        }
+        Some(other) => other.to_string(),
     }
 }
 
@@ -786,12 +962,90 @@ fn usage_pair(chat: &Value) -> (u64, u64) {
 
 /// Build the `response` object: the non-stream body and the payload of
 /// `response.completed` are the same thing on purpose, so a client sees one shape.
+/// One tool call the model asked for.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ToolCall {
+    /// Upstream call id (`call_…`), echoed back so the client can answer it.
+    id: String,
+    name: String,
+    /// Raw JSON string, exactly as the model produced it.
+    arguments: String,
+}
+
+/// Read the tool calls out of a chat `choices[0].message`.
+fn tool_calls_of(message: &Value) -> Vec<ToolCall> {
+    let Some(arr) = message.get("tool_calls").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|t| {
+            let f = t.get("function")?;
+            let name = f.get("name").and_then(Value::as_str)?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(ToolCall {
+                id: t
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                name: name.to_string(),
+                arguments: stringify_arguments(f.get("arguments")),
+            })
+        })
+        .collect()
+}
+
+/// The Responses `output` array: an assistant message when there is text, then one
+/// `function_call` item per tool call.
+fn output_items(item_id: &str, text: &str, calls: &[ToolCall]) -> Vec<Value> {
+    let mut out = Vec::new();
+    if !text.is_empty() {
+        out.push(json!({
+            "type": "message",
+            "id": item_id,
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }));
+    }
+    for c in calls {
+        let call_id = if c.id.is_empty() {
+            random_id("call_")
+        } else {
+            c.id.clone()
+        };
+        out.push(json!({
+            "type": "function_call",
+            "id": random_id("fc_"),
+            "call_id": call_id,
+            "name": c.name,
+            "arguments": c.arguments,
+            "status": "completed",
+        }));
+    }
+    if out.is_empty() {
+        // An empty answer still owes one item: clients index into `output`.
+        out.push(json!({
+            "type": "message",
+            "id": item_id,
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "", "annotations": []}],
+        }));
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn response_object(
     id: &str,
     created_at: u64,
     model: &str,
     item_id: &str,
     text: &str,
+    calls: &[ToolCall],
     usage: (u64, u64),
     previous_response_id: Option<&str>,
 ) -> Value {
@@ -805,13 +1059,7 @@ fn response_object(
         // The turn this one continues, exactly as the client sent it (null for a
         // fresh conversation), so a client can chain without bookkeeping.
         "previous_response_id": previous_response_id,
-        "output": [{
-            "type": "message",
-            "id": item_id,
-            "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": text, "annotations": []}],
-        }],
+        "output": output_items(item_id, text, calls),
         // Convenience field the official SDK reads without walking `output`.
         "output_text": text,
         "usage": {
@@ -840,10 +1088,15 @@ async fn non_stream_response(resp: Response, ctx: &ResponseContext) -> Response 
             "upstream_error",
         );
     };
-    let text = chat
-        .pointer("/choices/0/message/content")
+    let message = chat
+        .pointer("/choices/0/message")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let text = message
+        .get("content")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let calls = tool_calls_of(&message);
     let id = random_id("resp_");
     let created_at = unix_now();
     let usage = usage_pair(&chat);
@@ -855,6 +1108,7 @@ async fn non_stream_response(resp: Response, ctx: &ResponseContext) -> Response 
         &ctx.model,
         &random_id("msg_"),
         text,
+        &calls,
         usage,
         ctx.previous_response_id.as_deref(),
     ))
@@ -902,6 +1156,13 @@ struct StreamMapper {
     /// Last `finish_reason` seen upstream, so a cut-off generation is reported as
     /// `incomplete` instead of a clean, complete answer.
     finish_reason: Option<String>,
+    /// Tool calls being streamed, indexed by the upstream `index`.
+    tool_calls: Vec<ToolCall>,
+    /// How many tool-call items were announced, and their element ids (the compact
+    /// `function_call` item carries an `fc_…` id of its own).
+    tool_items: Vec<(String, String)>,
+    /// Whether the `output_item.added` frame for a tool index was sent.
+    announced: Vec<bool>,
     sequence: u64,
 }
 
@@ -919,6 +1180,9 @@ impl StreamMapper {
             completed: false,
             ok: false,
             finish_reason: None,
+            tool_calls: Vec::new(),
+            tool_items: Vec::new(),
+            announced: Vec::new(),
             sequence: 0,
         }
     }
@@ -1003,14 +1267,14 @@ impl StreamMapper {
         {
             self.finish_reason = Some(reason.to_string());
         }
+        let mut out = self.feed_tool_calls(&chunk);
         let delta = chunk
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
             .unwrap_or_default();
         if delta.is_empty() {
-            return Vec::new();
+            return out;
         }
-        let mut out = Vec::new();
         if !self.item_added {
             self.item_added = true;
             out.push(self.item_added_event());
@@ -1027,6 +1291,100 @@ impl StreamMapper {
             }),
         ));
         out
+    }
+
+    /// Chat streams tool calls as `delta.tool_calls[{index,id,function:{name,
+    /// arguments}}]`, split across chunks. Responses wants one `function_call` item
+    /// announced up front, then an arguments delta per chunk.
+    fn feed_tool_calls(&mut self, chunk: &Value) -> Vec<Bytes> {
+        let Some(calls) = chunk
+            .pointer("/choices/0/delta/tool_calls")
+            .and_then(Value::as_array)
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for call in calls {
+            let idx = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            while self.tool_calls.len() <= idx {
+                self.tool_calls.push(ToolCall::default());
+                self.tool_items.push((random_id("fc_"), random_id("call_")));
+            }
+            {
+                let tc = &mut self.tool_calls[idx];
+                if let Some(id) = call.get("id").and_then(Value::as_str)
+                    && !id.is_empty()
+                {
+                    tc.id = id.to_string();
+                }
+                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                    tc.name.push_str(name);
+                }
+            }
+            // Announce the item once the name is known, so the client sees a
+            // complete `function_call` item rather than a nameless one.
+            if !self.tool_calls[idx].name.is_empty() && !self.item_announced(idx) {
+                self.mark_announced(idx);
+                let (item_id, call_id) = self.tool_items[idx].clone();
+                let call_id = if self.tool_calls[idx].id.is_empty() {
+                    call_id
+                } else {
+                    self.tool_calls[idx].id.clone()
+                };
+                out.push(self.emit(
+                    "response.output_item.added",
+                    json!({
+                        "output_index": self.output_index(idx),
+                        "item": {
+                            "type": "function_call",
+                            "id": item_id,
+                            "call_id": call_id,
+                            "name": self.tool_calls[idx].name,
+                            "arguments": "",
+                            "status": "in_progress",
+                        },
+                    }),
+                ));
+            }
+            let args = call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !args.is_empty() {
+                let (item_id, _) = self.tool_items[idx].clone();
+                self.tool_calls[idx].arguments.push_str(args);
+                out.push(self.emit(
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": self.output_index(idx),
+                        "delta": args,
+                    }),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Index of the message item: it is emitted lazily, so the tool items have to
+    /// start after it when text already arrived.
+    fn output_index(&self, tool_idx: usize) -> usize {
+        if self.item_added {
+            tool_idx + 1
+        } else {
+            tool_idx
+        }
+    }
+
+    fn item_announced(&self, idx: usize) -> bool {
+        self.announced.get(idx).copied().unwrap_or(false)
+    }
+
+    fn mark_announced(&mut self, idx: usize) {
+        while self.announced.len() <= idx {
+            self.announced.push(false);
+        }
+        self.announced[idx] = true;
     }
 
     /// Append a delta to the accumulated reply, stopping at [`MAX_OUTPUT_TEXT`].
@@ -1056,29 +1414,70 @@ impl StreamMapper {
         // From here on the reply is real: the relay stores it.
         self.ok = true;
         let mut out = Vec::new();
-        if !self.item_added {
-            // An empty completion still owes one output item, otherwise the
-            // events below would reference an item the client never saw.
-            self.item_added = true;
-            out.push(self.item_added_event());
+        let text = self.text.clone();
+        let has_tools = !self.tool_calls.is_empty();
+        // A tool-only turn has no message item: announcing one with empty text
+        // would make the client render an empty bubble next to the call.
+        if !has_tools || !text.is_empty() {
+            if !self.item_added {
+                // An empty completion still owes one output item, otherwise the
+                // events below would reference an item the client never saw.
+                self.item_added = true;
+                out.push(self.item_added_event());
+            }
+            let item_id = self.item_id.clone();
+            out.push(self.emit(
+                "response.output_text.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": text,
+                }),
+            ));
+        }
+        // Close every function_call item: arguments, then the item itself.
+        for idx in 0..self.tool_calls.len() {
+            let (item_id, fallback_call) = self.tool_items[idx].clone();
+            let call_id = if self.tool_calls[idx].id.is_empty() {
+                fallback_call
+            } else {
+                self.tool_calls[idx].id.clone()
+            };
+            let name = self.tool_calls[idx].name.clone();
+            let args = self.tool_calls[idx].arguments.clone();
+            let output_index = self.output_index(idx);
+            out.push(self.emit(
+                "response.function_call_arguments.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "arguments": args,
+                }),
+            ));
+            out.push(self.emit(
+                "response.output_item.done",
+                json!({
+                    "output_index": output_index,
+                    "item": {
+                        "type": "function_call",
+                        "id": item_id,
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": args,
+                        "status": "completed",
+                    },
+                }),
+            ));
         }
         let item_id = self.item_id.clone();
-        let text = self.text.clone();
-        out.push(self.emit(
-            "response.output_text.done",
-            json!({
-                "item_id": item_id,
-                "output_index": 0,
-                "content_index": 0,
-                "text": text,
-            }),
-        ));
         let mut resp = response_object(
             &self.resp_id,
             self.created_at,
             &self.model,
             &item_id,
             &text,
+            &self.tool_calls,
             self.usage,
             self.previous_response_id.as_deref(),
         );
@@ -1370,11 +1769,13 @@ mod tests {
     fn unsupported_fields_are_rejected_by_name() {
         let cases = [
             (
-                json!({"model": "m", "input": "hi", "tools": [{"type": "function", "name": "f"}]}),
+                // A hosted tool runs on the provider's side: forwarding the name
+                // without the service would change what the model was asked to do.
+                json!({"model": "m", "input": "hi", "tools": [{"type": "web_search"}]}),
                 "tools",
             ),
             (
-                json!({"model": "m", "input": "hi", "tool_choice": "required"}),
+                json!({"model": "m", "input": "hi", "tool_choice": {"type": "web_search"}}),
                 "tool_choice",
             ),
             (
@@ -1394,6 +1795,98 @@ mod tests {
                 "message '{message}' must name the field '{field}'"
             );
         }
+    }
+
+    /// Function tools are translated to the chat shape and the turn's tool calls
+    /// are replayed as the assistant/tool messages chat expects — this is what a
+    /// tool-using client (DSH among them) sends on every follow-up turn.
+    #[test]
+    fn function_tools_and_call_history_are_translated() {
+        let chat = to_chat_request(&json!({
+            "model": "m",
+            "instructions": "be brief",
+            "tools": [
+                {"type": "function", "name": "lookup", "description": "find",
+                 "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+                 "strict": true},
+                {"type": "function", "name": "save", "parameters": {"type": "object"}}
+            ],
+            "tool_choice": {"type": "function", "name": "lookup"},
+            "parallel_tool_calls": false,
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "find it"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{\"q\":\"x\"}"},
+                {"type": "function_call", "call_id": "call_2", "name": "save", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "found"},
+                {"type": "function_call_output", "call_id": "call_2",
+                 "output": [{"type": "input_text", "text": "saved"}]},
+                {"type": "reasoning", "summary": []}
+            ]
+        }))
+        .expect("tool requests are supported");
+
+        assert_eq!(chat["tools"][0]["type"], "function");
+        assert_eq!(chat["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(chat["tools"][0]["function"]["strict"], true);
+        assert_eq!(chat["tools"][1]["function"]["name"], "save");
+        assert_eq!(chat["tool_choice"]["function"]["name"], "lookup");
+        assert_eq!(chat["parallel_tool_calls"], false);
+
+        let msgs = chat["messages"].as_array().expect("messages");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        // Consecutive function calls become ONE assistant turn with two tool calls.
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(msgs[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            msgs[2]["tool_calls"][0]["function"]["arguments"],
+            "{\"q\":\"x\"}"
+        );
+        // …and the outputs are tool messages, in order, with their text flattened.
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_call_id"], "call_1");
+        assert_eq!(msgs[3]["content"], "found");
+        assert_eq!(msgs[4]["role"], "tool");
+        assert_eq!(msgs[4]["content"], "saved");
+        // The reasoning item is dropped, not fatal.
+        assert_eq!(msgs.len(), 5);
+    }
+
+    /// A finish with tool calls must produce `function_call` items, not an empty
+    /// message — that is what the client renders as a call it can answer.
+    #[test]
+    fn a_tool_call_turn_is_reported_as_function_call_items() {
+        let calls = vec![ToolCall {
+            id: "call_9".into(),
+            name: "lookup".into(),
+            arguments: "{\"q\":\"x\"}".into(),
+        }];
+        let out = response_object("resp_1", 1, "m", "msg_1", "", &calls, (5, 2), None);
+        let items = out["output"].as_array().expect("output");
+        assert_eq!(items.len(), 1, "{out}");
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["call_id"], "call_9");
+        assert_eq!(items[0]["name"], "lookup");
+        assert_eq!(items[0]["arguments"], "{\"q\":\"x\"}");
+        assert_eq!(items[0]["status"], "completed");
+        assert_eq!(out["output_text"], "");
+
+        // Text plus a call: message first, then the call.
+        let out = response_object(
+            "resp_1",
+            1,
+            "m",
+            "msg_1",
+            "let me look",
+            &calls,
+            (5, 2),
+            None,
+        );
+        let items = out["output"].as_array().expect("output");
+        assert_eq!(items.len(), 2, "{out}");
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[1]["type"], "function_call");
     }
 
     #[test]
@@ -1749,6 +2242,7 @@ mod tests {
             "m",
             "msg_abc",
             text,
+            &[],
             usage_pair(&chat),
             None,
         );
@@ -1846,6 +2340,52 @@ mod tests {
                 "response.completed",
             ]
         );
+    }
+
+    /// The streaming half of a tool turn: the `function_call` item is announced,
+    /// its arguments arrive as deltas, and the terminal event carries the item.
+    #[test]
+    fn streamed_tool_calls_become_function_call_events() {
+        let mut mapper = StreamMapper::new("m".to_string(), None);
+        let mut frames = mapper.start();
+        frames.extend(mapper.feed(
+            br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"lookup","arguments":"{\"q\":"}}]}}]}"#,
+        ));
+        frames.extend(mapper.feed(
+            br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        ));
+        frames.extend(mapper.feed(b"[DONE]"));
+
+        assert_eq!(
+            event_names(&frames),
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        // Announced once, with the id and the name the client must answer.
+        let added = data_of(&frames[1]);
+        assert_eq!(added["item"]["type"], "function_call");
+        assert_eq!(added["item"]["call_id"], "call_a");
+        assert_eq!(added["item"]["name"], "lookup");
+        // Deltas carry the fragments; the done frame carries the whole string.
+        assert_eq!(data_of(&frames[2])["delta"], "{\"q\":");
+        assert_eq!(data_of(&frames[3])["delta"], "\"x\"}");
+        assert_eq!(data_of(&frames[4])["arguments"], "{\"q\":\"x\"}");
+        // And the terminal response lists the call as an output item.
+        let completed = data_of(frames.last().expect("terminal frame"));
+        let output = completed["response"]["output"].as_array().expect("output");
+        assert_eq!(output.len(), 1, "{completed}");
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[0]["call_id"], "call_a");
+        assert_eq!(output[0]["arguments"], "{\"q\":\"x\"}");
+        // No empty message item was invented for a tool-only turn.
+        assert!(output.iter().all(|i| i["type"] != "message"), "{completed}");
     }
 
     #[test]
@@ -2264,7 +2804,7 @@ mod tests {
         let usage = usage_pair(&chat);
         assert_eq!(usage, (u64::MAX, 1));
 
-        let out = response_object("resp_x", 0, "m", "msg_x", "hi", usage, None);
+        let out = response_object("resp_x", 0, "m", "msg_x", "hi", &[], usage, None);
         assert_eq!(out["usage"]["input_tokens"], json!(u64::MAX));
         assert_eq!(out["usage"]["output_tokens"], json!(1));
         assert_eq!(out["usage"]["total_tokens"], json!(u64::MAX));

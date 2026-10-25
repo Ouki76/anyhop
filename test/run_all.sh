@@ -191,6 +191,16 @@ RID=$(curl -s --max-time 15 "$BASE/v1/responses" -H "$AUTH" -H "$CT" \
     -d '{"model":"mock/test-model","input":"hi","store":false}' \
     | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
 [ -n "$RID" ] && ok "store:false still returns an id ($RID)" || fail "store:false returned no id"
+# Function tools: the request carries a tool definition (chat-nested upstream) and
+# the answer comes back as a `function_call` output item, not as text.
+TOOLS=$(curl -s --max-time 15 "$BASE/v1/responses" -H "$AUTH" -H "$CT" \
+  -d '{"model":"mock/test-model","input":"find it","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"auto"}')
+echo "$TOOLS" | grep -q '"type": *"function_call"' \
+  && ok "/v1/responses translates function tools (function_call item)" \
+  || fail "responses tools: $(echo "$TOOLS" | head -c 200)"
+echo "$TOOLS" | grep -q '"call_id": *"call_mock1"' \
+  && ok "/v1/responses keeps the upstream call_id" \
+  || fail "responses call_id: $(echo "$TOOLS" | head -c 200)"
 CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$BASE/v1/responses" -H "$AUTH" -H "$CT" \
     -d "{\"model\":\"mock/test-model\",\"input\":\"again\",\"previous_response_id\":\"$RID\"}")
 [ "$CODE" = 400 ] && ok "an unstored response cannot be chained" || fail "store:false id was replayable ($CODE)"

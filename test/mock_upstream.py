@@ -67,6 +67,43 @@ class H(BaseHTTPRequestHandler):
                 "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
             }).encode())
             return
+        if body.get("tools"):
+            # A tool turn: the model asks for a function call instead of text.
+            call_id = "call_mock1"
+            msg = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": call_id, "type": "function",
+                    "function": {"name": body["tools"][0]["function"]["name"],
+                                 "arguments": '{"q":"x"}'},
+                }],
+            }
+            if body.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for ev in (
+                    {"choices": [{"delta": {"tool_calls": [
+                        {"index": 0, "id": call_id,
+                         "function": {"name": msg["tool_calls"][0]["function"]["name"],
+                                      "arguments": ""}}]}}]},
+                    {"choices": [{"delta": {"tool_calls": [
+                        {"index": 0, "function": {"arguments": '{"q":"x"}'}}]}}]},
+                    {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+                ):
+                    self.wfile.write(b"data: " + json.dumps(ev).encode() + b"\n\n")
+                self.wfile.write(b"data: [DONE]\n\n")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "id": "chatcmpl-mock", "object": "chat.completion", "model": body.get("model"),
+                "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
+            }).encode())
+            return
         if body.get("stream"):
             # Real SSE framing so streaming pass-through is actually exercised.
             self.send_response(200)
