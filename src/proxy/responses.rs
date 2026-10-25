@@ -159,6 +159,7 @@ pub async fn responses(
         provider,
         previous_response_id: previous.as_ref().map(|p| p.id.clone()),
         store,
+        metadata: req.get("metadata").cloned().unwrap_or(Value::Null),
         storage: storage.cloned(),
         owner,
     };
@@ -182,6 +183,8 @@ struct ResponseContext {
     /// `store: false` on the request: never persist this response, and say so in
     /// the answer. OpenAI's default is `true`, so only an explicit false opts out.
     store: bool,
+    /// `metadata` as the client sent it, echoed back on the response object.
+    metadata: Value,
     /// `None` when the feature is off (no state file, or a zero cap).
     storage: Option<Storage>,
     /// The client key that owns the record this request stores.
@@ -197,7 +200,14 @@ struct ResponseContext {
 impl ResponseContext {
     /// Keep a completed response so the next turn can chain to it. Silent no-op
     /// when the store is off — the client just sees `previous_response_id: null`.
-    fn persist(&self, id: &str, created_at: u64, text: &str, usage: (u64, u64)) {
+    fn persist(
+        &self,
+        id: &str,
+        created_at: u64,
+        text: &str,
+        calls: &[ToolCall],
+        usage: (u64, u64),
+    ) {
         if !self.store {
             return;
         }
@@ -214,6 +224,16 @@ impl ResponseContext {
                 provider: self.provider.clone(),
                 input: self.input.clone(),
                 output_text: text.to_string(),
+                tool_calls: calls
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": {"name": c.name, "arguments": c.arguments},
+                        })
+                    })
+                    .collect(),
                 usage: Some(json!({
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -296,7 +316,22 @@ pub fn replay_history(chat: &mut Value, prev: &StoredResponse) {
         Value::String(s) => messages.push(user_message(s)),
         _ => {}
     }
-    messages.push(json!({"role": "assistant", "content": prev.output_text}));
+    // The assistant turn that produced the calls: without `tool_calls` on it, the
+    // client's `tool` messages in the next request have no call to answer and the
+    // upstream rejects the whole conversation.
+    if prev.tool_calls.is_empty() {
+        messages.push(json!({"role": "assistant", "content": prev.output_text}));
+    } else {
+        messages.push(json!({
+            "role": "assistant",
+            "content": if prev.output_text.is_empty() {
+                Value::Null
+            } else {
+                Value::String(prev.output_text.clone())
+            },
+            "tool_calls": prev.tool_calls,
+        }));
+    }
     if let Some(new) = chat.get("messages").and_then(Value::as_array) {
         messages.extend(new.iter().cloned());
     }
@@ -985,6 +1020,16 @@ fn usage_pair(chat: &Value) -> (u64, u64) {
 
 /// Build the `response` object: the non-stream body and the payload of
 /// `response.completed` are the same thing on purpose, so a client sees one shape.
+/// The request fields a client expects to read back on the response object:
+/// `store` (whether the turn was persisted) and `metadata` (whatever it sent).
+fn with_request_fields(mut v: Value, store: bool, metadata: &Value) -> Value {
+    v["store"] = json!(store);
+    if !metadata.is_null() {
+        v["metadata"] = metadata.clone();
+    }
+    v
+}
+
 /// One tool call the model asked for.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct ToolCall {
@@ -1124,16 +1169,20 @@ async fn non_stream_response(resp: Response, ctx: &ResponseContext) -> Response 
     let created_at = unix_now();
     let usage = usage_pair(&chat);
     // Batched write: the client is not made to wait for the state file.
-    ctx.persist(&id, created_at, text, usage);
-    Json(response_object(
-        &id,
-        created_at,
-        &ctx.model,
-        &random_id("msg_"),
-        text,
-        &calls,
-        usage,
-        ctx.previous_response_id.as_deref(),
+    ctx.persist(&id, created_at, text, &calls, usage);
+    Json(with_request_fields(
+        response_object(
+            &id,
+            created_at,
+            &ctx.model,
+            &random_id("msg_"),
+            text,
+            &calls,
+            usage,
+            ctx.previous_response_id.as_deref(),
+        ),
+        ctx.store,
+        &ctx.metadata,
     ))
     .into_response()
 }
@@ -1166,6 +1215,10 @@ struct StreamMapper {
     created_at: u64,
     /// Echoed in every snapshot of the response object.
     previous_response_id: Option<String>,
+    /// `store` as the client asked for it, echoed back.
+    store: bool,
+    /// `metadata` as the client sent it, echoed back.
+    metadata: Value,
     text: String,
     usage: (u64, u64),
     /// `output_item.added` is emitted lazily, right before the first delta.
@@ -1190,13 +1243,20 @@ struct StreamMapper {
 }
 
 impl StreamMapper {
-    fn new(model: String, previous_response_id: Option<String>) -> Self {
+    fn new(
+        model: String,
+        previous_response_id: Option<String>,
+        store: bool,
+        metadata: Value,
+    ) -> Self {
         Self {
             resp_id: random_id("resp_"),
             item_id: random_id("msg_"),
             model,
             created_at: unix_now(),
             previous_response_id,
+            store,
+            metadata,
             text: String::new(),
             usage: (0, 0),
             item_added: false,
@@ -1223,20 +1283,24 @@ impl StreamMapper {
 
     fn snapshot(&self, status: &str, output: Value) -> Value {
         let (input_tokens, output_tokens) = self.usage;
-        json!({
-            "id": self.resp_id,
-            "object": "response",
-            "created_at": self.created_at,
-            "status": status,
-            "model": self.model,
-            "previous_response_id": self.previous_response_id.as_deref(),
-            "output": output,
-            "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": input_tokens.saturating_add(output_tokens),
-            },
-        })
+        with_request_fields(
+            json!({
+                "id": self.resp_id,
+                "object": "response",
+                "created_at": self.created_at,
+                "status": status,
+                "model": self.model,
+                "previous_response_id": self.previous_response_id.as_deref(),
+                "output": output,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens.saturating_add(output_tokens),
+                },
+            }),
+            self.store,
+            &self.metadata,
+        )
     }
 
     fn item_added_event(&mut self) -> Bytes {
@@ -1494,15 +1558,19 @@ impl StreamMapper {
             ));
         }
         let item_id = self.item_id.clone();
-        let mut resp = response_object(
-            &self.resp_id,
-            self.created_at,
-            &self.model,
-            &item_id,
-            &text,
-            &self.tool_calls,
-            self.usage,
-            self.previous_response_id.as_deref(),
+        let mut resp = with_request_fields(
+            response_object(
+                &self.resp_id,
+                self.created_at,
+                &self.model,
+                &item_id,
+                &text,
+                &self.tool_calls,
+                self.usage,
+                self.previous_response_id.as_deref(),
+            ),
+            self.store,
+            &self.metadata,
         );
         // `finish_reason: "length"` means the provider stopped at the token cap.
         // Reporting it as `completed` hid a cut-off answer from every client that
@@ -1552,7 +1620,12 @@ struct StreamState {
 /// The key guard lives inside the upstream body, so it keeps the in-flight slot
 /// until this stream is dropped — no extra bookkeeping needed here.
 fn sse_response(resp: Response, ctx: ResponseContext) -> Response {
-    let mut mapper = StreamMapper::new(ctx.model.clone(), ctx.previous_response_id.clone());
+    let mut mapper = StreamMapper::new(
+        ctx.model.clone(),
+        ctx.previous_response_id.clone(),
+        ctx.store,
+        ctx.metadata.clone(),
+    );
     let queue: VecDeque<Bytes> = mapper.start().into();
     let state = StreamState {
         upstream: Box::pin(resp.into_body().into_data_stream()),
@@ -1577,6 +1650,7 @@ fn sse_response(resp: Response, ctx: ResponseContext) -> Response {
                     &st.mapper.resp_id,
                     st.mapper.created_at,
                     &st.mapper.text,
+                    &st.mapper.tool_calls,
                     st.mapper.usage,
                 );
             }
@@ -1655,6 +1729,7 @@ mod tests {
             provider: "test".to_string(),
             previous_response_id: previous.map(str::to_string),
             store: true,
+            metadata: Value::Null,
             storage: None,
             owner: None,
         }
@@ -1683,6 +1758,7 @@ mod tests {
                 {"role": "user", "content": "hi"}
             ]),
             output_text: "hello".to_string(),
+            tool_calls: Vec::new(),
             usage: None,
             owner: None,
         }
@@ -1906,6 +1982,62 @@ mod tests {
         assert_eq!(items.len(), 2, "{out}");
         assert_eq!(items[0]["type"], "message");
         assert_eq!(items[1]["type"], "function_call");
+    }
+
+    /// `store` and `metadata` come back on the response object: a client that sent
+    /// them reads them back to know whether the turn is chainable and to correlate
+    /// its own bookkeeping.
+    #[test]
+    fn store_and_metadata_are_echoed() {
+        let v = with_request_fields(
+            response_object("resp_1", 1, "m", "msg_1", "hi", &[], (1, 1), None),
+            false,
+            &json!({"trace": "abc"}),
+        );
+        assert_eq!(v["store"], false);
+        assert_eq!(v["metadata"]["trace"], "abc");
+
+        // Absent metadata stays absent instead of becoming `null`.
+        let v = with_request_fields(
+            response_object("resp_1", 1, "m", "msg_1", "hi", &[], (1, 1), None),
+            true,
+            &Value::Null,
+        );
+        assert_eq!(v["store"], true);
+        assert!(v.get("metadata").is_none(), "{v}");
+    }
+
+    /// A chained tool conversation: the replayed assistant turn must carry the
+    /// `tool_calls` it made, otherwise the client's `tool` messages answer a call
+    /// the model never sees and the upstream rejects the request.
+    #[test]
+    fn replay_keeps_the_assistant_tool_calls() {
+        let mut prev = stored("resp_1", 1);
+        prev.output_text = String::new();
+        prev.tool_calls = vec![json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+        })];
+        // The follow-up turn is just the tool's answer: the client already sent
+        // the user message on the earlier turn.
+        let mut chat = json!({"messages": [
+            {"role": "tool", "tool_call_id": "call_1", "content": "100"}
+        ]});
+        replay_history(&mut chat, &prev);
+
+        let msgs = chat["messages"].as_array().expect("messages");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        // The assistant turn that asked for the call, with content null.
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], Value::Null);
+        assert_eq!(msgs[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "lookup");
+        // …and the answer follows it.
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_call_id"], "call_1");
+        assert_eq!(msgs.len(), 4, "{chat}");
     }
 
     /// `reasoning.effort` reaches the upstream as `reasoning_effort`; the
@@ -2176,9 +2308,10 @@ mod tests {
             model: "m".to_string(),
             provider: "mock".to_string(),
             previous_response_id: Some("resp_prev".to_string()),
+            store: true,
+            metadata: Value::Null,
             storage: Some(store.clone()),
             owner: None,
-            store: true,
         };
         let upstream = json!({
             "choices": [{"message": {"role": "assistant", "content": "hello"}}],
@@ -2227,9 +2360,10 @@ mod tests {
             model: "m".to_string(),
             provider: "mock".to_string(),
             previous_response_id: None,
+            store: true,
+            metadata: Value::Null,
             storage: Some(store.clone()),
             owner: None,
-            store: true,
         };
         let upstream = futures::stream::iter(vec![
             Ok::<Bytes, std::io::Error>(Bytes::from_static(
@@ -2319,7 +2453,7 @@ mod tests {
 
     #[test]
     fn chat_deltas_map_to_responses_sse_events() {
-        let mut mapper = StreamMapper::new("m".to_string(), None);
+        let mut mapper = StreamMapper::new("m".to_string(), None, true, Value::Null);
         let mut frames = mapper.start();
         // Role-only and empty deltas must not produce text events.
         frames.extend(mapper.feed(br#"{"choices":[{"delta":{"role":"assistant"}}]}"#));
@@ -2373,7 +2507,7 @@ mod tests {
 
     #[test]
     fn eof_without_done_still_completes_once() {
-        let mut mapper = StreamMapper::new("m".to_string(), None);
+        let mut mapper = StreamMapper::new("m".to_string(), None, true, Value::Null);
         let mut frames = mapper.start();
         frames.extend(mapper.feed(br#"{"choices":[{"delta":{"content":"x"}}]}"#));
         frames.extend(mapper.finish());
@@ -2394,7 +2528,7 @@ mod tests {
     /// its arguments arrive as deltas, and the terminal event carries the item.
     #[test]
     fn streamed_tool_calls_become_function_call_events() {
-        let mut mapper = StreamMapper::new("m".to_string(), None);
+        let mut mapper = StreamMapper::new("m".to_string(), None, true, Value::Null);
         let mut frames = mapper.start();
         frames.extend(mapper.feed(
             br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"lookup","arguments":"{\"q\":"}}]}}]}"#,
@@ -2438,7 +2572,7 @@ mod tests {
 
     #[test]
     fn empty_completion_still_reports_one_item() {
-        let mut mapper = StreamMapper::new("m".to_string(), None);
+        let mut mapper = StreamMapper::new("m".to_string(), None, true, Value::Null);
         let mut frames = mapper.start();
         frames.extend(mapper.feed(b"[DONE]"));
         assert_eq!(
@@ -2455,7 +2589,12 @@ mod tests {
 
     #[test]
     fn streaming_echoes_previous_response_id_in_every_response_object() {
-        let mut mapper = StreamMapper::new("m".to_string(), Some("resp_prev".to_string()));
+        let mut mapper = StreamMapper::new(
+            "m".to_string(),
+            Some("resp_prev".to_string()),
+            true,
+            Value::Null,
+        );
         let mut frames = mapper.start();
         frames.extend(mapper.feed(br#"{"choices":[{"delta":{"content":"x"}}]}"#));
         frames.extend(mapper.finish());
@@ -2473,7 +2612,7 @@ mod tests {
     /// the terminal events still describe valid UTF-8.
     #[test]
     fn the_accumulated_text_stops_at_the_cap_on_a_char_boundary() {
-        let mut mapper = StreamMapper::new("m".to_string(), None);
+        let mut mapper = StreamMapper::new("m".to_string(), None, true, Value::Null);
         let _ = mapper.start();
         // "€" is three bytes, so the cap lands inside a character.
         let big = "€".repeat((MAX_OUTPUT_TEXT / 3) + 1000);
@@ -2513,7 +2652,7 @@ mod tests {
 
     #[test]
     fn a_failed_stream_is_not_stored() {
-        let mut mapper = StreamMapper::new("m".to_string(), None);
+        let mut mapper = StreamMapper::new("m".to_string(), None, true, Value::Null);
         let _ = mapper.start();
         let _ = mapper.feed(br#"{"error":{"message":"boom"}}"#);
         assert!(mapper.completed);
@@ -2597,7 +2736,7 @@ mod tests {
 
     #[test]
     fn upstream_error_frame_ends_the_stream_as_failed() {
-        let mut mapper = StreamMapper::new("m".to_string(), None);
+        let mut mapper = StreamMapper::new("m".to_string(), None, true, Value::Null);
         let mut frames = mapper.start();
         frames.extend(mapper.feed(br#"{"error":{"message":"boom","type":"server_error"}}"#));
         assert_eq!(
@@ -2858,7 +2997,7 @@ mod tests {
         assert_eq!(out["usage"]["total_tokens"], json!(u64::MAX));
 
         // The streaming snapshots sum the same numbers.
-        let mut mapper = StreamMapper::new("m".to_string(), None);
+        let mut mapper = StreamMapper::new("m".to_string(), None, true, Value::Null);
         mapper.usage = usage;
         let snapshot = mapper.snapshot("completed", json!([]));
         assert_eq!(snapshot["usage"]["total_tokens"], json!(u64::MAX));
@@ -2875,11 +3014,12 @@ mod tests {
             model: "m".to_string(),
             provider: "mock".to_string(),
             previous_response_id: None,
+            store: true,
+            metadata: Value::Null,
             storage: Some(store.clone()),
             owner: None,
-            store: true,
         };
-        ctx.persist("resp_huge", 1, "hi", (u64::MAX, 1));
+        ctx.persist("resp_huge", 1, "hi", &[], (u64::MAX, 1));
         store.flush_async().await;
         let rec = store
             .load_response("resp_huge")

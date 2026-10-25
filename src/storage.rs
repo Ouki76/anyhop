@@ -129,6 +129,10 @@ pub struct StoredResponse {
     pub input: serde_json::Value,
     /// The assistant text.
     pub output_text: String,
+    /// Tool calls the assistant made on this turn (chat shape: id/name/arguments),
+    /// replayed with the history so a chained tool conversation stays valid.
+    #[serde(default)]
+    pub tool_calls: Vec<serde_json::Value>,
     /// Usage in Responses naming (`input_tokens`/`output_tokens`/`total_tokens`),
     /// when the provider reported it.
     pub usage: Option<serde_json::Value>,
@@ -1101,6 +1105,7 @@ mod tests {
             provider: "mock".to_string(),
             input: serde_json::json!([{"role": "user", "content": "hi"}]),
             output_text: "there".to_string(),
+            tool_calls: Vec::new(),
             usage: Some(serde_json::json!({
                 "input_tokens": 1,
                 "output_tokens": 1,

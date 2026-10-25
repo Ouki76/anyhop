@@ -1285,6 +1285,12 @@ fn stored_response(v: &Value) -> StoredResponse {
             .and_then(Value::as_str)
             .unwrap_or("previous")
             .to_string(),
+        // Attacker-shaped too: a stored turn may carry tool calls of any shape.
+        tool_calls: v
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
         usage: None,
         owner: None,
     }
