@@ -327,7 +327,16 @@ impl Account {
     }
 
     /// Returns the cloudcode project id, resolving it via loadCodeAssist on first use.
-    pub async fn ensure_project_id(&self, access_token: &str) -> Result<String, AuthError> {
+    ///
+    /// `endpoint` is the provider's configured base URL, not a constant: when the
+    /// operator routes Antigravity through a proxy or a mirror, resolving the
+    /// project against `cloudcode-pa.googleapis.com` directly both bypasses that
+    /// setting and fails on networks where only the proxy is reachable.
+    pub async fn ensure_project_id(
+        &self,
+        access_token: &str,
+        endpoint: &str,
+    ) -> Result<String, AuthError> {
         if let Some(p) = &self.project_id_static {
             return Ok(p.clone());
         }
@@ -338,7 +347,11 @@ impl Account {
 
         let resp = self
             .client
-            .post(format!("{PROD_ENDPOINT}/{API_VERSION}:loadCodeAssist"))
+            .post(format!(
+                "{}/{}:loadCodeAssist",
+                endpoint.trim_end_matches('/'),
+                API_VERSION
+            ))
             .bearer_auth(access_token)
             .header("User-Agent", USER_AGENT)
             .json(&json!({"metadata": {"ideType": "ANTIGRAVITY"}}))
@@ -996,7 +1009,10 @@ async fn finish(p: PendingAuth, code: &str) -> anyhow::Result<AuthOutcome> {
         p.http.clone(),
         std::sync::Arc::new(crate::config::Tuning::default()),
     );
-    let project_id = match account.ensure_project_id(&tokens.access_token).await {
+    let project_id = match account
+        .ensure_project_id(&tokens.access_token, PROD_ENDPOINT)
+        .await
+    {
         Ok(p) => Some(p),
         Err(e) => {
             warn!("project id not resolved: {e} (auto-resolved on first request)");

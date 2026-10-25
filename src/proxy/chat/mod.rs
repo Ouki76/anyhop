@@ -587,7 +587,7 @@ async fn run_target(
                         continue;
                     }
                 };
-                let project = match account.ensure_project_id(&token).await {
+                let project = match account.ensure_project_id(&token, &provider.base_url).await {
                     Ok(p) => p,
                     Err(e) => {
                         let kind = auth_fail_kind(&e);
