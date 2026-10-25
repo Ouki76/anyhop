@@ -13,6 +13,21 @@ commits from a parallel agent landed while the audit ran — `ae418d8` (PKCE),
 `3a0f5cc`/`512ae88`. All numbers below measure the tree at `512ae88` plus this
 document.
 
+## Anti-vacuum evidence for the current checks (2026-10-26)
+
+A green suite proves nothing unless breaking the behaviour turns it red. Two
+mutations were applied to a scratch build and reverted:
+
+| Mutation | Expected | Observed |
+| --- | --- | --- |
+| stop sending `Access-Control-Allow-Origin` from the CORS layer | the two CORS header checks fail | `FAIL cors preflight`, `FAIL cors: no allow-origin on GET` |
+| put the secret back into `GET /api/client-keys` (`key: Some(secret)`) | the client-key suite fails | `FAIL client keys and models access control` |
+
+Both fired; the tree was restored and the suite returned to `58/0/0`.
+
+The same exercise for the older checks is recorded in the audit narrative
+(14 deliberate breaks, each with the failing test named).
+
 ## Why this is measured by analysis + execution
 
 `cargo-llvm-cov` cannot run in this toolchain — there is no `llvm-profdata`
