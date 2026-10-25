@@ -98,6 +98,10 @@ pub struct Provider {
     models_cache: arc_swap::ArcSwap<Option<(Instant, Arc<Vec<String>>)>>,
     /// Optional URL of a richer catalogue to read limits from (`limits_url`).
     limits_url: Option<String>,
+    /// Set once the provider answered 404/405 for `/completions`: FIM requests then
+    /// go straight to the marker path instead of paying a doomed round trip on
+    /// every keystroke.
+    pub no_completions: std::sync::atomic::AtomicBool,
     /// Limits parsed from the last successful catalogue fetch (model id -> limits).
     /// Empty until the first refresh; a provider that publishes numbers is the most
     /// accurate source there is.
@@ -244,6 +248,7 @@ impl Provider {
                 .map(str::trim)
                 .filter(|u| !u.is_empty())
                 .map(str::to_string),
+            no_completions: std::sync::atomic::AtomicBool::new(false),
             ag_accounts,
             codex_accounts,
             models_cache: arc_swap::ArcSwap::from_pointee(None),

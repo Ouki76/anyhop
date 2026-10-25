@@ -17,6 +17,7 @@ pub mod realtime;
 pub mod responses;
 
 pub use access::{combo_allowed, model_allowed, model_disabled};
+pub(crate) use chat::errors::parse_retry_after;
 pub use chat::{chat_completions, run_target_pub};
 // Exposed for `cargo bench` only (hot-path measurement), not part of the HTTP surface.
 pub use chat::session_key;

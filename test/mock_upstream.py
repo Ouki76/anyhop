@@ -17,6 +17,23 @@ class H(BaseHTTPRequestHandler):
         if self.path.endswith("/embeddings"):
             self.embeddings(body, auth)
             return
+        if self.path.endswith("/completions") and not self.path.endswith("/chat/completions"):
+            # Native FIM endpoint (vLLM/SGLang/Together shape): the gateway must
+            # forward `prompt` and `suffix` untouched, so echo back what it got.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "id": "cmpl-mock", "object": "text_completion", "created": 0,
+                "model": body.get("model"),
+                "choices": [{
+                    "index": 0,
+                    "text": "NATIVE:" + str(body.get("prompt", "")) + "|" + str(body.get("suffix", "")),
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }).encode())
+            return
         if "bad-429" in auth:
             self.send_response(429)
             self.send_header("Retry-After", "30")

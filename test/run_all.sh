@@ -221,6 +221,14 @@ echo "$FIM" | grep -q '"choices"' && ok "/v1/fim/completions answers" || fail "f
 FIM2=$(curl -s --max-time 15 "$BASE/v1/completions" -H "$AUTH" -H "$CT" \
     -d '{"model":"mock/test-model","prompt":"def add(a, b):","max_tokens":16}')
 echo "$FIM2" | grep -q '"choices"' && ok "/v1/completions alias answers" || fail "fim alias: $(echo "$FIM2" | head -c 120)"
+# A provider with a real /completions gets the prompt and suffix *verbatim* — no
+# chat wrapping and no post-processing. The mock echoes them back, so the check
+# fails if the gateway starts rewriting FIM requests again.
+FIMN=$(curl -s --max-time 15 "$BASE/v1/fim/completions" -H "$AUTH" -H "$CT" \
+  -d '{"model":"mock/test-model","prompt":"<|fim_prefix|>const x =<|fim_suffix|>;","suffix":";","max_tokens":16}')
+echo "$FIMN" | grep -q '"text": *"NATIVE:<|fim_prefix|>const x =<|fim_suffix|>;|;"' \
+  && ok "fim native pass-through (prompt+suffix untouched)" \
+  || fail "fim native: $(echo "$FIMN" | head -c 160)"
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/fim/completions" -H "$CT" -d '{"model":"mock/test-model","prompt":"x"}')
 [ "$CODE" = 401 ] && ok "fim requires auth" || fail "fim auth: $CODE"
 

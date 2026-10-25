@@ -5,7 +5,7 @@
 //! - `session` — sticky-session hashing
 //! - `stream`  — pass-through, buffering and translated responses
 
-mod errors;
+pub(crate) mod errors;
 mod retry;
 mod session;
 mod stream;
