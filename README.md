@@ -28,6 +28,8 @@ Single binary (~6MB), minimal resource footprint.
   (`[[model_limits]]` or Models → the limits chip on a row, with a per-field **Reset**).
   They are published in `/v1/models` as `context_length` / `max_completion_tokens` /
   `max_input_tokens`, so clients can size their requests without guessing
+
+  ![Model limits editor](docs/img/model-limits.png)
 - **`/v1/models` metadata**: a model id, owner and its limits — served from a
   per-catalogue cache and filtered by the client key's allowlist
 - **Automatic model refresh**: periodic `/models` polling of all providers
