@@ -473,7 +473,7 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                                 }
                             }
                             (if !lim_error.get_clone().is_empty() {
-                                view! { div(class="auth-banner auth-error flush") { (lim_error.get_clone()) } }
+                                view! { div(class="auth-banner auth-error flush", role="alert") { (lim_error.get_clone()) } }
                             } else if lim_saved.get_clone() {
                                 view! { div(class="auth-banner auth-ok flush") { "saved" } }
                             } else {
@@ -690,7 +690,7 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                                 (if combo_error.get_clone().is_empty() {
                                     view! {}
                                 } else {
-                                    view! { div(class="auth-banner auth-error flush") { (combo_error.get_clone()) } }
+                                    view! { div(class="auth-banner auth-error flush", role="alert") { (combo_error.get_clone()) } }
                                 })
                                 div(class="row gap-10 mt-16") {
                                     button(class="btn btn-primary btn-sm", on:click=move |_| {

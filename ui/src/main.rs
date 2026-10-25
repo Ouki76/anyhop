@@ -78,7 +78,10 @@ fn AuthBanner() -> View {
 fn ThemeToggle() -> View {
     let theme = create_signal(current_theme());
     view! {
-        button(class="theme-btn", on:click=move |_| {
+        button(
+            class="theme-btn",
+            aria-label="Switch colour theme",
+            on:click=move |_| {
             let next = if theme.get_clone() == "dark" { "light" } else { "dark" };
             set_theme(next);
             theme.set(next.to_string());
@@ -297,6 +300,8 @@ fn App() -> View {
 
     view! {
         div(class="topbar") {}
+        // Keyboard users can jump past the sidebar: the first Tab lands here.
+        a(class="skip-link", href="#main-content") { "Skip to content" }
         div(class="layout") {
             aside(class="side") {
                 div(class="side-top") {
@@ -308,6 +313,8 @@ fn App() -> View {
                     // above 720px, where the full nav is always visible).
                     button(
                         class=if nav_open.get_clone() { "nav-burger open" } else { "nav-burger" },
+                        aria-label="Toggle navigation",
+                        aria-expanded=if nav_open.get_clone() { "true" } else { "false" },
                         on:click=move |_| nav_open.set(!nav_open.get_clone()),
                     ) {
                         span {}
@@ -316,7 +323,10 @@ fn App() -> View {
                     }
                 }
 
-                nav(class=if nav_open.get_clone() { "side-nav open" } else { "side-nav" }) {
+                nav(
+                    class=if nav_open.get_clone() { "side-nav open" } else { "side-nav" },
+                    aria-label="Dashboard sections",
+                ) {
                     (NAV.iter().map(|(group, items)| {
                         let items_v: Vec<View> = items.iter().map(|(t, label)| {
                             let t = *t;
@@ -324,6 +334,7 @@ fn App() -> View {
                             view! {
                                 button(
                                     class=if tab.get() == t { "nav-item active" } else { "nav-item" },
+                                    aria-current=move || if tab.get() == t { Some("page") } else { None },
                                     on:click=move |_| {
                                         tab.set(t);
                                         nav_open.set(false);
@@ -357,7 +368,7 @@ fn App() -> View {
                 }
             }
 
-            main(class="main") {
+            main(class="main", id="main-content", tabindex="-1") {
                 (if need_auth.get() {
                     view! { AuthBanner() }
                 } else {

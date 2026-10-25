@@ -103,6 +103,14 @@ body {
   transition: color .12s;
 }
 .nav-item:hover { color: var(--fg); }
+/* The nav item spans the sidebar, so an outside ring is clipped at the edges:
+   show keyboard focus as a bar plus a tint instead. */
+.nav-item:focus-visible {
+  outline: none;
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--c3);
+  color: var(--fg);
+}
 .nav-item.active { color: var(--c3); }
 
 /* sidebar footer — endpoint + theme + version, plain mono text */
@@ -579,11 +587,30 @@ a.quota-card { display: block; }
   background: none; border: none; cursor: pointer; padding: 4px 8px;
   font-family: var(--mono); font-size: 11px; text-transform: uppercase;
   letter-spacing: 0.08em; color: var(--dim); border-radius: 5px;
-  opacity: 0; transition: opacity .15s, color .15s, background .15s;
+  /* Visible at rest: a hover-only action is invisible to anyone who does not
+     already know it is there (and to every keyboard user). Hover/focus only
+     strengthens it. */
+  opacity: .62; transition: opacity .15s, color .15s, background .15s;
 }
+.btn-ghost:hover, .btn-ghost:focus-visible { opacity: 1; }
 .btn-ghost:hover { color: var(--c3); background: var(--accent-soft); }
 .btn-ghost-danger:hover { color: var(--red-fg); background: var(--red-bg); }
 @media (hover: none) { .btn-ghost { opacity: 1; } }
+
+/* Keyboard focus must be visible on every interactive element: the dashboard is
+   fully operable from the keyboard, and an invisible focus is a trap. */
+:focus-visible {
+  outline: 2px solid var(--c3);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.skip-link {
+  position: absolute; left: -9999px; top: 8px; z-index: 100;
+  background: var(--panel); color: var(--fg); padding: 8px 14px;
+  border: 1px solid var(--c3); border-radius: 6px;
+  font-family: var(--mono); font-size: 12px;
+}
+.skip-link:focus { left: 16px; }
 
 /* layout utilities */
 .row { display: flex; align-items: center; gap: 8px; }

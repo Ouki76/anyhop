@@ -222,7 +222,7 @@ pub fn ApiKeysTab(
                     }
 
                     (if !copy_status.get_clone().is_empty() {
-                        view! { div(class="auth-banner auth-error flush") { (copy_status.get_clone()) } }
+                        view! { div(class="auth-banner auth-error flush", role="alert") { (copy_status.get_clone()) } }
                     } else {
                         view! {}
                     })
@@ -299,7 +299,7 @@ pub fn ApiKeysTab(
                         button(class="btn", on:click=move |_| show_create.set(false)) { "Cancel" }
                     }
                     (if !create_error.get_clone().is_empty() {
-                        view! { div(class="auth-banner auth-error flush") { (create_error.get_clone()) } }
+                        view! { div(class="auth-banner auth-error flush", role="alert") { (create_error.get_clone()) } }
                     } else {
                         view! {}
                     })

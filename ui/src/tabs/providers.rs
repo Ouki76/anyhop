@@ -450,7 +450,7 @@ pub fn AddProviderModal(
                         }
                     })
                     (if !error.get_clone().is_empty() {
-                        view! { div(class="auth-banner auth-error flush") { (error.get_clone()) } }
+                        view! { div(class="auth-banner auth-error flush", role="alert") { (error.get_clone()) } }
                     } else {
                         view! {}
                     })
@@ -747,7 +747,7 @@ pub fn ProviderSettings(provider: ProviderDto) -> View {
             (if error.get_clone().is_empty() {
                 view! {}
             } else {
-                view! { div(class="auth-banner auth-error flush") { (error.get_clone()) } }
+                view! { div(class="auth-banner auth-error flush", role="alert") { (error.get_clone()) } }
             })
             div(class="card-foot") {
                 button(class="btn btn-primary", on:click=move |_| {
@@ -936,7 +936,7 @@ pub fn AddKeyForm(provider: String) -> View {
                 });
             }) { "Add" }
             (if !error.get_clone().is_empty() {
-                view! { div(class="auth-banner auth-error flush") { (error.get_clone()) } }
+                view! { div(class="auth-banner auth-error flush", role="alert") { (error.get_clone()) } }
             } else {
                 view! {}
             })
@@ -1084,7 +1084,7 @@ pub fn OAuthAddButton(kind: String, provider: String) -> View {
             None => view! {},
         })
         (if !action_error.get_clone().is_empty() {
-            view! { div(class="auth-banner auth-error flush") { (action_error.get_clone()) } }
+            view! { div(class="auth-banner auth-error flush", role="alert") { (action_error.get_clone()) } }
         } else {
             view! {}
         })
@@ -1118,7 +1118,7 @@ pub fn KeyActionButton(provider: String, id: String, status: String) -> View {
             });
         }) { (label) }
         (if !error.get_clone().is_empty() {
-            view! { div(class="auth-banner auth-error flush") { (error.get_clone()) } }
+            view! { div(class="auth-banner auth-error flush", role="alert") { (error.get_clone()) } }
         } else {
             view! {}
         })
