@@ -1,18 +1,18 @@
 //! Where a model's context window and token caps come from.
 //!
-//! Four sources, most specific first:
+//! Two sources, most specific first:
 //!
 //! 1. **override** — `[[model_limits]]` in the config (the dashboard's editor);
-//! 2. **provider** — parsed from the provider's own model listing
+//! 2. **provider** — parsed from a catalogue the provider itself serves
 //!    (Antigravity's `maxTokens`/`maxOutputTokens`, Gemini's
-//!    `inputTokenLimit`/`outputTokenLimit`, OpenRouter-style `context_length`…);
-//! 3. **builtin** — a small table of published numbers for well-known families,
-//!    used only when the provider says nothing (DashScope's `/models`, for one,
-//!    returns nothing but `id`);
-//! 4. **unknown** — no number. We publish no field rather than invent one.
+//!    `inputTokenLimit`/`outputTokenLimit`, OpenRouter-style `context_length`,
+//!    DashScope's native `model_info`…).
 //!
-//! The upstream payload is the source of truth whenever it exists: a provider that
-//! states the numbers is never overridden by the table below.
+//! Anything nobody states is **unknown**: the field is not published at all. There
+//! is deliberately no table of model families in this repository — model
+//! catalogues change faster than a release, and a stale number presented as a fact
+//! is worse than no number. A provider that serves no metadata is covered by
+//! `limits_url` on the provider, or by an operator override.
 
 use serde_json::Value;
 
@@ -35,7 +35,6 @@ impl Limits {
 pub enum Source {
     Override,
     Provider,
-    Builtin,
     #[default]
     Unknown,
 }
@@ -45,7 +44,6 @@ impl Source {
         match self {
             Source::Override => "override",
             Source::Provider => "provider",
-            Source::Builtin => "builtin",
             Source::Unknown => "unknown",
         }
     }
@@ -67,19 +65,10 @@ pub struct Sources {
 }
 
 impl Resolved {
-    /// Merge the three layers, most specific last: a number set by the operator
-    /// beats the provider's own figure, which beats the builtin table. A field
-    /// nobody states stays at 0 / `unknown`.
-    pub fn resolve(
-        overrides: Option<Limits>,
-        provider: Option<Limits>,
-        builtin: Option<Limits>,
-    ) -> Self {
-        let layers = [
-            (builtin, Source::Builtin),
-            (provider, Source::Provider),
-            (overrides, Source::Override),
-        ];
+    /// Merge the layers, most specific last: a number set by the operator beats the
+    /// provider's own figure. A field nobody states stays at 0 / `unknown`.
+    pub fn resolve(overrides: Option<Limits>, provider: Option<Limits>) -> Self {
+        let layers = [(provider, Source::Provider), (overrides, Source::Override)];
         let pick = |field: fn(&Limits) -> u64| -> (u64, Source) {
             let mut out = (0, Source::Unknown);
             for (layer, source) in layers {
@@ -214,68 +203,6 @@ fn as_u64(v: &Value) -> Option<u64> {
         .filter(|n| *n > 0)
 }
 
-// ---------- the builtin table ----------
-
-/// Published limits for model families whose numbers are stable and documented.
-///
-/// Deliberately small: a wrong number here is worse than no number, because the
-/// dashboard presents it as a fact. Anything not listed resolves to "unknown" (and
-/// publishes no field) unless the provider states it or the operator overrides it.
-/// Values are matched on the model id after stripping the provider prefix.
-pub fn builtin(model: &str) -> Option<Limits> {
-    let id = model.to_ascii_lowercase();
-    let id = id.rsplit('/').next().unwrap_or(&id);
-    let has = |needle: &str| id.contains(needle);
-    let pair = |ctx: u64, out: u64| {
-        Some(Limits {
-            context_window: ctx,
-            max_output_tokens: out,
-            max_input_tokens: 0,
-        })
-    };
-
-    // Google Gemini (the provider publishes these itself; this covers models it
-    // does not list, e.g. the Antigravity codenames).
-    if has("gemini-3") || has("gemini-2.5") || has("gemini-2.0") {
-        return pair(1_048_576, 65_536);
-    }
-    if has("gemini-1.5-pro") {
-        return pair(2_097_152, 8_192);
-    }
-    if has("gemini-1.5-flash") {
-        return pair(1_048_576, 8_192);
-    }
-
-    // Anthropic Claude: 200k window for every current model.
-    if has("claude") {
-        if has("haiku") {
-            return pair(200_000, 8_192);
-        }
-        if has("opus") {
-            return pair(200_000, 32_000);
-        }
-        if has("sonnet") {
-            return pair(200_000, 64_000);
-        }
-        return pair(200_000, 8_192);
-    }
-
-    // OpenAI.
-    if has("gpt-4.1") {
-        return pair(1_047_576, 32_768);
-    }
-    if has("gpt-4o") {
-        return pair(128_000, 16_384);
-    }
-    if has("gpt-4-turbo") {
-        return pair(128_000, 4_096);
-    }
-    if has("gpt-3.5") {
-        return pair(16_385, 4_096);
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,15 +287,10 @@ mod tests {
     }
 
     #[test]
-    fn resolution_prefers_override_then_provider_then_builtin() {
+    fn resolution_prefers_the_operator_and_never_invents_a_number() {
         let provider = Limits {
             context_window: 262_144,
             max_output_tokens: 8_192,
-            max_input_tokens: 0,
-        };
-        let builtin = Limits {
-            context_window: 1_048_576,
-            max_output_tokens: 65_536,
             max_input_tokens: 0,
         };
         let over = Limits {
@@ -377,9 +299,9 @@ mod tests {
             max_input_tokens: 100_000,
         };
 
-        let r = Resolved::resolve(Some(over), Some(provider), Some(builtin));
-        // The provider's window wins over the table; the override wins over both —
-        // field by field, and a field nobody set stays empty.
+        let r = Resolved::resolve(Some(over), Some(provider));
+        // Field by field: the override wins where it is set, the provider's figure
+        // fills the rest, and a field nobody states stays empty.
         assert_eq!(r.limits.context_window, 262_144);
         assert_eq!(r.source_of("context_window"), "provider");
         assert_eq!(r.limits.max_output_tokens, 4_096);
@@ -387,28 +309,12 @@ mod tests {
         assert_eq!(r.limits.max_input_tokens, 100_000);
         assert_eq!(r.source_of("max_input_tokens"), "override");
 
-        let r = Resolved::resolve(None, None, Some(builtin));
-        assert_eq!(r.source_of("context_window"), "builtin");
-        assert_eq!(r.limits.context_window, 1_048_576);
+        let r = Resolved::resolve(None, Some(provider));
+        assert_eq!(r.source_of("context_window"), "provider");
+        assert_eq!(r.limits.context_window, 262_144);
 
-        let r = Resolved::resolve(None, None, None);
+        let r = Resolved::resolve(None, None);
         assert!(r.limits.is_empty());
         assert_eq!(r.source_of("context_window"), "unknown");
-    }
-
-    #[test]
-    fn the_builtin_table_covers_the_families_it_claims_and_nothing_else() {
-        let expect = |id: &str, ctx: u64, out: u64| {
-            let l = builtin(id).unwrap_or_else(|| panic!("{id} must be known"));
-            assert_eq!((l.context_window, l.max_output_tokens), (ctx, out), "{id}");
-        };
-        expect("dashscope/gemini-2.5-pro", 1_048_576, 65_536);
-        expect("antigravity/claude-sonnet-4-6", 200_000, 64_000);
-        expect("antigravity/claude-opus-4-6-thinking", 200_000, 32_000);
-        expect("openai/gpt-4o-mini", 128_000, 16_384);
-        // Unknown families must stay unknown — a guess would be shown as a fact.
-        assert!(builtin("dashscope/qwen3.8-max").is_none());
-        assert!(builtin("dashscope/deepseek-v4-pro").is_none());
-        assert!(builtin("mock/test-model").is_none());
     }
 }

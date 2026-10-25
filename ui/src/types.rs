@@ -27,10 +27,10 @@ pub struct ModelItemDto {
     pub name: String,
     pub provider: String,
     pub enabled: bool,
-    /// The numbers that apply (override → provider → builtin; 0 = unknown).
+    /// The numbers that apply (override → provider; 0 = unknown).
     #[serde(default)]
     pub limits: ModelLimits,
-    /// Where each number came from: override | provider | builtin | unknown.
+    /// Where each number came from: override | provider | unknown.
     #[serde(default)]
     pub sources: LimitSources,
     /// The operator's own values (0 = not set) — what the editor's inputs show.

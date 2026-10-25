@@ -56,7 +56,7 @@ pub async fn list_models(
             {
                 continue;
             }
-            let resolved = resolved_for(&state, &limits, p.discovered_limits(m), &id, m);
+            let resolved = resolved_for(&limits, p.discovered_limits(m), &id);
             data.push(model_json(resolved, &id, &p.name));
         }
     }
@@ -71,8 +71,7 @@ pub async fn list_models(
         {
             continue;
         }
-        let bare = c.name.strip_prefix("combo/").unwrap_or(&c.name);
-        let resolved = resolved_for(&state, &limits, None, &c.name, bare);
+        let resolved = resolved_for(&limits, None, &c.name);
         data.push(model_json(resolved, &c.name, "combo"));
     }
     let body = serde_json::json!({ "object": "list", "data": data }).to_string();
@@ -135,8 +134,7 @@ pub async fn get_model(
                 {
                     break;
                 }
-                let resolved =
-                    resolved_for(&state, &limits, p.discovered_limits(model), &id, model);
+                let resolved = resolved_for(&limits, p.discovered_limits(model), &id);
                 return Json(model_json(resolved, &id, &p.name)).into_response();
             }
         }
@@ -149,8 +147,7 @@ pub async fn get_model(
             {
                 break;
             }
-            let bare = c.name.strip_prefix("combo/").unwrap_or(&c.name);
-            let resolved = resolved_for(&state, &limits, None, &c.name, bare);
+            let resolved = resolved_for(&limits, None, &c.name);
             return Json(model_json(resolved, &c.name, "combo")).into_response();
         }
     }
@@ -186,22 +183,19 @@ fn model_json(limits: crate::limits::Limits, id: &str, owner: &str) -> serde_jso
     v
 }
 
-/// The three layers for a provider model: the operator's override, the provider's
-/// own numbers, and the builtin table (in that order of precedence).
+/// The two layers for a provider model: the operator's override, else the numbers
+/// the provider itself published.
 fn resolved_for(
-    state: &AppState,
     overrides: &crate::config::ModelLimits,
     provider_model: Option<crate::limits::Limits>,
     id: &str,
-    bare: &str,
 ) -> crate::limits::Limits {
     let over = overrides.get(id).map(|l| crate::limits::Limits {
         context_window: l.context_window,
         max_output_tokens: l.max_output_tokens,
         max_input_tokens: l.max_input_tokens,
     });
-    let _ = state;
-    crate::limits::Resolved::resolve(over, provider_model, crate::limits::builtin(bare)).limits
+    crate::limits::Resolved::resolve(over, provider_model).limits
 }
 
 /// `GET /v1/models` is cached per catalogue epoch and filtered twice (disabled

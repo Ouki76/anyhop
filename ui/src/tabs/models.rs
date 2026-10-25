@@ -122,7 +122,7 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
     let open_limits = move |id: String| {
         if let Some(m) = models.get_clone().into_iter().find(|m| m.id == id) {
             // The inputs hold the operator's own numbers (empty when there is no
-            // override); the provider's or builtin value is shown beside them as the
+            // override); the provider's value is shown beside them as the
             // effective one, so typing replaces it instead of silently copying it.
             lim_ctx.set(sig_str(m.override_of("context_window")));
             lim_out.set(sig_str(m.override_of("max_output_tokens")));

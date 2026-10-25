@@ -1145,11 +1145,13 @@ pub struct ProviderConfig {
     /// Where to read per-model limits from, when the provider's OpenAI-compatible
     /// `/models` does not carry them.
     ///
-    /// DashScope is the reason this exists: `compatible-mode/v1/models` returns
-    /// only id/object/created/owned_by, while its native catalogue
-    /// (`/api/v1/models`) publishes `model_info.context_window` and friends. Left
-    /// empty, the gateway probes that native path automatically for
-    /// `*.aliyuncs.com` hosts and skips it everywhere else.
+    /// Nothing is special-cased in the code: a vendor whose standard endpoint is
+    /// bare (DashScope's `compatible-mode/v1/models` returns only
+    /// `id/object/created/owned_by`) is described by its operator once, e.g.
+    ///
+    ///     limits_url = "https://dashscope-intl.aliyuncs.com/api/v1/models"
+    ///
+    /// Left empty, no second request is made.
     #[serde(default)]
     pub limits_url: Option<String>,
     /// Upstream proxy: http://, https://, socks5://, socks5h://.

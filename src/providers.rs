@@ -98,9 +98,9 @@ pub struct Provider {
     models_cache: arc_swap::ArcSwap<Option<(Instant, Arc<Vec<String>>)>>,
     /// Optional URL of a richer catalogue to read limits from (`limits_url`).
     limits_url: Option<String>,
-    /// Limits parsed from the last successful upstream listing (model id -> limits).
+    /// Limits parsed from the last successful catalogue fetch (model id -> limits).
     /// Empty until the first refresh; a provider that publishes numbers is the most
-    /// accurate source there is, ahead of the builtin table.
+    /// accurate source there is.
     discovered_limits: arc_swap::ArcSwap<std::collections::HashMap<String, crate::limits::Limits>>,
     quota_cache: Mutex<Option<(Instant, AccountQuotas)>>,
 }
@@ -387,9 +387,11 @@ impl Provider {
                     }
                 }
                 // The OpenAI-compatible catalogue often carries no limits at all
-                // (DashScope: only id/object/created/owned_by). Fill them from a
-                // richer catalogue when there is one.
-                if cat.limits.is_empty() || self.limits_url.is_some() {
+                // (DashScope: only id/object/created/owned_by). When the operator
+                // points `limits_url` at the vendor's richer catalogue, read the
+                // numbers from there. No vendor is special-cased here: which
+                // endpoint publishes what is the operator's call, not a guess.
+                if let Some(_url) = self.limits_url.as_deref() {
                     for (id, l) in self.fetch_limits_catalogue(&key.secret).await {
                         cat.limits.entry(id).or_insert(l);
                     }
@@ -492,32 +494,21 @@ impl Provider {
         }
     }
 
-    /// Read per-model limits from a vendor's native catalogue.
+    /// Read per-model limits from the catalogue `limits_url` points at.
     ///
-    /// Used when the OpenAI-compatible `/models` says nothing: DashScope publishes
-    /// `model_info.context_window` / `max_input_tokens` / `max_output_tokens` on
-    /// `/api/v1/models`, but only `id` on `/compatible-mode/v1/models`. The page
-    /// walk is bounded (10 x 100) so a misbehaving catalogue cannot hang a refresh,
-    /// and any failure is a debug log — limits are metadata, never a reason to fail
-    /// the model list.
+    /// The OpenAI-compatible `/models` of some vendors says nothing about sizes
+    /// (DashScope returns only `id/object/created/owned_by`) while their native
+    /// catalogue publishes them; the operator names that catalogue once, per
+    /// provider. The page walk is bounded (10 x 100) so a misbehaving catalogue
+    /// cannot hang a refresh, and any failure is a debug log — limits are metadata,
+    /// never a reason to fail the model list.
     async fn fetch_limits_catalogue(
         &self,
         key: &str,
     ) -> std::collections::HashMap<String, crate::limits::Limits> {
         let mut out = std::collections::HashMap::new();
-        let Ok(base) = reqwest::Url::parse(&self.base_url) else {
+        let Some(meta_base) = self.limits_url.clone() else {
             return out;
-        };
-        let meta_base = match self.limits_url.as_deref() {
-            Some(u) => u.to_string(),
-            None => {
-                // Only auto-probe the vendor that needs it, by host.
-                let host = base.host_str().unwrap_or_default().to_string();
-                if !host.ends_with("aliyuncs.com") {
-                    return out;
-                }
-                format!("{}://{host}/api/v1/models", base.scheme())
-            }
         };
         for page in 1..=10u32 {
             let sep = if meta_base.contains('?') { '&' } else { '?' };
@@ -795,6 +786,57 @@ mod tests {
             2,
         )
         .expect("provider builds offline")
+    }
+
+    /// The second catalogue is a *config* value, not a vendor name: whatever URL
+    /// `limits_url` holds is walked (paged) and its `model_info`-shaped numbers are
+    /// merged into the discovered map.
+    #[tokio::test]
+    async fn limits_url_is_read_and_paged_without_any_vendor_knowledge() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                // Page 1 has two models, page 2 is empty; only the first request
+                // carries no `page_no`, which is what the client sends.
+                let body = if req.contains("page_no=1") || !req.contains("page_no") {
+                    r#"{"output":{"models":[
+                        {"model":"alpha","model_info":{"context_window":1000,"max_input_tokens":900,"max_output_tokens":100}},
+                        {"model":"beta","model_info":{"context_window":2000}}
+                    ]}}"#
+                } else {
+                    r#"{"output":{"models":[]}}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let p = provider(&format!(
+            r#"limits_url = "http://127.0.0.1:{}/api/v1/models""#,
+            addr.port()
+        ));
+        let found = p.fetch_limits_catalogue("sk-1").await;
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found["alpha"].context_window, 1000);
+        assert_eq!(found["alpha"].max_output_tokens, 100);
+        assert_eq!(found["alpha"].max_input_tokens, 900);
+        assert_eq!(found["beta"].context_window, 2000);
     }
 
     /// B: the production constructor must hand the configured tuning to the pool.

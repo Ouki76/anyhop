@@ -21,7 +21,7 @@ pub struct ModelLimitsDto {
     pub max_input_tokens: u64,
 }
 
-/// Where each number came from: `override`, `provider`, `builtin` or `unknown`.
+/// Where each number came from: `override`, `provider` or `unknown`.
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct SourcesDto {
     pub context_window: String,
@@ -35,11 +35,11 @@ pub struct ModelItemDto {
     pub name: String,
     pub provider: String,
     pub enabled: bool,
-    /// The numbers that apply (override → provider → builtin; 0 = unknown).
+    /// The numbers that apply (override → provider; 0 = unknown).
     #[serde(default)]
     pub limits: ModelLimitsDto,
     /// Provenance per field, so the dashboard can label a provider figure
-    /// differently from an operator override or from the builtin table.
+    /// differently from an operator override.
     #[serde(default)]
     pub sources: SourcesDto,
     /// The operator's own values (0 = not set). These are what the editor's inputs
@@ -217,7 +217,7 @@ pub async fn models_list(State(state): State<Arc<AppState>>) -> ApiResult {
             let id = format!("{}/{}", p.name, m);
             let enabled = !is_disabled(&disabled, &id);
             let (limits_dto, sources, overrides, source) =
-                limits_of(&limits, p.discovered_limits(m), &id, m);
+                limits_of(&limits, p.discovered_limits(m), &id);
             list.push(ModelItemDto {
                 id,
                 name: m.to_string(),
@@ -233,8 +233,7 @@ pub async fn models_list(State(state): State<Arc<AppState>>) -> ApiResult {
     for c in &router.combos {
         // Mirrors the request path: "combo/x" and bare "x" both disable a combo.
         let enabled = !is_disabled(&disabled, &c.name);
-        let bare = c.name.strip_prefix("combo/").unwrap_or(&c.name);
-        let (limits_dto, sources, overrides, source) = limits_of(&limits, None, &c.name, bare);
+        let (limits_dto, sources, overrides, source) = limits_of(&limits, None, &c.name);
         list.push(ModelItemDto {
             id: c.name.clone(),
             name: c.name.clone(),
@@ -252,16 +251,14 @@ pub async fn models_list(State(state): State<Arc<AppState>>) -> ApiResult {
 
 /// Resolve the three layers for one model into wire shape.
 ///
-/// `provider` is what the provider's own listing stated (Antigravity, Gemini,
-/// OpenRouter-shaped gateways), `builtin` the published table for well-known
-/// families; the operator's override wins over both. The returned `overrides` are
-/// only what the operator set — that is what the editor's inputs and the per-field
-/// Reset button work with.
+/// `provider` is what the provider's own catalogue stated (Antigravity, Gemini,
+/// DashScope's native list, OpenRouter-shaped gateways); the operator's override
+/// wins over it. The returned `overrides` are only what the operator set — that is
+/// what the editor's inputs and the per-field Reset button work with.
 fn limits_of(
     limits: &ModelLimits,
     provider: Option<Limits>,
     id: &str,
-    bare: &str,
 ) -> (ModelLimitsDto, SourcesDto, ModelLimitsDto, String) {
     let over = limits.get(id);
     let resolved = Resolved::resolve(
@@ -271,7 +268,6 @@ fn limits_of(
             max_input_tokens: l.max_input_tokens,
         }),
         provider,
-        crate::limits::builtin(bare),
     );
     let overrides = ModelLimitsDto {
         context_window: over.map(|l| l.context_window).unwrap_or(0),
@@ -946,16 +942,16 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The layers reach the API in the right order: the provider's own numbers beat
-    /// the builtin table, an override beats both, and each field is labelled with
-    /// where it came from (that label is what the dashboard shows).
+    /// The layers reach the API in the right order: the provider's own numbers,
+    /// an override on top, and each field labelled with where it came from (that
+    /// label is what the dashboard shows).
     #[tokio::test]
-    async fn provider_and_builtin_layers_are_reported_with_their_source() {
+    async fn provider_layer_and_override_are_reported_with_their_source() {
         let (st, path) = state_with_catalogue();
         let router = st.router.load();
         let p = &router.providers[0];
-        // `mock/m` gets a provider-published window, `mock/m2` only a builtin one
-        // (both come out of the same resolution path).
+        // `mock/m` gets a provider-published window; nothing is invented for a
+        // model the provider says nothing about.
         p.set_discovered_limits_for_test(std::collections::HashMap::from([(
             "m".to_string(),
             crate::limits::Limits {
