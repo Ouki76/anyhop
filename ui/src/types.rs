@@ -6,7 +6,12 @@ use serde::{Deserialize, Serialize};
 pub struct ClientKeyDto {
     #[serde(default)]
     pub max_concurrent: Option<u32>,
-    pub key: String,
+    /// Stable public id — the listing never carries the secret itself.
+    #[serde(default)]
+    pub id: String,
+    /// Present only in the response that created the key.
+    #[serde(default)]
+    pub key: Option<String>,
     pub masked: String,
     pub name: String,
     #[serde(default)]

@@ -16,7 +16,15 @@ pub struct ClientKeyDto {
     /// In-flight cap for this key (None = the server default). Must be exposed or
     /// the dashboard silently rewrites it away on the next edit.
     pub max_concurrent: Option<u32>,
-    pub key: String,
+    /// Stable public identifier: `sha256(secret)[..16]`. The secret itself is
+    /// never listed — a dashboard screenshot or a proxied response would leak every
+    /// key at once. Actions take this id; the secret is only returned by an explicit
+    /// reveal.
+    pub id: String,
+    /// Present only in the response that *created* the key: that is the one moment
+    /// the secret is handed to the operator. The listing never carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub masked: String,
     pub name: String,
     pub models: Vec<String>,
@@ -44,12 +52,22 @@ pub struct AddClientKey {
 
 #[derive(Deserialize)]
 pub struct DeleteClientKey {
-    pub key: String,
+    /// Public id (`sha256(secret)[..16]`) — what the listing returns.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// The raw secret. Accepted for scripts written against the old API; the
+    /// dashboard uses `id`.
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct UpdateClientKey {
-    pub key: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Raw secret, for compatibility with older scripts (see [`DeleteClientKey`]).
+    #[serde(default)]
+    pub key: Option<String>,
     /// `None` = keep the current name; `Some(x)` = rename to `x` (validated).
     pub name: Option<String>,
     /// `None` = keep the current allowlist; `Some(vec![])` = allow every model.
@@ -177,6 +195,28 @@ fn ensure_unique_name(
     Ok(())
 }
 
+/// `sha256(secret)[..16]`: enough to identify a key in the UI and in the logs,
+/// useless on its own as a credential.
+pub fn key_id(secret: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(secret.as_bytes());
+    let mut out = String::with_capacity(16);
+    for b in digest.iter().take(8) {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// The secret a mutation refers to: the public `id` first, then a raw `key` (kept
+/// for scripts written against the old API).
+fn resolve_secret(state: &Arc<AppState>, id: Option<&str>, key: Option<&str>) -> Option<String> {
+    if let Some(k) = key.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(k.to_string());
+    }
+    let id = id.map(str::trim).filter(|s| !s.is_empty())?;
+    ck_read(state).keys().find(|k| key_id(k) == id).cloned()
+}
+
 pub fn mask_key(k: &str) -> String {
     // The head and tail slices must never overlap: with `take(7)` + `skip(n-4)` a
     // 9-char key was printed in full (`sk-team...am-a` reconstructs it), and that
@@ -202,7 +242,8 @@ pub fn generate_client_key() -> Option<String> {
 fn to_dto(rt: &crate::proxy::ClientKeyRuntime) -> ClientKeyDto {
     let k = &rt.cfg;
     ClientKeyDto {
-        key: k.key.clone(),
+        id: key_id(&k.key),
+        key: None,
         masked: mask_key(&k.key),
         name: k.name.clone().unwrap_or_else(|| mask_key(&k.key)),
         models: k.models.clone(),
@@ -237,6 +278,8 @@ pub async fn client_key_add(
     if let Err((_, msg)) = super::validate_secret_len("client key", &key_str) {
         return Err(ApiError::bad_request(msg));
     }
+    // Kept for the response: the created key is the only place the secret appears.
+    let secret_for_display = key_str.clone();
     if let Some(n) = body
         .name
         .as_deref()
@@ -311,11 +354,49 @@ pub async fn client_key_add(
     );
 
     match runtime {
-        Some(rt) => ok_json(to_dto(&rt)),
+        Some(rt) => {
+            // The secret is shown exactly once, on creation: the operator has to
+            // copy it now, and no later listing can hand it back.
+            let mut dto = to_dto(&rt);
+            dto.key = Some(secret_for_display);
+            ok_json(dto)
+        }
         None => Err(ApiError::internal(
             "the key was written but is not in the live map",
         )),
     }
+}
+
+/// `POST /api/client-keys/reveal {id}` — hand the secret to the admin, once.
+///
+/// The listing deliberately does not carry secrets; this is the only way back to
+/// one, it is admin-only, and it leaves an event so a reveal is never silent.
+#[derive(Deserialize)]
+pub struct RevealClientKey {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+pub async fn client_key_reveal(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RevealClientKey>,
+) -> ApiResult {
+    let Some(secret) = resolve_secret(&state, body.id.as_deref(), body.key.as_deref()) else {
+        return Err(ApiError::not_found("API key not found"));
+    };
+    let label = ck_read(&state)
+        .get(&secret)
+        .map(|k| k.cfg.name.clone().unwrap_or_else(|| mask_key(&secret)))
+        .unwrap_or_else(|| mask_key(&secret));
+    state.events.emit_simple(
+        "auth",
+        "",
+        "backoff",
+        format!("revealed client API key '{label}'"),
+    );
+    ok_json(serde_json::json!({"key": secret}))
 }
 
 pub async fn client_key_delete(
@@ -323,10 +404,13 @@ pub async fn client_key_delete(
     Json(body): Json<DeleteClientKey>,
 ) -> ApiResult {
     let keys = current_keys(&state);
-    let Some(k) = keys.iter().find(|k| k.key == body.key).cloned() else {
+    let Some(secret) = resolve_secret(&state, body.id.as_deref(), body.key.as_deref()) else {
         return Err(ApiError::not_found("API key not found"));
     };
-    let remaining: Vec<_> = keys.into_iter().filter(|k| k.key != body.key).collect();
+    let Some(k) = keys.iter().find(|k| k.key == secret).cloned() else {
+        return Err(ApiError::not_found("API key not found"));
+    };
+    let remaining: Vec<_> = keys.into_iter().filter(|k| k.key != secret).collect();
     save_client_keys(&state, &remaining)
         .await
         .map_err(|r| boxed(&r))?;
@@ -374,7 +458,10 @@ pub async fn client_key_update(
     }
 
     let mut keys = current_keys(&state);
-    let Some(prev) = keys.iter().find(|k| k.key == body.key).cloned() else {
+    let Some(secret) = resolve_secret(&state, body.id.as_deref(), body.key.as_deref()) else {
+        return Err(ApiError::not_found("API key not found"));
+    };
+    let Some(prev) = keys.iter().find(|k| k.key == secret).cloned() else {
         return Err(ApiError::not_found("API key not found"));
     };
     let mut cfg = prev;
@@ -395,9 +482,9 @@ pub async fn client_key_update(
         cfg.rpm = rpm;
         cfg.burst = burst;
     }
-    ensure_unique_name(&keys, cfg.name.as_deref(), Some(&body.key))?;
+    ensure_unique_name(&keys, cfg.name.as_deref(), Some(&secret))?;
     for k in &mut keys {
-        if k.key == body.key {
+        if k.key == secret {
             *k = cfg.clone();
         }
     }
@@ -405,7 +492,7 @@ pub async fn client_key_update(
         .await
         .map_err(|r| boxed(&r))?;
 
-    match ck_read(&state).get(&body.key).cloned() {
+    match ck_read(&state).get(&secret).cloned() {
         Some(rt) => ok_json(to_dto(&rt)),
         None => Err(ApiError::internal(
             "the key was written but is not in the live map",
@@ -675,6 +762,53 @@ mod secret_tests {
         );
         assert_eq!(normalise_limit(Some(0), Some(10)), (None, None));
         assert_eq!(normalise_limit(None, Some(10)), (None, None));
+    }
+
+    /// The listing must never carry secrets: a screenshot, a proxy log or a
+    /// shared screen would leak every key at once. Actions use the public `id`, and
+    /// the secret comes back only from an explicit reveal (or the create response).
+    #[tokio::test]
+    async fn the_listing_never_leaks_the_secret_and_reveal_returns_it() {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+        client_key_add(
+            State(st.clone()),
+            json(r#"{"key":"sk-hop-secret-value-1","name":"one"}"#),
+        )
+        .await
+        .expect("added");
+
+        let listed = client_keys_list(State(st.clone())).await.expect("list");
+        let listed = body_json(listed).await;
+        let row = &listed.as_array().expect("array")[0];
+        assert!(
+            row.get("key").is_none(),
+            "the list leaked the secret: {row}"
+        );
+        assert_eq!(row["name"], "one");
+        assert_eq!(row["id"], key_id("sk-hop-secret-value-1"));
+        assert_eq!(row["masked"], mask_key("sk-hop-secret-value-1"));
+
+        // Reveal by id.
+        let id = row["id"].as_str().expect("id").to_string();
+        let revealed = client_key_reveal(State(st.clone()), json(&format!(r#"{{"id":"{id}"}}"#)))
+            .await
+            .expect("revealed");
+        assert_eq!(body_json(revealed).await["key"], "sk-hop-secret-value-1");
+
+        // Deleting by id works too, and an unknown id is a clean 404.
+        assert!(
+            client_key_delete(State(st.clone()), json(&format!(r#"{{"id":"{id}"}}"#)))
+                .await
+                .is_ok()
+        );
+        assert!(
+            client_key_reveal(State(st.clone()), json(r#"{"id":"deadbeefdeadbeef"}"#))
+                .await
+                .is_err(),
+            "an unknown id must not resolve to anything"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Add and delete both rewrite `client_keys` in the TOML. The file is the

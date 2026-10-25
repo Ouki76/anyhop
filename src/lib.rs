@@ -668,6 +668,7 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
         .route("/api/client-keys/add", post(api::client_key_add))
         .route("/api/client-keys/delete", post(api::client_key_delete))
         .route("/api/client-keys/update", post(api::client_key_update))
+        .route("/api/client-keys/reveal", post(api::client_key_reveal))
         .route("/api/models", get(api::models_list))
         .route("/api/models/refresh", post(api::models_refresh))
         .route("/api/models/enable", post(api::model_enable))

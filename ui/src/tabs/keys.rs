@@ -22,8 +22,12 @@ pub fn ApiKeysTab(
     let model_search = create_signal(String::new());
     let created_banner = create_signal(Option::<ClientKeyDto>::None);
     let create_error = create_signal(String::new());
-    let revealed = create_signal(std::collections::HashSet::<String>::new());
+    // id -> secret, filled on demand: the listing never carries the secret, so
+    // "Show"/"Copy" fetch it once and remember it for this tab.
+    let revealed = create_signal(std::collections::HashMap::<String, String>::new());
     let copied_key = create_signal(String::new());
+    // Surfaced above the list: "cannot reveal the key: …".
+    let copy_status = create_signal(String::new());
 
     // Inline edit for existing key
     let editing_key = create_signal(Option::<String>::None);
@@ -56,9 +60,12 @@ pub fn ApiKeysTab(
 
         (match created_banner.get_clone() {
             Some(k) => {
-                let key_txt = k.key.clone();
-                let key_memo = k.key.clone();
-                let key_copy = k.key.clone();
+                // The creation response is the only place the secret appears; a
+                // key rebuilt from the listing has none to show.
+                let secret = k.key.clone().unwrap_or_default();
+                let key_txt = secret.clone();
+                let key_memo = secret.clone();
+                let key_copy = secret;
                 let is_copied = create_memo(move || copied_key.get_clone() == key_memo);
                 view! {
                     div(class="created-key-box") {
@@ -214,6 +221,12 @@ pub fn ApiKeysTab(
                         })
                     }
 
+                    (if !copy_status.get_clone().is_empty() {
+                        view! { div(class="auth-banner auth-error flush") { (copy_status.get_clone()) } }
+                    } else {
+                        view! {}
+                    })
+
                     div(class="row gap-10 mt-20") {
                         button(class="btn btn-primary", on:click=move |_| {
                             let name = name_input.get_clone();
@@ -314,14 +327,13 @@ pub fn ApiKeysTab(
                         Indexed(
                             list=client_keys,
                             view=move |k: ClientKeyDto| {
-                                let k_key_display = k.key.clone();
-                                let k_key_reveal = k.key.clone();
-                                let k_key_copy = k.key.clone();
-                                let k_key_edit = k.key.clone();
-                                let k_key_del = k.key.clone();
-                                let k_key_btn_rev = k.key.clone();
-                                let k_key_btn_cp = k.key.clone();
-                                let k_key_btn_ed = k.key.clone();
+                                let k_key_reveal_memo = k.id.clone();
+                                let k_key_copy = k.id.clone();
+                                let k_key_edit = k.id.clone();
+                                let k_key_del = k.id.clone();
+                                let k_key_btn_rev = k.id.clone();
+                                let k_key_btn_cp = k.id.clone();
+                                let k_key_btn_ed = k.id.clone();
                                 let k_models_btn_ed = k.models.clone();
                                 let k_lim_btn_ed = k.rpm;
                                 let k_burst_btn_ed = k.burst;
@@ -331,15 +343,16 @@ pub fn ApiKeysTab(
                                 let k_rpm = k.rpm;
                                 let k_models = k.models.clone();
 
-                                let is_rev = create_memo(move || revealed.get_clone().contains(&k_key_reveal));
+                                let is_rev = create_memo(move || revealed.get_clone().contains_key(&k_key_reveal_memo));
                                 let is_copied = create_memo(move || copied_key.get_clone() == k_key_copy);
                                 let is_editing = create_memo(move || editing_key.get_clone().as_deref() == Some(&k_key_edit));
 
+                                let masked = k.masked.clone();
+                                let k_key_display = k.id.clone();
                                 let display_key = create_memo(move || {
-                                    if is_rev.get() {
-                                        k_key_display.clone()
-                                    } else {
-                                        k.masked.clone()
+                                    match revealed.get_clone().get(&k_key_display) {
+                                        Some(secret) => secret.clone(),
+                                        None => masked.clone(),
                                     }
                                 });
 
@@ -483,19 +496,61 @@ pub fn ApiKeysTab(
                                             })
                                             div(class="client-key-actions") {
                                                 button(class="btn-ghost", on:click=move |_| {
-                                                    let mut set = revealed.get_clone();
-                                                    if set.contains(&k_key_btn_rev) {
-                                                        set.remove(&k_key_btn_rev);
-                                                    } else {
-                                                        set.insert(k_key_btn_rev.clone());
+                                                    let id = k_key_btn_rev.clone();
+                                                    if revealed.get_clone().contains_key(&id) {
+                                                        let mut map = revealed.get_clone();
+                                                        map.remove(&id);
+                                                        revealed.set(map);
+                                                        return;
                                                     }
-                                                    revealed.set(set);
+                                                    spawn_local(async move {
+                                                        match post_json_result::<_, serde_json::Value>(
+                                                            "/api/client-keys/reveal",
+                                                            &serde_json::json!({"id": id.clone()}),
+                                                        ).await {
+                                                            Ok(v) => {
+                                                                if let Some(secret) = v.get("key").and_then(|k| k.as_str()) {
+                                                                    let mut map = revealed.get_clone();
+                                                                    map.insert(id, secret.to_string());
+                                                                    revealed.set(map);
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                if copy_status.is_alive() {
+                                                                    copy_status.set(format!("cannot reveal the key: {e}"));
+                                                                }
+                                                            }
+                                                        }
+                                                    });
                                                 }) { (if is_rev.get() { "Hide" } else { "Show" }) }
 
                                                 button(class="btn-ghost", on:click=move |_| {
-                                                    let key_str = k_key_btn_cp.clone();
+                                                    let id = k_key_btn_cp.clone();
                                                     let copied_key = copied_key;
                                                     spawn_local(async move {
+                                                        // The listing has no secret: fetch it, then copy.
+                                                        let secret = match revealed.get_clone().get(&id) {
+                                                            Some(s) => Ok(s.clone()),
+                                                            None => post_json_result::<_, serde_json::Value>(
+                                                                "/api/client-keys/reveal",
+                                                                &serde_json::json!({"id": id.clone()}),
+                                                            )
+                                                            .await
+                                                            .map(|v| v["key"].as_str().unwrap_or_default().to_string()),
+                                                        };
+                                                        let key_str = match secret {
+                                                            Ok(s) if !s.is_empty() => s,
+                                                            Ok(_) => String::new(),
+                                                            Err(e) => {
+                                                                if copy_status.is_alive() {
+                                                                    copy_status.set(format!("cannot reveal the key: {e}"));
+                                                                }
+                                                                String::new()
+                                                            }
+                                                        };
+                                                        if key_str.is_empty() {
+                                                            return;
+                                                        }
                                                         if copy_to_clipboard(&key_str).await {
                                                             copied_key.set(key_str);
                                                         }

@@ -96,12 +96,22 @@ def run_tests(original_toml):
     assert key2["models"] == []
     print(f"  ok created auto-generated key: {key2['masked']}")
 
-    # 5. List client keys
+    # 5. List client keys — the listing carries no secrets, only ids/masks.
     status, keys_list = request("GET", "/api/client-keys")
     assert status == 200
-    assert any(k["key"] == "sk-hop-test-gemini-only" for k in keys_list)
-    assert any(k["key"] == key2["key"] for k in keys_list)
-    print(f"  ok /api/client-keys listed {len(keys_list)} keys")
+    assert all("key" not in k for k in keys_list), \
+        f"the listing leaked a secret: {keys_list}"
+    assert any(k["id"] == key1["id"] for k in keys_list)
+    assert any(k["id"] == key2["id"] for k in keys_list)
+    assert any(k["masked"] == key2["masked"] for k in keys_list)
+    print(f"  ok /api/client-keys listed {len(keys_list)} keys (no secrets)")
+
+    # 5b. The secret comes back only from an explicit reveal, by id.
+    status, revealed = request("POST", "/api/client-keys/reveal", {"id": key1["id"]})
+    assert status == 200 and revealed["key"] == "sk-hop-test-gemini-only", revealed
+    status, _ = request("POST", "/api/client-keys/reveal", {"id": "0000000000000000"})
+    assert status == 404, status
+    print("  ok client key reveal (by id, unknown id is 404)")
 
     # 6. Test /v1/models with restricted client key
     status, v1_restricted = request("GET", "/v1/models", token="sk-hop-test-gemini-only")
@@ -222,7 +232,7 @@ def run_tests(original_toml):
     # 12. Test deleting client keys
     status, _ = request("POST", "/api/client-keys/delete", {"key": "sk-hop-test-gemini-only"})
     assert status == 200
-    status, _ = request("POST", "/api/client-keys/delete", {"key": key2["key"]})
+    status, _ = request("POST", "/api/client-keys/delete", {"id": key2["id"]})
     assert status == 200
     print("  ok deleted client keys")
 
