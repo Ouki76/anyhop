@@ -18,10 +18,12 @@ pub struct Config {
     /// Per-model limits (context window and token caps), editable from the
     /// dashboard and published in `/v1/models`.
     ///
-    ///     [[model_limits]]
-    ///     model = "dashscope/deepseek-v4-pro"
-    ///     context_window = 131072
-    ///     max_output_tokens = 8192
+    /// ```toml
+    /// [[model_limits]]
+    /// model = "dashscope/deepseek-v4-pro"
+    /// context_window = 131072
+    /// max_output_tokens = 8192
+    /// ```
     ///
     /// A zero (or absent) value means "not set": the gateway then publishes no
     /// number for that field instead of inventing one.
@@ -1180,7 +1182,9 @@ pub struct ProviderConfig {
     /// bare (DashScope's `compatible-mode/v1/models` returns only
     /// `id/object/created/owned_by`) is described by its operator once, e.g.
     ///
-    ///     limits_url = "https://dashscope-intl.aliyuncs.com/api/v1/models"
+    /// ```toml
+    /// limits_url = "https://dashscope-intl.aliyuncs.com/api/v1/models"
+    /// ```
     ///
     /// Left empty, no second request is made.
     #[serde(default)]

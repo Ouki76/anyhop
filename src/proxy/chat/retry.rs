@@ -71,29 +71,53 @@ mod tests {
     }
 
     /// A real `reqwest::Response` carrying `headers`, served from a loopback
-    /// socket for exactly one request. The header logic is what is under test,
-    /// and that needs a genuine response object.
+    /// socket. The header logic is what is under test, and that needs a genuine
+    /// response object.
+    ///
+    /// Served by axum rather than by a hand-written socket: `tokio` 1.54 + hyper 1
+    /// report a raw "write the response, close immediately" server as
+    /// `UnexpectedMessage` (the client sees the connection end mid-exchange), which
+    /// says nothing about the code under test.
     async fn response_with(headers: &[(&str, &str)]) -> reqwest::Response {
-        use tokio::io::AsyncWriteExt;
+        let pairs: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let pairs = pairs.clone();
+                async move {
+                    let mut resp = axum::response::Response::new(axum::body::Body::empty());
+                    for (k, v) in pairs {
+                        if let (Ok(name), Ok(value)) = (
+                            axum::http::HeaderName::from_bytes(k.as_bytes()),
+                            axum::http::HeaderValue::from_str(&v),
+                        ) {
+                            resp.headers_mut().insert(name, value);
+                        }
+                    }
+                    resp
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a loopback port");
         let addr = listener.local_addr().expect("local addr");
-        let mut head =
-            String::from("HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n");
-        for (k, v) in headers {
-            head.push_str(&format!("{k}: {v}\r\n"));
-        }
-        head.push_str("\r\n");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
-            if let Ok((mut sock, _)) = listener.accept().await {
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.shutdown().await;
-            }
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await;
         });
-        reqwest::get(format!("http://{addr}/"))
+        let resp = reqwest::get(format!("http://{addr}/"))
             .await
-            .expect("the loopback server answers")
+            .expect("the loopback server answers");
+        let _ = tx.send(());
+        resp
     }
 
     /// The (single) key's remaining cooldown.

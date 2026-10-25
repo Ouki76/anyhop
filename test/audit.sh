@@ -93,6 +93,16 @@ else
     warn "unsafe_code is not denied in Cargo.toml"
 fi
 
+echo "== docs drift =="
+# Every route the README promises must exist in the code: documentation that sends
+# a reader to a 404 is worse than none, and this table drifts silently.
+MISSING=$(python3 test/tools/docs_routes_check.py)
+if [ -z "$MISSING" ]; then
+    ok "every route in the README exists in the code"
+else
+    fail "README documents routes that do not exist: $(echo "$MISSING" | tr '\n' ' ')"
+fi
+
 echo "== dependencies =="
 if command -v cargo-audit >/dev/null 2>&1; then
     # A dependency advisory is a real vulnerability in this binary, not a style
