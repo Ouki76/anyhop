@@ -32,7 +32,16 @@ jobs:
       - name: Build
         run: cargo build --locked --all-targets
       - name: Unit tests
-        run: cargo test --locked
+        run: cargo test --locked 2>&1 | tee /tmp/suite.log
+
+      - name: Publish failure logs
+        if: failure() && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_NAME: unit-tests
+        run: |
+          set -u
+          bash .github/scripts/publish-ci-logs.sh
       # Benches are code too: keep them compiling so the numbers in the README stay real.
       - name: Build benchmarks
         run: cargo build --locked --benches
