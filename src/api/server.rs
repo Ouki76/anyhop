@@ -726,6 +726,7 @@ api_key = "test-gw-key"
             request_log: Mutex::new(VecDeque::new()),
             client_keys: RwLock::new(HashMap::new()),
             disabled_models: RwLock::new(HashSet::new()),
+            model_limits: RwLock::new(crate::config::ModelLimits::default()),
             config_lock: tokio::sync::Mutex::new(()),
             tuning: arc_swap::ArcSwap::from_pointee(crate::config::Tuning::default()),
         })

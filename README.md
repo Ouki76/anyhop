@@ -24,6 +24,12 @@ Single binary (~6MB), minimal resource footprint.
   (`[[client_keys]]` or via UI/API) with per-model access control
 - **Model management**: enable/disable models (`disabled_models` or via UI/API) —
   disabled models are hidden from `GET /v1/models` and rejected in `/v1/chat/completions`
+- **Per-model limits**: context window, max output and max input tokens
+  (`[[model_limits]]` or Models → the limits chip on a row, with a per-field **Reset**).
+  They are published in `/v1/models` as `context_length` / `max_completion_tokens` /
+  `max_input_tokens`, so clients can size their requests without guessing
+- **`/v1/models` metadata**: a model id, owner and its limits — served from a
+  per-catalogue cache and filtered by the client key's allowlist
 - **Automatic model refresh**: periodic `/models` polling of all providers
   (`[server] models_refresh_secs`, default 300s) + a "Refresh models" button in the dashboard
 - **Hot reload**: `kill -HUP` re-reads the config without a restart

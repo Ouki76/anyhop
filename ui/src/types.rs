@@ -27,6 +27,67 @@ pub struct ModelItemDto {
     pub name: String,
     pub provider: String,
     pub enabled: bool,
+    /// Context window / token caps; every field is 0 when nothing is known.
+    #[serde(default)]
+    pub limits: ModelLimits,
+    /// Which of `limits` the operator set (the rest are inherited or unknown).
+    #[serde(default)]
+    pub overridden: Vec<String>,
+    /// The config key the values came from ("" = none, otherwise usually the
+    /// model id itself or a shared bare-name entry).
+    #[serde(default)]
+    pub limits_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct ModelLimits {
+    #[serde(default)]
+    pub context_window: u64,
+    #[serde(default)]
+    pub max_output_tokens: u64,
+    #[serde(default)]
+    pub max_input_tokens: u64,
+}
+
+impl ModelItemDto {
+    /// Is this field's value set on this very model (as opposed to inherited from a
+    /// bare-name entry)? Only then does "Reset" make sense.
+    pub fn is_overridden(&self, field: &str) -> bool {
+        self.overridden.iter().any(|f| f == field)
+    }
+
+    /// "128k", "1M", "8192" — compact enough for a row.
+    pub fn context_label(&self) -> String {
+        fmt_tokens(self.limits.context_window)
+    }
+
+    pub fn output_label(&self) -> String {
+        fmt_tokens(self.limits.max_output_tokens)
+    }
+}
+
+/// 0 -> "—", 1500 -> "1.5k", 131072 -> "131k", 1_048_576 -> "1M".
+pub fn fmt_tokens(n: u64) -> String {
+    if n == 0 {
+        return "—".to_string();
+    }
+    if n >= 1_000_000 {
+        let m = n as f64 / 1_000_000.0;
+        return if (m - m.round()).abs() < 0.05 {
+            format!("{}M", m.round() as u64)
+        } else {
+            format!("{m:.1}M")
+        };
+    }
+    if n >= 1000 {
+        let k = n as f64 / 1000.0;
+        return if (k - k.round()).abs() < 0.05 {
+            format!("{}k", k.round() as u64)
+        } else {
+            format!("{k:.1}k")
+        };
+    }
+    n.to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

@@ -39,6 +39,11 @@ pub async fn list_models(
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    let limits = state
+        .model_limits
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let mut data = Vec::new();
     for p in &router.providers {
         for m in p.effective_models().await.iter() {
@@ -51,11 +56,7 @@ pub async fn list_models(
             {
                 continue;
             }
-            data.push(serde_json::json!({
-                "id": id,
-                "object": "model",
-                "owned_by": p.name,
-            }));
+            data.push(model_json(&limits, &id, &p.name));
         }
     }
     for c in &router.combos {
@@ -69,11 +70,7 @@ pub async fn list_models(
         {
             continue;
         }
-        data.push(serde_json::json!({
-            "id": c.name,
-            "object": "model",
-            "owned_by": "combo",
-        }));
+        data.push(model_json(&limits, &c.name, "combo"));
     }
     let body = serde_json::json!({ "object": "list", "data": data }).to_string();
     if allowed.is_none() {
@@ -105,6 +102,11 @@ pub async fn get_model(
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    let limits = state
+        .model_limits
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let (bare_kind, explicit_provider) = match id.split_once('/') {
         Some((p, m)) if p != "combo" => (p, Some(m)),
         _ => ("", None),
@@ -130,12 +132,7 @@ pub async fn get_model(
                 {
                     break;
                 }
-                return Json(serde_json::json!({
-                    "id": id,
-                    "object": "model",
-                    "owned_by": p.name,
-                }))
-                .into_response();
+                return Json(model_json(&limits, &id, &p.name)).into_response();
             }
         }
     }
@@ -147,12 +144,7 @@ pub async fn get_model(
             {
                 break;
             }
-            return Json(serde_json::json!({
-                "id": c.name,
-                "object": "model",
-                "owned_by": "combo",
-            }))
-            .into_response();
+            return Json(model_json(&limits, &c.name, "combo")).into_response();
         }
     }
     super::error_response(
@@ -160,6 +152,33 @@ pub async fn get_model(
         format!("model '{id}' not found"),
         "not_found_error",
     )
+}
+
+/// The wire object for one model.
+///
+/// OpenAI's shape is `id`/`object`/`created`/`owned_by`; the token limits are extra
+/// fields in the spelling the wider ecosystem already uses (OpenRouter's
+/// `context_length`, OpenAI's `max_completion_tokens`). They are only emitted when
+/// the operator set them — inventing a number for an unknown model would be worse
+/// than saying nothing.
+fn model_json(limits: &crate::config::ModelLimits, id: &str, owner: &str) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "id": id,
+        "object": "model",
+        "owned_by": owner,
+    });
+    if let Some(l) = limits.get(id) {
+        if l.context_window > 0 {
+            v["context_length"] = serde_json::json!(l.context_window);
+        }
+        if l.max_output_tokens > 0 {
+            v["max_completion_tokens"] = serde_json::json!(l.max_output_tokens);
+        }
+        if l.max_input_tokens > 0 {
+            v["max_input_tokens"] = serde_json::json!(l.max_input_tokens);
+        }
+    }
+    v
 }
 
 /// `GET /v1/models` is cached per catalogue epoch and filtered twice (disabled

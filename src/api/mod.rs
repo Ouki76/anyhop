@@ -21,6 +21,7 @@
 //! POST /api/models/refresh        re-fetch model lists from all providers
 //! POST /api/models/enable|disable|toggle  {model}
 //! POST /api/models/enable-all|disable-all
+//! GET|POST /api/models/limits     per-model context window / token caps (null clears)
 //! GET|PUT /api/config             raw TOML read / validate+write+reload
 //! POST /api/reload                re-read config from disk
 //! POST /api/auth/start            {kind: antigravity|codex} OAuth onboarding

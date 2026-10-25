@@ -290,6 +290,7 @@ td.num { font-variant-numeric: tabular-nums; }
 .auth-waiting { color: var(--yellow-fg); border-color: rgba(183,121,31,.4); }
 .auth-done { color: var(--green-fg); border-color: rgba(47,158,99,.4); }
 .auth-error { color: var(--red-fg); border-color: rgba(214,69,69,.4); }
+.auth-ok { color: var(--green-fg); border-color: var(--green-bg); }
 .auth-banner.flush { margin: 12px 0 0; }
 
 /* quotas — account cards with model bars */
@@ -421,6 +422,31 @@ a.quota-card { display: block; }
   font-family: var(--mono); font-size: 11.5px;
   border: 1px solid var(--border);
   border-radius: 6px; padding: 4px 10px;
+}
+/* The limits chip is a button: it is the discoverable way into the editor
+   (the row's ghost buttons only appear on hover). */
+.chip-btn {
+  cursor: pointer; background: none; color: var(--dim);
+  font: inherit; font-family: var(--mono); font-size: 11.5px;
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px;
+}
+.chip-btn:hover { color: var(--fg); border-color: var(--fg); }
+.chip-btn.has-limits { color: var(--fg); }
+
+/* Model-limits editor: fixed-width number fields so the per-field Reset button
+   stays next to its input (`.settings-grid .input` stretches to 100%). */
+.limits-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px 28px; margin-top: 6px;
+}
+.limits-grid .form-group { margin-bottom: 0; }
+.limits-grid .input { width: 150px; flex: none; }
+.limits-grid .row { flex-wrap: nowrap; }
+/* The per-field Reset is a primary affordance here, not a hover-only row action:
+   a ghost button would be invisible until the pointer happens to cross it. */
+.limits-grid .btn-ghost {
+  opacity: 1; border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 10px; font-size: 11.5px; letter-spacing: .04em;
 }
 
 /* provider catalog — editorial list */

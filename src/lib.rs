@@ -234,6 +234,11 @@ async fn async_main() -> anyhow::Result<()> {
         request_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
         client_keys: std::sync::RwLock::new(client_keys_map),
         disabled_models: std::sync::RwLock::new(disabled_models_set),
+        // Built here as well as in `install_config`: startup does not go through
+        // `apply_config`, so a limit would be a silent no-op until the first reload.
+        model_limits: std::sync::RwLock::new(crate::config::ModelLimits::build(
+            cfg.model_limits.clone(),
+        )),
         config_lock: tokio::sync::Mutex::new(()),
         tuning: arc_swap::ArcSwap::from_pointee(cfg.tuning.clone()),
     });
@@ -527,6 +532,15 @@ fn install_config(state: &Arc<proxy::AppState>, prepared: PreparedConfig) -> usi
             dm.insert(m.clone());
         }
     }
+    {
+        // Full replacement, like every other derived structure: a limit removed from
+        // the config must stop being published.
+        let built = crate::config::ModelLimits::build(cfg.model_limits.clone());
+        *state
+            .model_limits
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = built;
+    }
     n
 }
 
@@ -658,6 +672,10 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
         .route("/api/models/toggle", post(api::model_toggle))
         .route("/api/models/enable-all", post(api::models_enable_all))
         .route("/api/models/disable-all", post(api::models_disable_all))
+        .route(
+            "/api/models/limits",
+            get(api::models_limits).post(api::models_limits_set),
+        )
         .route("/api/config", get(api::get_config).put(api::put_config))
         .route("/api/reload", post(api::reload))
         .route("/api/server", get(api::get_server))
@@ -999,6 +1017,7 @@ mod tests {
             request_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
             client_keys: std::sync::RwLock::new(std::collections::HashMap::new()),
             disabled_models: std::sync::RwLock::new(std::collections::HashSet::new()),
+            model_limits: std::sync::RwLock::new(crate::config::ModelLimits::default()),
             config_lock: tokio::sync::Mutex::new(()),
             tuning: arc_swap::ArcSwap::from_pointee(cfg.tuning.clone()),
         });

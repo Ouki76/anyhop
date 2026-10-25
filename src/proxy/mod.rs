@@ -91,6 +91,9 @@ pub struct AppState {
         std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<ClientKeyRuntime>>>,
     /// Disabled models (client-facing ids: "provider/model" or combo name).
     pub disabled_models: std::sync::RwLock<std::collections::HashSet<String>>,
+    /// Per-model limits (context window and token caps), with a lookup index that
+    /// also answers to the bare model name.
+    pub model_limits: std::sync::RwLock<crate::config::ModelLimits>,
     /// Serializes read-modify-write cycles on the TOML config file
     /// (dashboard handlers + the OAuth callback all rewrite it).
     pub config_lock: tokio::sync::Mutex<()>,

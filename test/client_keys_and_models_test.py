@@ -377,6 +377,42 @@ def run_tests(original_toml):
     assert request("POST", "/api/combos/delete", {"name": "apitest"})[0] == 404
     print("  ok combos API (add/list/update/delete + validation)")
 
+    # 20b. Per-model limits: view, override, and reset straight from the dashboard.
+    #      They must reach /v1/models (in the ecosystem's spelling), survive a
+    #      reload, and disappear from the file when the last field is cleared.
+    status, _ = request("POST", "/api/models/limits",
+                        {"model": "mock/test-model", "context_window": 131072,
+                         "max_output_tokens": 8192})
+    assert status == 200, status
+    status, models = request("GET", "/api/models")
+    row = next(m for m in models if m["id"] == "mock/test-model")
+    assert row["limits"]["context_window"] == 131072, row
+    assert sorted(row["overridden"]) == ["context_window", "max_output_tokens"], row
+    status, cat = request("GET", "/v1/models")
+    entry = next(m for m in cat["data"] if m["id"] == "mock/test-model")
+    assert entry["context_length"] == 131072, entry
+    assert entry["max_completion_tokens"] == 8192, entry
+    # An inherited bare-name entry is materialised, not shared: editing
+    # "mock/test-model" must not rewrite a limit set on "test-model".
+    with open(os.environ.get("ANYHOP_TEST_CONFIG", "test/anyhop.test.toml")) as f:
+        assert "[[model_limits]]" in f.read()
+    # Out-of-range values are refused before the file is touched.
+    assert request("POST", "/api/models/limits",
+                   {"model": "mock/test-model", "context_window": 100,
+                    "max_output_tokens": 500})[0] == 400
+    # Reset one field, then the last one: the block leaves the file.
+    assert request("POST", "/api/models/limits",
+                   {"model": "mock/test-model", "max_output_tokens": None})[0] == 200
+    status, _ = request("POST", "/api/models/limits",
+                        {"model": "mock/test-model", "context_window": None})
+    assert status == 200, status
+    status, cat = request("GET", "/v1/models")
+    entry = next(m for m in cat["data"] if m["id"] == "mock/test-model")
+    assert "context_length" not in entry, entry
+    with open(os.environ.get("ANYHOP_TEST_CONFIG", "test/anyhop.test.toml")) as f:
+        assert "model_limits" not in f.read(), "reset left the block behind"
+    print("  ok per-model limits (set/publish/reset, validated, file cleaned)")
+
     # 21. Provider settings: update is persisted and validated.
     status, providers = request("GET", "/api/providers")
     mock = next(p for p in providers if p["name"] == "mock")

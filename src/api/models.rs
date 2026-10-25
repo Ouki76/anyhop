@@ -7,9 +7,18 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
-use super::persist::save_disabled_models;
+use super::persist::{save_disabled_models, save_model_limits};
 use super::{ApiResult, ok_json};
+use crate::config::{ModelLimit, ModelLimits};
 use crate::proxy::AppState;
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct ModelLimitsDto {
+    /// 0 = unknown/unset.
+    pub context_window: u64,
+    pub max_output_tokens: u64,
+    pub max_input_tokens: u64,
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ModelItemDto {
@@ -17,6 +26,53 @@ pub struct ModelItemDto {
     pub name: String,
     pub provider: String,
     pub enabled: bool,
+    /// Effective limits (all zero when nothing is known about the model).
+    #[serde(default)]
+    pub limits: ModelLimitsDto,
+    /// Which of `limits` the operator set here, as opposed to an inherited
+    /// bare-name entry — the dashboard shows a reset button per field.
+    #[serde(default)]
+    pub overridden: Vec<String>,
+    /// The config key the limits came from ("" when none matched): a limit set on
+    /// the bare name `beta` shows up on `mock/beta` with `source = "beta"`.
+    #[serde(default)]
+    pub limits_source: String,
+}
+
+/// `POST /api/models/limits` — set or clear per-model limits.
+///
+/// A field that is *absent* is left alone, `null` clears it, a number sets it.
+/// Clearing the last field removes the entry entirely, so "reset" cannot leave a
+/// `[[model_limits]]` block with three zeros behind.
+#[derive(Deserialize)]
+pub struct LimitsUpdate {
+    pub model: String,
+    #[serde(default, deserialize_with = "present_field")]
+    pub context_window: Field<u64>,
+    #[serde(default, deserialize_with = "present_field")]
+    pub max_output_tokens: Field<u64>,
+    #[serde(default, deserialize_with = "present_field")]
+    pub max_input_tokens: Field<u64>,
+}
+
+/// Did the client mention this field at all, and with what?
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Field<T> {
+    #[default]
+    Absent,
+    Clear,
+    Set(T),
+}
+
+fn present_field<'de, D>(d: D) -> Result<Field<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<u64>::deserialize(d)?;
+    Ok(match v {
+        Some(n) => Field::Set(n),
+        None => Field::Clear,
+    })
 }
 
 #[derive(Deserialize)]
@@ -137,30 +193,208 @@ pub async fn models_list(State(state): State<Arc<AppState>>) -> ApiResult {
     let disabled = dm_read(&state).clone();
     let mut list = Vec::new();
 
+    let limits = state
+        .model_limits
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+
     for p in &router.providers {
         for m in p.effective_models().await.iter() {
             let id = format!("{}/{}", p.name, m);
             let enabled = !is_disabled(&disabled, &id);
+            let (limits_dto, overridden, source) = limits_of(&limits, &id);
             list.push(ModelItemDto {
                 id,
                 name: m.to_string(),
                 provider: p.name.clone(),
                 enabled,
+                limits: limits_dto,
+                overridden,
+                limits_source: source,
             });
         }
     }
     for c in &router.combos {
         // Mirrors the request path: "combo/x" and bare "x" both disable a combo.
         let enabled = !is_disabled(&disabled, &c.name);
+        let (limits_dto, overridden, source) = limits_of(&limits, &c.name);
         list.push(ModelItemDto {
             id: c.name.clone(),
             name: c.name.clone(),
             provider: "combo".into(),
             enabled,
+            limits: limits_dto,
+            overridden,
+            limits_source: source,
         });
     }
 
     ok_json(list)
+}
+
+/// Resolve the limits that apply to `id` into wire shape.
+fn limits_of(limits: &ModelLimits, id: &str) -> (ModelLimitsDto, Vec<String>, String) {
+    match limits.get(id) {
+        Some(l) => (
+            ModelLimitsDto {
+                context_window: l.context_window,
+                max_output_tokens: l.max_output_tokens,
+                max_input_tokens: l.max_input_tokens,
+            },
+            l.overridden().into_iter().map(str::to_string).collect(),
+            l.model.clone(),
+        ),
+        None => (ModelLimitsDto::default(), Vec::new(), String::new()),
+    }
+}
+
+pub async fn models_limits(State(state): State<Arc<AppState>>) -> ApiResult {
+    let limits = state
+        .model_limits
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let mut out: Vec<_> = limits
+        .entries()
+        .iter()
+        .cloned()
+        .map(|l| {
+            let overridden: Vec<String> = l.overridden().into_iter().map(str::to_string).collect();
+            (l, overridden)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.model.cmp(&b.0.model));
+    ok_json(
+        out.into_iter()
+            .map(|(l, overridden)| {
+                serde_json::json!({
+                    "model": l.model,
+                    "context_window": l.context_window,
+                    "max_output_tokens": l.max_output_tokens,
+                    "max_input_tokens": l.max_input_tokens,
+                    "overridden": overridden,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+pub async fn models_limits_set(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<LimitsUpdate>,
+) -> ApiResult {
+    let model = update.model.trim().to_string();
+    if model.is_empty() {
+        return Err(super::ApiError::BadRequest("model is required".into()));
+    }
+    if model.chars().count() > ModelLimit::MAX_MODEL_LEN || model.chars().any(|c| c.is_control()) {
+        return Err(super::ApiError::BadRequest(
+            "invalid model id (too long, or contains control characters)".into(),
+        ));
+    }
+
+    // Work from the installed snapshot, not from a pre-lock read: the writer below
+    // re-validates and rebuilds from the file, and a concurrent edit must not be
+    // overwritten with a stale list.
+    let mut list: Vec<ModelLimit> = state
+        .model_limits
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .entries()
+        .to_vec();
+
+    // The entry the operator is editing: the id itself, or an inherited bare-name
+    // entry when they are looking at `provider/model` that inherits from `model`.
+    let idx = list.iter().position(|l| l.model == model).or_else(|| {
+        // Inherited from a bare-name entry: find the entry it came from.
+        let inherited = state
+            .model_limits
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&model)?
+            .model
+            .clone();
+        list.iter().position(|l| l.model == inherited)
+    });
+
+    let mut entry = match idx {
+        // The entry the operator is editing: replace it in place.
+        Some(i) if list[i].model == model => list.remove(i),
+        // Inherited from a shared bare-name entry: copy its values into a dedicated
+        // entry and leave the shared one alone (a `provider/model` edit must not
+        // silently change every other provider serving that model).
+        Some(i) => ModelLimit {
+            model: model.clone(),
+            ..list[i].clone()
+        },
+        None => ModelLimit {
+            model: model.clone(),
+            ..Default::default()
+        },
+    };
+    apply_field(&mut entry.context_window, update.context_window);
+    apply_field(&mut entry.max_output_tokens, update.max_output_tokens);
+    apply_field(&mut entry.max_input_tokens, update.max_input_tokens);
+
+    if let Err(e) = entry.check() {
+        // `check()` also rejects an all-zero entry; that is the "reset everything"
+        // case, which must remove the entry rather than fail.
+        let reset = entry.is_empty();
+        let existed = idx.is_some_and(|i| list.get(i).is_some_and(|l| l.model == model));
+        if !(reset && (existed || idx.is_some())) {
+            return Err(super::ApiError::BadRequest(format!("{e}")));
+        }
+    }
+    if !entry.is_empty() {
+        list.push(entry.clone());
+    }
+    list.sort_by(|a, b| a.model.cmp(&b.model));
+
+    save_model_limits(&state, &list)
+        .await
+        .map_err(|resp| boxed(&resp))?;
+    state.invalidate_catalog();
+    state.events.emit_simple(
+        "models",
+        &entry.model,
+        "limits",
+        if entry.is_empty() {
+            "limits reset".to_string()
+        } else {
+            format!(
+                "limits: {}",
+                entry
+                    .overridden()
+                    .into_iter()
+                    .map(|f| format!(
+                        "{f}={}",
+                        match f {
+                            "context_window" => entry.context_window,
+                            "max_output_tokens" => entry.max_output_tokens,
+                            _ => entry.max_input_tokens,
+                        }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        },
+    );
+    ok_json(serde_json::json!({
+        "model": if entry.is_empty() { model } else { entry.model.clone() },
+        "context_window": entry.context_window,
+        "max_output_tokens": entry.max_output_tokens,
+        "max_input_tokens": entry.max_input_tokens,
+        "overridden": entry.overridden(),
+    }))
+}
+
+fn apply_field(target: &mut u64, field: Field<u64>) {
+    match field {
+        Field::Absent => {}
+        Field::Clear => *target = 0,
+        Field::Set(n) => *target = n,
+    }
 }
 
 pub async fn models_refresh(State(state): State<Arc<AppState>>) -> ApiResult {
@@ -318,10 +552,12 @@ mod tests {
         json(&serde_json::json!({ "model": model }).to_string())
     }
 
-    /// A state with one provider serving `mock/m` and one combo `combo/x`.
-    fn state_with_catalogue() -> (std::sync::Arc<AppState>, std::path::PathBuf) {
-        let path = temp_config(MINIMAL);
-        let st = state(&path);
+    /// The router the tests expect to be serving (`mock/m`, `mock/m2`, combo `x`).
+    ///
+    /// Any config write reinstalls the router from the *file*, which in these tests
+    /// has no providers — so a test that writes a limit and then looks at the
+    /// catalogue has to put this router back.
+    fn catalogue() -> crate::providers::ProviderRouter {
         let pcfg: ProviderConfig = toml::from_str(
             r#"
             name = "mock"
@@ -342,14 +578,24 @@ mod tests {
             1,
         )
         .expect("builds offline");
-        st.router
-            .store(std::sync::Arc::new(crate::providers::ProviderRouter {
-                providers: vec![provider],
-                combos: vec![ComboConfig {
-                    name: "x".to_string(),
-                    chain: vec!["mock/m".to_string()],
-                }],
-            }));
+        crate::providers::ProviderRouter {
+            providers: vec![provider],
+            combos: vec![ComboConfig {
+                name: "x".to_string(),
+                chain: vec!["mock/m".to_string()],
+            }],
+        }
+    }
+
+    fn install_catalogue(st: &std::sync::Arc<AppState>) {
+        st.router.store(std::sync::Arc::new(catalogue()));
+    }
+
+    /// A state with one provider serving `mock/m` and one combo `combo/x`.
+    fn state_with_catalogue() -> (std::sync::Arc<AppState>, std::path::PathBuf) {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+        install_catalogue(&st);
         (st, path)
     }
 
@@ -508,6 +754,181 @@ mod tests {
         let raw = std::fs::read_to_string(&path).expect("read");
         let parsed: crate::config::Config = toml::from_str(&raw).expect("valid config");
         assert!(parsed.disabled_models.is_empty(), "{raw}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- per-model limits -----
+
+    fn limits_update(body: serde_json::Value) -> Json<LimitsUpdate> {
+        json(&body.to_string())
+    }
+
+    /// View → edit → reset, with the file and the published catalogue in step.
+    #[tokio::test]
+    async fn a_limit_round_trips_and_a_full_reset_removes_the_entry() {
+        let (st, path) = state_with_catalogue();
+
+        let resp = models_limits_set(
+            State(st.clone()),
+            limits_update(serde_json::json!({
+                "model": "mock/m",
+                "context_window": 131072,
+                "max_output_tokens": 8192,
+            })),
+        )
+        .await
+        .expect("set");
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(body["context_window"], 131072);
+        assert_eq!(
+            body["overridden"],
+            serde_json::json!(["context_window", "max_output_tokens"])
+        );
+
+        // The runtime map answers to both spellings.
+        let live = st.model_limits.read().unwrap().clone();
+        assert_eq!(live.get("mock/m").map(|l| l.max_output_tokens), Some(8192));
+        assert_eq!(live.get("m").map(|l| l.context_window), Some(131072));
+
+        // The file is valid and carries the entry.
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let parsed: crate::config::Config = toml::from_str(&raw).expect("valid config");
+        assert_eq!(parsed.model_limits.len(), 1, "{raw}");
+        assert_eq!(parsed.model_limits[0].context_window, 131072);
+
+        // The catalogue publishes them in the ecosystem's spelling. (The write above
+        // reinstalled the router from the file, which has no providers.)
+        install_catalogue(&st);
+        let listed = crate::proxy::list_models(State(st.clone()), None).await;
+        let listed: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let m = listed["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "mock/m")
+            .unwrap_or_else(|| panic!("mock/m listed: {listed}"));
+        assert_eq!(m["context_length"], 131072, "{listed}");
+        assert_eq!(m["max_completion_tokens"], 8192, "{listed}");
+
+        // Clearing one field keeps the others…
+        models_limits_set(
+            State(st.clone()),
+            limits_update(serde_json::json!({
+                "model": "mock/m",
+                "max_output_tokens": null,
+            })),
+        )
+        .await
+        .expect("clear one");
+        let live = st.model_limits.read().unwrap().clone();
+        let l = live.get("mock/m").expect("still set");
+        assert_eq!(l.context_window, 131072);
+        assert_eq!(l.max_output_tokens, 0);
+
+        // …and clearing the last one removes the entry from the file entirely.
+        models_limits_set(
+            State(st.clone()),
+            limits_update(serde_json::json!({"model": "mock/m", "context_window": null})),
+        )
+        .await
+        .expect("clear the last");
+        assert!(
+            st.model_limits.read().unwrap().is_empty(),
+            "{:?}",
+            st.model_limits.read().unwrap()
+        );
+        let raw = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            !raw.contains("model_limits"),
+            "left an empty block behind: {raw}"
+        );
+        let parsed: crate::config::Config = toml::from_str(&raw).expect("valid config");
+        assert!(parsed.model_limits.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A limit set on the bare name applies to every provider; editing the
+    /// qualified id must create its own entry instead of rewriting the shared one.
+    #[tokio::test]
+    async fn editing_an_inherited_limit_does_not_rewrite_the_shared_entry() {
+        let (st, path) = state_with_catalogue();
+        models_limits_set(
+            State(st.clone()),
+            limits_update(serde_json::json!({"model": "m", "context_window": 32000})),
+        )
+        .await
+        .expect("bare name");
+
+        // The qualified id inherits it… (re-install: the write above rebuilt the
+        // router from the file)
+        install_catalogue(&st);
+        let listed = models_list(State(st.clone())).await.expect("list");
+        let listed: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let row = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "mock/m")
+            .expect("mock/m listed");
+        assert_eq!(row["limits"]["context_window"], 32000, "{listed}");
+        assert_eq!(row["limits_source"], "m", "{listed}");
+
+        // …and editing it materialises a dedicated entry.
+        models_limits_set(
+            State(st.clone()),
+            limits_update(serde_json::json!({"model": "mock/m", "max_output_tokens": 4096})),
+        )
+        .await
+        .expect("qualified");
+        let live = st.model_limits.read().unwrap().clone();
+        assert_eq!(live.entries().len(), 2, "{live:?}");
+        assert_eq!(live.get("m").unwrap().context_window, 32000);
+        let qualified = live.get("mock/m").expect("dedicated entry");
+        assert_eq!(qualified.context_window, 32000, "inherited the window");
+        assert_eq!(qualified.max_output_tokens, 4096);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Nonsense is refused *before* the file is rewritten.
+    #[tokio::test]
+    async fn invalid_limits_are_rejected_and_the_file_is_untouched() {
+        let (st, path) = state_with_catalogue();
+        let before = std::fs::read_to_string(&path).expect("read");
+
+        for bad in [
+            serde_json::json!({"model": "", "context_window": 1}),
+            serde_json::json!({"model": "mock/m", "context_window": 100, "max_output_tokens": 500}),
+            serde_json::json!({"model": "mock/m", "context_window": u64::MAX}),
+            serde_json::json!({"model": "mock/m", "max_output_tokens": 0}),
+        ] {
+            let err = models_limits_set(State(st.clone()), limits_update(bad.clone()))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{bad} was accepted"));
+            assert!(
+                err.to_string().to_lowercase().contains("model")
+                    || format!("{err:?}").to_lowercase().contains("bad"),
+                "{err:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            before,
+            "a rejected request rewrote the config"
+        );
+        assert!(st.model_limits.read().unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
     }
 }

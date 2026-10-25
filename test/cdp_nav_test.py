@@ -212,6 +212,94 @@ def main():
         if rows == 0:
             fail("no providers rendered — the dashboard is not authenticated")
 
+        # 3b. Per-model limits: the row shows what is set, the panel edits it and
+        #     the per-field Reset button actually clears the override.
+        status, body = api("GET", "/api/models")
+        if status != 200 or not json.loads(body):
+            fail(f"GET /api/models returned {status}")
+        first = next(m for m in json.loads(body) if m["provider"] != "combo")
+        model_id = first["id"]
+        api("POST", "/api/models/limits",
+            {"model": model_id, "context_window": 65536, "max_output_tokens": 4096})
+        js("""
+          [...document.querySelectorAll('.side-nav .nav-item')]
+            .find(t => t.textContent.trim().toUpperCase() === 'MODELS')?.click(), 'ok'
+        """)
+        time.sleep(1.5)
+        chip = js("""
+          (() => {
+            const row = [...document.querySelectorAll('.model-row')]
+              .find(r => r.querySelector('.model-row-id')?.textContent.trim() === %s);
+            return row?.querySelector('.chip-btn')?.textContent.trim() || '';
+          })()
+        """ % json.dumps(model_id))
+        collect()
+        if "ctx" not in chip or "65.5k" not in chip:
+            fail(f"model row does not show the limits ({chip!r} for {model_id})")
+        print(f"  ok models row shows limits ({chip})")
+
+        opened = js("""
+          (() => {
+            const row = [...document.querySelectorAll('.model-row')]
+              .find(r => r.querySelector('.model-row-id')?.textContent.trim() === %s);
+            // The row's ghost buttons only appear on hover; the limits chip is the
+            // always-visible way in (and the one an operator will find).
+            const chip = row.querySelector('.chip-btn');
+            const btn = [...row.querySelectorAll('button')].find(b => b.textContent.trim() === 'Limits');
+            const target = chip || btn;
+            if (!target) return 'missing';
+            target.click();
+            return 'clicked';
+          })()
+        """ % json.dumps(model_id))
+        time.sleep(1.0)
+        panel = js("""
+          (() => {
+            const card = document.querySelector('.model-limits');
+            if (!card) return {error: 'no panel'};
+            return {
+              inputs: card.querySelectorAll('input[type=number]').length,
+              resets: [...card.querySelectorAll('button')].filter(b => b.textContent.trim() === 'Reset').length,
+              ctx: card.querySelector('input[type=number]')?.value,
+            };
+          })()
+        """)
+        collect()
+        if opened != "clicked" or not isinstance(panel, dict) or panel.get("error"):
+            fail(f"limits panel did not open: {opened} {panel}")
+        if panel["inputs"] != 3 or panel["resets"] < 1 or panel["ctx"] != "65536":
+            fail(f"limits panel is wrong: {panel}")
+        print(f"  ok limits panel (3 fields, {panel['resets']} reset button(s))")
+
+        # Reset the context window: the override disappears, the input empties, and
+        # the row chip drops the value.
+        js("""
+          (() => {
+            const card = document.querySelector('.model-limits');
+            const btn = [...card.querySelectorAll('button')].find(b => b.textContent.trim() === 'Reset');
+            btn?.click();
+            return 'ok';
+          })()
+        """)
+        time.sleep(2.0)
+        after = js("""
+          (() => {
+            const card = document.querySelector('.model-limits');
+            const row = [...document.querySelectorAll('.model-row')]
+              .find(r => r.querySelector('.model-row-id')?.textContent.trim() === %s);
+            return {
+              ctx: card?.querySelector('input[type=number]')?.value ?? 'gone',
+              chip: row?.querySelector('.chip-btn')?.textContent.trim() || '',
+            };
+          })()
+        """ % json.dumps(model_id))
+        collect()
+        if isinstance(after, dict) and after.get("ctx") == "65536":
+            fail(f"reset did not clear the override: {after}")
+        print(f"  ok limits reset ({after})")
+        api("POST", "/api/models/limits",
+            {"model": model_id, "context_window": None, "max_output_tokens": None})
+
         # 4. Events tab must receive SSE events. Regression guard: EventSource cannot
         #    set headers, so without ?key= the stream is 401 and the list stays empty.
         api("POST", "/api/client-keys/add",

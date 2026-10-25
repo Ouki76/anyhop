@@ -15,6 +15,18 @@ pub struct Config {
     pub client_keys: Vec<ClientKeyConfig>,
     #[serde(default)]
     pub disabled_models: Vec<String>,
+    /// Per-model limits (context window and token caps), editable from the
+    /// dashboard and published in `/v1/models`.
+    ///
+    ///     [[model_limits]]
+    ///     model = "dashscope/deepseek-v4-pro"
+    ///     context_window = 131072
+    ///     max_output_tokens = 8192
+    ///
+    /// A zero (or absent) value means "not set": the gateway then publishes no
+    /// number for that field instead of inventing one.
+    #[serde(default)]
+    pub model_limits: Vec<ModelLimit>,
     /// Runtime knobs that used to be hardcoded constants.
     #[serde(default)]
     pub tuning: Tuning,
@@ -307,6 +319,175 @@ pub struct ComboConfig {
     pub name: String,
     /// Entries like "provider/model".
     pub chain: Vec<String>,
+}
+
+/// What the gateway knows about one model's limits.
+///
+/// Every field is optional and defaults to 0 (= unknown). The rules a value has to
+/// satisfy live in [`ModelLimit::check`], so a hand-edited file, `PUT /api/config`
+/// and the dashboard accept exactly the same numbers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct ModelLimit {
+    /// `provider/model`, a bare model name (applies to every provider serving it),
+    /// or a combo name.
+    pub model: String,
+    /// Total tokens the model can hold — prompt plus completion.
+    pub context_window: u64,
+    /// Cap on the completion; published as `max_completion_tokens` in `/v1/models`.
+    pub max_output_tokens: u64,
+    /// Cap on the prompt alone, when the provider states one separately.
+    pub max_input_tokens: u64,
+}
+
+/// Largest accepted values: a wrong number must not turn into an absurd JSON
+/// response, and `u64::MAX` in a config file is always a typo.
+pub const MAX_CONTEXT_WINDOW: u64 = 10_000_000;
+pub const MAX_OUTPUT_TOKENS: u64 = 1_000_000;
+
+impl ModelLimit {
+    /// Longest accepted model id — the same bound `disabled_models` uses.
+    pub const MAX_MODEL_LEN: usize = 256;
+
+    /// Did the operator set anything at all?
+    pub fn is_empty(&self) -> bool {
+        self.context_window == 0 && self.max_output_tokens == 0 && self.max_input_tokens == 0
+    }
+
+    /// Which fields carry an explicit value ("context_window", …).
+    pub fn overridden(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.context_window > 0 {
+            out.push("context_window");
+        }
+        if self.max_output_tokens > 0 {
+            out.push("max_output_tokens");
+        }
+        if self.max_input_tokens > 0 {
+            out.push("max_input_tokens");
+        }
+        out
+    }
+
+    /// Validation shared by `Config::validate` and the API handler.
+    pub fn check(&self) -> anyhow::Result<()> {
+        let m = self.model.trim();
+        anyhow::ensure!(!m.is_empty(), "model_limits entry with an empty model id");
+        anyhow::ensure!(
+            m.chars().count() <= Self::MAX_MODEL_LEN,
+            "model_limits: model id is too long (max {} characters)",
+            Self::MAX_MODEL_LEN
+        );
+        anyhow::ensure!(
+            !m.chars().any(|c| c.is_control()),
+            "model_limits: model id must not contain control characters"
+        );
+        anyhow::ensure!(
+            self.context_window <= MAX_CONTEXT_WINDOW,
+            "model_limits '{}': context_window must be 0 (unset) or 1..={MAX_CONTEXT_WINDOW}",
+            self.model
+        );
+        anyhow::ensure!(
+            self.max_output_tokens <= MAX_OUTPUT_TOKENS,
+            "model_limits '{}': max_output_tokens must be 0 (unset) or 1..={MAX_OUTPUT_TOKENS}",
+            self.model
+        );
+        anyhow::ensure!(
+            self.max_input_tokens <= MAX_CONTEXT_WINDOW,
+            "model_limits '{}': max_input_tokens must be 0 (unset) or 1..={MAX_CONTEXT_WINDOW}",
+            self.model
+        );
+        // The completion is part of the window: a cap larger than the whole window
+        // can never be satisfied, and the dashboard would happily show both.
+        if self.context_window > 0 && self.max_output_tokens > 0 {
+            anyhow::ensure!(
+                self.max_output_tokens <= self.context_window,
+                "model_limits '{}': max_output_tokens ({}) cannot exceed context_window ({})",
+                self.model,
+                self.max_output_tokens,
+                self.context_window
+            );
+        }
+        if self.context_window > 0 && self.max_input_tokens > 0 {
+            anyhow::ensure!(
+                self.max_input_tokens <= self.context_window,
+                "model_limits '{}': max_input_tokens ({}) cannot exceed context_window ({})",
+                self.model,
+                self.max_input_tokens,
+                self.context_window
+            );
+        }
+        anyhow::ensure!(
+            !self.is_empty(),
+            "model_limits '{}': nothing to store (set at least one limit or delete the entry)",
+            self.model
+        );
+        Ok(())
+    }
+}
+
+/// The installed per-model limits.
+///
+/// `entries` is exactly what the file holds (canonical model ids, sorted) — the
+/// writer and the API need that list. `index` answers a lookup for any spelling
+/// (*qualified id*, bare model name, `combo/<name>`) in one hash probe, which is
+/// what `/v1/models` does for every model of every provider.
+#[derive(Debug, Clone, Default)]
+pub struct ModelLimits {
+    entries: Vec<ModelLimit>,
+    index: std::collections::HashMap<String, ModelLimit>,
+}
+
+impl ModelLimits {
+    pub fn build(mut entries: Vec<ModelLimit>) -> Self {
+        for l in &mut entries {
+            l.model = l.model.trim().to_string();
+        }
+        entries.retain(|l| !l.model.is_empty() && !l.is_empty());
+        entries.sort_by(|a, b| a.model.cmp(&b.model));
+
+        let mut index = std::collections::HashMap::new();
+        for l in &entries {
+            // The entry itself…
+            index.insert(l.model.clone(), l.clone());
+            // …its bare name (a limit on `beta` applies to every provider serving
+            // `beta`), and `combo/<name>` for a bare combo name.
+            match l.model.split_once('/') {
+                Some((_, bare)) if !bare.is_empty() => {
+                    index.entry(bare.to_string()).or_insert_with(|| l.clone());
+                }
+                _ => {
+                    index
+                        .entry(format!("combo/{}", l.model))
+                        .or_insert_with(|| l.clone());
+                }
+            }
+        }
+        Self { entries, index }
+    }
+
+    /// The limits that apply to `id`, or `None`.
+    pub fn get(&self, id: &str) -> Option<&ModelLimit> {
+        if let Some(l) = self.index.get(id) {
+            return Some(l);
+        }
+        // A qualified id whose provider-specific entry is absent still inherits the
+        // bare-name entry, which `build` indexed — covered by the lookup above. The
+        // remaining case is a bare id asking for a `combo/` spelling.
+        match id.split_once('/') {
+            Some((_, bare)) => self.index.get(bare),
+            None => self.index.get(&format!("combo/{id}")),
+        }
+    }
+
+    /// What the file holds (canonical ids, sorted).
+    pub fn entries(&self) -> &[ModelLimit] {
+        &self.entries
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 impl Config {
@@ -617,6 +798,18 @@ impl Config {
         );
 
         let mut key_values = std::collections::HashSet::new();
+        // Per-model limits: unique ids, bounded numbers, and consistency between
+        // the window and the caps (see ModelLimit::check).
+        let mut limit_ids = std::collections::HashSet::new();
+        for l in &self.model_limits {
+            l.check()?;
+            anyhow::ensure!(
+                limit_ids.insert(l.model.trim().to_string()),
+                "duplicate model_limits entry for '{}'",
+                l.model
+            );
+        }
+
         let mut key_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (i, k) in self.client_keys.iter().enumerate() {
             // An empty key would be matched by an empty bearer token.
@@ -990,6 +1183,69 @@ mod tests {
             "[server]\ntls_cert = \"/etc/anyhop/tls.crt\"\ntls_key = \"/etc/anyhop/tls.key\"",
         );
         parse(&both).validate().expect("a complete pair is valid");
+    }
+
+    /// Per-model limits: the numbers the dashboard offers are the numbers the
+    /// validator accepts, and the runtime index answers every spelling of a model.
+    #[test]
+    fn model_limits_are_bounded_and_indexed_by_every_spelling() {
+        let ok = VALID.to_string()
+            + r#"
+            [[model_limits]]
+            model = "p/alpha"
+            context_window = 131072
+            max_output_tokens = 8192
+
+            [[model_limits]]
+            model = "beta"
+            context_window = 32000
+            "#;
+        let cfg = parse(&ok);
+        cfg.validate().expect("valid limits");
+
+        let index = ModelLimits::build(cfg.model_limits.clone());
+        // The qualified id and the bare name both resolve…
+        assert_eq!(index.get("p/alpha").map(|l| l.context_window), Some(131072));
+        assert_eq!(index.get("alpha").map(|l| l.max_output_tokens), Some(8192));
+        // …as does a bare entry for a model served by any provider, even when the
+        // provider-qualified spelling was never written.
+        assert_eq!(index.get("beta").map(|l| l.context_window), Some(32000));
+        assert_eq!(
+            index.get("other/beta").map(|l| l.context_window),
+            Some(32000)
+        );
+        assert!(index.get("gamma").is_none());
+
+        // Out-of-range and contradictory numbers are refused, so the dashboard
+        // cannot store something the next reload rejects.
+        for (body, needle) in [
+            (
+                "model = \"p/a\"\ncontext_window = 100\nmax_output_tokens = 500",
+                "cannot exceed",
+            ),
+            (
+                "model = \"p/a\"\nmax_output_tokens = 2000000",
+                "max_output_tokens",
+            ),
+            (
+                "model = \"p/a\"\ncontext_window = 99000000",
+                "context_window",
+            ),
+            ("model = \"\"\ncontext_window = 100", "empty model id"),
+            ("model = \"p/a\"", "nothing to store"),
+        ] {
+            let cfg = VALID.to_string() + &format!("\n[[model_limits]]\n{body}\n");
+            let msg = error_of(&cfg);
+            assert!(msg.contains(needle), "{body}: {msg}");
+        }
+
+        // Two entries for the same model are ambiguous — reject instead of letting
+        // the index pick one by iteration order.
+        let dup = VALID.to_string()
+            + "\n[[model_limits]]\nmodel = \"p/a\"\ncontext_window = 1000\n"
+            + "\n[[model_limits]]\nmodel = \"p/a\"\ncontext_window = 2000\n";
+        let msg = error_of(&dup);
+        assert!(msg.contains("duplicate"), "{msg}");
     }
 
     /// The per-provider override wins over `server.max_retries`, which is bounded —

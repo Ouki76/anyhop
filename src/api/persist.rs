@@ -38,6 +38,17 @@ pub(crate) async fn save_disabled_models(
     commit_config_text(state, &text).await.map(|_| ())
 }
 
+/// Persist the whole `[[model_limits]]` list (same discipline as
+/// [`save_client_keys`]): validate, build, write, install.
+pub(crate) async fn save_model_limits(
+    state: &Arc<AppState>,
+    limits: &[crate::config::ModelLimit],
+) -> Result<(), Box<axum::response::Response>> {
+    let _guard = state.config_lock.lock().await;
+    let text = model_limits_text(&state.config_path, limits).map_err(io_error)?;
+    commit_config_text(state, &text).await.map(|_| ())
+}
+
 /// A config-file read/parse failure is *our* problem, not the caller's: 404 used to
 /// make a permissions or ENOSPC error look like a wrong URL.
 fn io_error(e: anyhow::Error) -> Box<axum::response::Response> {
@@ -139,6 +150,41 @@ pub fn client_keys_text(
         arr.push(t);
     }
     doc["client_keys"] = toml_edit::Item::ArrayOfTables(arr);
+
+    Ok(doc.to_string())
+}
+
+pub fn model_limits_text(
+    path: &str,
+    limits: &[crate::config::ModelLimit],
+) -> anyhow::Result<String> {
+    let raw = std::fs::read_to_string(path)?;
+    let mut doc = raw.parse::<toml_edit::DocumentMut>()?;
+
+    let mut arr = toml_edit::ArrayOfTables::new();
+    for l in limits {
+        let mut t = toml_edit::Table::new();
+        t["model"] = toml_edit::value(l.model.clone());
+        // Only the fields that carry a value: an explicit `0` in the file is
+        // indistinguishable from "unset" anyway, and a shorter diff is easier to
+        // review when the dashboard edits one number.
+        if l.context_window > 0 {
+            t["context_window"] = toml_edit::value(l.context_window as i64);
+        }
+        if l.max_output_tokens > 0 {
+            t["max_output_tokens"] = toml_edit::value(l.max_output_tokens as i64);
+        }
+        if l.max_input_tokens > 0 {
+            t["max_input_tokens"] = toml_edit::value(l.max_input_tokens as i64);
+        }
+        arr.push(t);
+    }
+    if limits.is_empty() {
+        // Leave no empty header behind (`[[model_limits]]` with no entries).
+        doc.remove("model_limits");
+    } else {
+        doc["model_limits"] = toml_edit::Item::ArrayOfTables(arr);
+    }
 
     Ok(doc.to_string())
 }

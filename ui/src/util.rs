@@ -243,3 +243,32 @@ pub async fn reload_client_keys(keys: Signal<Vec<ClientKeyDto>>) {
         keys.set(d);
     }
 }
+
+/// A number as an input value: 0 means "not set" and becomes an empty field.
+pub fn sig_str(n: u64) -> String {
+    if n == 0 {
+        String::new()
+    } else {
+        n.to_string()
+    }
+}
+
+/// Parse an optional number field: empty -> None, digits -> Some(n).
+///
+/// A junk value is an error, not "empty": treating it as empty would silently
+/// reset the limit the operator meant to change.
+pub fn parse_opt(raw: &str) -> Result<Option<u64>, ()> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    t.parse::<u64>().map(Some).map_err(|_| ())
+}
+
+/// `Some(n)` -> n, `None` -> JSON null (which clears the field server-side).
+pub fn opt_json(v: Option<u64>) -> serde_json::Value {
+    match v {
+        Some(n) => serde_json::Value::from(n),
+        None => serde_json::Value::Null,
+    }
+}
