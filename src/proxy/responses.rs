@@ -494,13 +494,11 @@ pub fn to_chat_request(v: &Value) -> Result<Value, (StatusCode, String)> {
     // replayed) by the handler, so it is not this function's business.
     let tools = translate_tools(v.get("tools"))?;
     let tool_choice = translate_tool_choice(v.get("tool_choice"))?;
-    if let Some(reasoning) = v.get("reasoning")
-        && reasoning
-            .as_object()
-            .is_some_and(|o| !o.is_empty() && o.values().any(|x| !x.is_null()))
-    {
-        return Err(unsupported("reasoning"));
-    }
+    // `reasoning.effort` is honourable: chat-completions spells the same hint
+    // `reasoning_effort`. The other subfields (`summary`,
+    // `encrypted_content`) are Responses-only bookkeeping and are dropped —
+    // rejecting them made every "high effort" turn fail.
+    let reasoning_effort = translate_reasoning(v.get("reasoning"))?;
     if let Some(format) = v.pointer("/text/format")
         && !is_plain_text_format(format)
     {
@@ -544,6 +542,9 @@ pub fn to_chat_request(v: &Value) -> Result<Value, (StatusCode, String)> {
     let mut chat = json!({"model": model, "messages": messages});
     if let Some(n) = max_tokens {
         chat["max_tokens"] = json!(n);
+    }
+    if let Some(effort) = reasoning_effort {
+        chat["reasoning_effort"] = effort;
     }
     if let Some(tools) = tools {
         chat["tools"] = tools;
@@ -622,6 +623,28 @@ fn translate_tools(tools: Option<&Value>) -> Result<Option<Value>, (StatusCode, 
         out.push(json!({"type": "function", "function": f}));
     }
     Ok(Some(json!(out)))
+}
+
+/// Responses `reasoning` -> chat `reasoning_effort`.
+///
+/// Only the effort hint has an equivalent; `summary` and `encrypted_content` are
+/// Responses-specific and are dropped. A `reasoning` object without an effort is
+/// inert, so it is ignored rather than refused.
+fn translate_reasoning(reasoning: Option<&Value>) -> Result<Option<Value>, (StatusCode, String)> {
+    let Some(reasoning) = reasoning else {
+        return Ok(None);
+    };
+    if reasoning.is_null() {
+        return Ok(None);
+    }
+    let Some(obj) = reasoning.as_object() else {
+        return Err(bad_request("'reasoning' must be an object"));
+    };
+    match obj.get("effort") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(e)) if !e.trim().is_empty() => Ok(Some(json!(e.trim()))),
+        Some(_) => Err(bad_request("'reasoning.effort' must be a string")),
+    }
 }
 
 /// Responses `tool_choice` -> chat `tool_choice`.
@@ -1779,10 +1802,6 @@ mod tests {
                 "tool_choice",
             ),
             (
-                json!({"model": "m", "input": "hi", "reasoning": {"effort": "high"}}),
-                "reasoning",
-            ),
-            (
                 json!({"model": "m", "input": "hi", "text": {"format": {"type": "json_schema"}}}),
                 "text.format",
             ),
@@ -1887,6 +1906,35 @@ mod tests {
         assert_eq!(items.len(), 2, "{out}");
         assert_eq!(items[0]["type"], "message");
         assert_eq!(items[1]["type"], "function_call");
+    }
+
+    /// `reasoning.effort` reaches the upstream as `reasoning_effort`; the
+    /// Responses-only bookkeeping around it is dropped instead of failing the turn.
+    #[test]
+    fn reasoning_effort_is_forwarded_and_the_rest_is_dropped() {
+        let chat = to_chat_request(&json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "include": ["reasoning.encrypted_content"]
+        }))
+        .expect("effort is supported");
+        assert_eq!(chat["reasoning_effort"], "high");
+        assert!(chat.get("reasoning").is_none(), "{chat}");
+
+        // No effort at all: nothing is sent, nothing fails.
+        let chat = to_chat_request(
+            &json!({"model": "m", "input": "hi", "reasoning": {"summary": "auto"}}),
+        )
+        .expect("an inert reasoning object is fine");
+        assert!(chat.get("reasoning_effort").is_none(), "{chat}");
+
+        // A non-string effort is a client error, by name.
+        let (status, msg) =
+            to_chat_request(&json!({"model": "m", "input": "hi", "reasoning": {"effort": 3}}))
+                .expect_err("must be rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("reasoning.effort"), "{msg}");
     }
 
     #[test]
