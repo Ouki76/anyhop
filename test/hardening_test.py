@@ -287,6 +287,40 @@ def check_observability():
         else:
             ok("/v1/responses returns a Response object")
 
+        # A tool turn that continues through previous_response_id: the stored turn
+        # must replay the assistant's function_call, or the follow-up answers a call
+        # the model can never see and the upstream rejects the whole conversation.
+        tools = [{"type": "function", "name": "lookup",
+                  "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}]
+        status, body = request(port, "/v1/responses", {
+            "model": "mock/test-model",
+            "input": "find it",
+            "tools": tools,
+            "store": True,
+        })
+        call = None
+        rid = None
+        if status == 200:
+            parsed = json.loads(body)
+            rid = parsed.get("id")
+            calls = [i for i in parsed.get("output", []) if i.get("type") == "function_call"]
+            call = calls[0] if calls else None
+        if not call:
+            fail(f"tool turn: no function_call item ({status}): {body[:160]}")
+        else:
+            ok("/v1/responses returns a function_call item")
+            status, body = request(port, "/v1/responses", {
+                "model": "mock/test-model",
+                "input": [{"type": "function_call_output",
+                           "call_id": call["call_id"], "output": "100"}],
+                "previous_response_id": rid,
+            })
+            if status != 200:
+                fail(f"tool follow-up on previous_response_id: {status}: {body[:160]}")
+            else:
+                kind = json.loads(body).get("object")
+                ok(f"tool follow-up replays the call (previous_response_id, {kind})")
+
         status, body = request(port, "/v1/models/mock/test-model")
         if status != 200 or json.loads(body).get("id") != "mock/test-model":
             fail(f"/v1/models/{{id}} returned {status}: {body[:100]}")

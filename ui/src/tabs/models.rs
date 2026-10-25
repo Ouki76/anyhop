@@ -255,6 +255,15 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                                     }
                                 };
                                 let has_limits = !limit_chips.is_empty();
+                                // Where each number comes from, on hover: the chip has
+                                // no room for provenance, and "why is this 1M?" is the
+                                // question an operator actually asks.
+                                let limit_tip = format!(
+                                    "context: {} · output: {} · input: {}\nclick to edit",
+                                    m.source_of("context_window"),
+                                    m.source_of("max_output_tokens"),
+                                    m.source_of("max_input_tokens"),
+                                );
 
                                 view! {
                                     div(class=if enabled { "model-row" } else { "model-row off" }) {
@@ -263,7 +272,7 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                                         span(class="dim-text") { (prov) }
                                         button(
                                             class=if has_limits { "chip-btn has-limits" } else { "chip-btn" },
-                                            title="View or override this model's limits",
+                                            title=limit_tip.clone(),
                                             on:click=move |_| { open_limits(id_chip.clone()); }
                                         ) {
                                             (if has_limits { limit_chips.clone() } else { "+ limits".to_string() })
