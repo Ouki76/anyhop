@@ -387,7 +387,11 @@ def run_tests(original_toml):
     status, models = request("GET", "/api/models")
     row = next(m for m in models if m["id"] == "mock/test-model")
     assert row["limits"]["context_window"] == 131072, row
-    assert sorted(row["overridden"]) == ["context_window", "max_output_tokens"], row
+    assert row["overrides"]["context_window"] == 131072, row
+    assert row["overrides"]["max_output_tokens"] == 8192, row
+    # The operator's own numbers are reported as overrides, not as provider facts.
+    assert row["sources"]["context_window"] == "override", row
+    assert row["sources"]["max_input_tokens"] == "unknown", row
     status, cat = request("GET", "/v1/models")
     entry = next(m for m in cat["data"] if m["id"] == "mock/test-model")
     assert entry["context_length"] == 131072, entry

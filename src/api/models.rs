@@ -10,14 +10,23 @@ use serde::{Deserialize, Serialize};
 use super::persist::{save_disabled_models, save_model_limits};
 use super::{ApiResult, ok_json};
 use crate::config::{ModelLimit, ModelLimits};
+use crate::limits::{Limits, Resolved};
 use crate::proxy::AppState;
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct ModelLimitsDto {
-    /// 0 = unknown/unset.
+    /// The number that applies. 0 = nobody states it.
     pub context_window: u64,
     pub max_output_tokens: u64,
     pub max_input_tokens: u64,
+}
+
+/// Where each number came from: `override`, `provider`, `builtin` or `unknown`.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct SourcesDto {
+    pub context_window: String,
+    pub max_output_tokens: String,
+    pub max_input_tokens: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -26,15 +35,19 @@ pub struct ModelItemDto {
     pub name: String,
     pub provider: String,
     pub enabled: bool,
-    /// Effective limits (all zero when nothing is known about the model).
+    /// The numbers that apply (override → provider → builtin; 0 = unknown).
     #[serde(default)]
     pub limits: ModelLimitsDto,
-    /// Which of `limits` the operator set here, as opposed to an inherited
-    /// bare-name entry — the dashboard shows a reset button per field.
+    /// Provenance per field, so the dashboard can label a provider figure
+    /// differently from an operator override or from the builtin table.
     #[serde(default)]
-    pub overridden: Vec<String>,
-    /// The config key the limits came from ("" when none matched): a limit set on
-    /// the bare name `beta` shows up on `mock/beta` with `source = "beta"`.
+    pub sources: SourcesDto,
+    /// The operator's own values (0 = not set). These are what the editor's inputs
+    /// show, and what the per-field Reset button clears.
+    #[serde(default)]
+    pub overrides: ModelLimitsDto,
+    /// The config key the overrides live under ("" when there are none): a limit
+    /// set on the bare name `beta` shows up on `mock/beta` with this set to `beta`.
     #[serde(default)]
     pub limits_source: String,
 }
@@ -203,14 +216,16 @@ pub async fn models_list(State(state): State<Arc<AppState>>) -> ApiResult {
         for m in p.effective_models().await.iter() {
             let id = format!("{}/{}", p.name, m);
             let enabled = !is_disabled(&disabled, &id);
-            let (limits_dto, overridden, source) = limits_of(&limits, &id);
+            let (limits_dto, sources, overrides, source) =
+                limits_of(&limits, p.discovered_limits(m), &id, m);
             list.push(ModelItemDto {
                 id,
                 name: m.to_string(),
                 provider: p.name.clone(),
                 enabled,
                 limits: limits_dto,
-                overridden,
+                sources,
+                overrides,
                 limits_source: source,
             });
         }
@@ -218,14 +233,16 @@ pub async fn models_list(State(state): State<Arc<AppState>>) -> ApiResult {
     for c in &router.combos {
         // Mirrors the request path: "combo/x" and bare "x" both disable a combo.
         let enabled = !is_disabled(&disabled, &c.name);
-        let (limits_dto, overridden, source) = limits_of(&limits, &c.name);
+        let bare = c.name.strip_prefix("combo/").unwrap_or(&c.name);
+        let (limits_dto, sources, overrides, source) = limits_of(&limits, None, &c.name, bare);
         list.push(ModelItemDto {
             id: c.name.clone(),
             name: c.name.clone(),
             provider: "combo".into(),
             enabled,
             limits: limits_dto,
-            overridden,
+            sources,
+            overrides,
             limits_source: source,
         });
     }
@@ -233,20 +250,48 @@ pub async fn models_list(State(state): State<Arc<AppState>>) -> ApiResult {
     ok_json(list)
 }
 
-/// Resolve the limits that apply to `id` into wire shape.
-fn limits_of(limits: &ModelLimits, id: &str) -> (ModelLimitsDto, Vec<String>, String) {
-    match limits.get(id) {
-        Some(l) => (
-            ModelLimitsDto {
-                context_window: l.context_window,
-                max_output_tokens: l.max_output_tokens,
-                max_input_tokens: l.max_input_tokens,
-            },
-            l.overridden().into_iter().map(str::to_string).collect(),
-            l.model.clone(),
-        ),
-        None => (ModelLimitsDto::default(), Vec::new(), String::new()),
-    }
+/// Resolve the three layers for one model into wire shape.
+///
+/// `provider` is what the provider's own listing stated (Antigravity, Gemini,
+/// OpenRouter-shaped gateways), `builtin` the published table for well-known
+/// families; the operator's override wins over both. The returned `overrides` are
+/// only what the operator set — that is what the editor's inputs and the per-field
+/// Reset button work with.
+fn limits_of(
+    limits: &ModelLimits,
+    provider: Option<Limits>,
+    id: &str,
+    bare: &str,
+) -> (ModelLimitsDto, SourcesDto, ModelLimitsDto, String) {
+    let over = limits.get(id);
+    let resolved = Resolved::resolve(
+        over.map(|l| Limits {
+            context_window: l.context_window,
+            max_output_tokens: l.max_output_tokens,
+            max_input_tokens: l.max_input_tokens,
+        }),
+        provider,
+        crate::limits::builtin(bare),
+    );
+    let overrides = ModelLimitsDto {
+        context_window: over.map(|l| l.context_window).unwrap_or(0),
+        max_output_tokens: over.map(|l| l.max_output_tokens).unwrap_or(0),
+        max_input_tokens: over.map(|l| l.max_input_tokens).unwrap_or(0),
+    };
+    (
+        ModelLimitsDto {
+            context_window: resolved.limits.context_window,
+            max_output_tokens: resolved.limits.max_output_tokens,
+            max_input_tokens: resolved.limits.max_input_tokens,
+        },
+        SourcesDto {
+            context_window: resolved.source_of("context_window").to_string(),
+            max_output_tokens: resolved.source_of("max_output_tokens").to_string(),
+            max_input_tokens: resolved.source_of("max_input_tokens").to_string(),
+        },
+        overrides,
+        over.map(|l| l.model.clone()).unwrap_or_default(),
+    )
 }
 
 pub async fn models_limits(State(state): State<Arc<AppState>>) -> ApiResult {
@@ -898,6 +943,82 @@ mod tests {
         let qualified = live.get("mock/m").expect("dedicated entry");
         assert_eq!(qualified.context_window, 32000, "inherited the window");
         assert_eq!(qualified.max_output_tokens, 4096);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The layers reach the API in the right order: the provider's own numbers beat
+    /// the builtin table, an override beats both, and each field is labelled with
+    /// where it came from (that label is what the dashboard shows).
+    #[tokio::test]
+    async fn provider_and_builtin_layers_are_reported_with_their_source() {
+        let (st, path) = state_with_catalogue();
+        let router = st.router.load();
+        let p = &router.providers[0];
+        // `mock/m` gets a provider-published window, `mock/m2` only a builtin one
+        // (both come out of the same resolution path).
+        p.set_discovered_limits_for_test(std::collections::HashMap::from([(
+            "m".to_string(),
+            crate::limits::Limits {
+                context_window: 524_288,
+                max_output_tokens: 16_384,
+                max_input_tokens: 0,
+            },
+        )]));
+        drop(router);
+
+        let listed = models_list(State(st.clone())).await.expect("list");
+        let listed: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let m = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "mock/m")
+            .expect("mock/m listed");
+        assert_eq!(m["limits"]["context_window"], 524_288, "{listed}");
+        assert_eq!(m["sources"]["context_window"], "provider", "{listed}");
+        assert_eq!(m["overrides"]["context_window"], 0, "{listed}");
+
+        // An override wins over the provider figure, field by field.
+        models_limits_set(
+            State(st.clone()),
+            limits_update(serde_json::json!({"model": "mock/m", "max_output_tokens": 4_096})),
+        )
+        .await
+        .expect("override");
+        install_catalogue(&st);
+        // The router was reinstalled from the file, so re-seed the provider numbers.
+        let router = st.router.load();
+        router.providers[0].set_discovered_limits_for_test(std::collections::HashMap::from([(
+            "m".to_string(),
+            crate::limits::Limits {
+                context_window: 524_288,
+                max_output_tokens: 16_384,
+                max_input_tokens: 0,
+            },
+        )]));
+        drop(router);
+        let listed = models_list(State(st.clone())).await.expect("list");
+        let listed: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let m = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "mock/m")
+            .expect("mock/m listed");
+        assert_eq!(m["limits"]["context_window"], 524_288, "{listed}");
+        assert_eq!(m["sources"]["context_window"], "provider", "{listed}");
+        assert_eq!(m["limits"]["max_output_tokens"], 4_096, "{listed}");
+        assert_eq!(m["sources"]["max_output_tokens"], "override", "{listed}");
         let _ = std::fs::remove_file(&path);
     }
 

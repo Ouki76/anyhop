@@ -1035,11 +1035,63 @@ pub fn write_atomic(path: &str, contents: &str) -> std::io::Result<()> {
     }
     // Rename keeps the temporary's 0600 mode, so the config never becomes
     // group/world readable.
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    //
+    // A single-file bind mount cannot be renamed *onto* (`EBUSY`) — and that is how
+    // most container deployments mount the config. Falling back to an in-place copy
+    // keeps the dashboard usable there; it is not atomic, so it is logged and only
+    // used for this error class (a permission failure still fails loudly instead of
+    // truncating the file).
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(16) /* EBUSY */ | Some(18) /* EXDEV */
+            ) =>
+        {
+            tracing::warn!(
+                path,
+                error = %e,
+                "config is a bind mount: rewriting it in place (not atomic)"
+            );
+            write_in_place(path, contents).inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })?;
+            let _ = std::fs::remove_file(&tmp);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    Ok(())
+}
+
+/// Truncate and rewrite `path`, creating it 0600 when it does not exist yet.
+fn write_in_place(path: &str, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()
+    }
 }
 
 /// A unique sibling path for the atomic write: `<path>.tmp.<pid>.<counter>`.

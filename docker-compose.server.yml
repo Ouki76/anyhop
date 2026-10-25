@@ -1,8 +1,10 @@
 # anyhop — server deployment from the published image.
 #
-#   # 1. config directory (a *directory*, not a single file: the gateway rewrites
-#   #    the config when you use the dashboard — models, client keys, providers —
-#   #    and an atomic rewrite needs to create a temp file next to it)
+#   # 1. config directory (a *directory* is recommended: the gateway rewrites the
+#   #    config when you use the dashboard — models, client keys, providers — and
+#   #    the atomic rewrite renames a temp file over it, which a single-file mount
+#   #    cannot do. A file mount still works: the writer falls back to an in-place
+#   #    rewrite, without the atomicity guarantee)
 #   mkdir -p config && cp anyhop.example.toml config/anyhop.toml && chmod 600 config/anyhop.toml
 #   sed -i 's|^listen = .*|listen = "0.0.0.0:8080"|' config/anyhop.toml
 #   #    …and set [server] api_key = "a-long-secret" (without it /api/* is open)

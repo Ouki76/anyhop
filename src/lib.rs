@@ -19,6 +19,7 @@ pub mod distributed;
 pub mod events;
 pub mod fim;
 pub mod gemini;
+pub mod limits;
 pub mod logging;
 pub mod middleware;
 pub mod pool;

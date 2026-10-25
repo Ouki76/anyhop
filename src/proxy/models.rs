@@ -56,7 +56,8 @@ pub async fn list_models(
             {
                 continue;
             }
-            data.push(model_json(&limits, &id, &p.name));
+            let resolved = resolved_for(&state, &limits, p.discovered_limits(m), &id, m);
+            data.push(model_json(resolved, &id, &p.name));
         }
     }
     for c in &router.combos {
@@ -70,7 +71,9 @@ pub async fn list_models(
         {
             continue;
         }
-        data.push(model_json(&limits, &c.name, "combo"));
+        let bare = c.name.strip_prefix("combo/").unwrap_or(&c.name);
+        let resolved = resolved_for(&state, &limits, None, &c.name, bare);
+        data.push(model_json(resolved, &c.name, "combo"));
     }
     let body = serde_json::json!({ "object": "list", "data": data }).to_string();
     if allowed.is_none() {
@@ -132,7 +135,9 @@ pub async fn get_model(
                 {
                     break;
                 }
-                return Json(model_json(&limits, &id, &p.name)).into_response();
+                let resolved =
+                    resolved_for(&state, &limits, p.discovered_limits(model), &id, model);
+                return Json(model_json(resolved, &id, &p.name)).into_response();
             }
         }
     }
@@ -144,7 +149,9 @@ pub async fn get_model(
             {
                 break;
             }
-            return Json(model_json(&limits, &c.name, "combo")).into_response();
+            let bare = c.name.strip_prefix("combo/").unwrap_or(&c.name);
+            let resolved = resolved_for(&state, &limits, None, &c.name, bare);
+            return Json(model_json(resolved, &c.name, "combo")).into_response();
         }
     }
     super::error_response(
@@ -161,24 +168,40 @@ pub async fn get_model(
 /// `context_length`, OpenAI's `max_completion_tokens`). They are only emitted when
 /// the operator set them — inventing a number for an unknown model would be worse
 /// than saying nothing.
-fn model_json(limits: &crate::config::ModelLimits, id: &str, owner: &str) -> serde_json::Value {
+fn model_json(limits: crate::limits::Limits, id: &str, owner: &str) -> serde_json::Value {
     let mut v = serde_json::json!({
         "id": id,
         "object": "model",
         "owned_by": owner,
     });
-    if let Some(l) = limits.get(id) {
-        if l.context_window > 0 {
-            v["context_length"] = serde_json::json!(l.context_window);
-        }
-        if l.max_output_tokens > 0 {
-            v["max_completion_tokens"] = serde_json::json!(l.max_output_tokens);
-        }
-        if l.max_input_tokens > 0 {
-            v["max_input_tokens"] = serde_json::json!(l.max_input_tokens);
-        }
+    if limits.context_window > 0 {
+        v["context_length"] = serde_json::json!(limits.context_window);
+    }
+    if limits.max_output_tokens > 0 {
+        v["max_completion_tokens"] = serde_json::json!(limits.max_output_tokens);
+    }
+    if limits.max_input_tokens > 0 {
+        v["max_input_tokens"] = serde_json::json!(limits.max_input_tokens);
     }
     v
+}
+
+/// The three layers for a provider model: the operator's override, the provider's
+/// own numbers, and the builtin table (in that order of precedence).
+fn resolved_for(
+    state: &AppState,
+    overrides: &crate::config::ModelLimits,
+    provider_model: Option<crate::limits::Limits>,
+    id: &str,
+    bare: &str,
+) -> crate::limits::Limits {
+    let over = overrides.get(id).map(|l| crate::limits::Limits {
+        context_window: l.context_window,
+        max_output_tokens: l.max_output_tokens,
+        max_input_tokens: l.max_input_tokens,
+    });
+    let _ = state;
+    crate::limits::Resolved::resolve(over, provider_model, crate::limits::builtin(bare)).limits
 }
 
 /// `GET /v1/models` is cached per catalogue epoch and filtered twice (disabled

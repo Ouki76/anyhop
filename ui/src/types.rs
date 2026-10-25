@@ -27,16 +27,28 @@ pub struct ModelItemDto {
     pub name: String,
     pub provider: String,
     pub enabled: bool,
-    /// Context window / token caps; every field is 0 when nothing is known.
+    /// The numbers that apply (override → provider → builtin; 0 = unknown).
     #[serde(default)]
     pub limits: ModelLimits,
-    /// Which of `limits` the operator set (the rest are inherited or unknown).
+    /// Where each number came from: override | provider | builtin | unknown.
     #[serde(default)]
-    pub overridden: Vec<String>,
-    /// The config key the values came from ("" = none, otherwise usually the
-    /// model id itself or a shared bare-name entry).
+    pub sources: LimitSources,
+    /// The operator's own values (0 = not set) — what the editor's inputs show.
+    #[serde(default)]
+    pub overrides: ModelLimits,
+    /// The config key the overrides live under ("" = none).
     #[serde(default)]
     pub limits_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct LimitSources {
+    #[serde(default)]
+    pub context_window: String,
+    #[serde(default)]
+    pub max_output_tokens: String,
+    #[serde(default)]
+    pub max_input_tokens: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -50,10 +62,32 @@ pub struct ModelLimits {
 }
 
 impl ModelItemDto {
-    /// Is this field's value set on this very model (as opposed to inherited from a
-    /// bare-name entry)? Only then does "Reset" make sense.
+    /// Did the operator set this field? Only then does "Reset" make sense.
     pub fn is_overridden(&self, field: &str) -> bool {
-        self.overridden.iter().any(|f| f == field)
+        match field {
+            "context_window" => self.overrides.context_window > 0,
+            "max_output_tokens" => self.overrides.max_output_tokens > 0,
+            _ => self.overrides.max_input_tokens > 0,
+        }
+    }
+
+    /// The operator's value for a field (0 = not set).
+    pub fn override_of(&self, field: &str) -> u64 {
+        match field {
+            "context_window" => self.overrides.context_window,
+            "max_output_tokens" => self.overrides.max_output_tokens,
+            _ => self.overrides.max_input_tokens,
+        }
+    }
+
+    /// Where a field's effective value came from.
+    pub fn source_of(&self, field: &str) -> String {
+        let s = match field {
+            "context_window" => &self.sources.context_window,
+            "max_output_tokens" => &self.sources.max_output_tokens,
+            _ => &self.sources.max_input_tokens,
+        };
+        if s.is_empty() { "unknown".to_string() } else { s.clone() }
     }
 
     /// "128k", "1M", "8192" — compact enough for a row.
@@ -64,6 +98,35 @@ impl ModelItemDto {
     pub fn output_label(&self) -> String {
         fmt_tokens(self.limits.max_output_tokens)
     }
+
+    /// 1048576 -> "1 048 576" (thin thousands groups, readable at a glance).
+    pub fn context_exact(&self) -> String {
+        fmt_exact(self.limits.context_window)
+    }
+
+    pub fn output_exact(&self) -> String {
+        fmt_exact(self.limits.max_output_tokens)
+    }
+
+    pub fn input_exact(&self) -> String {
+        fmt_exact(self.limits.max_input_tokens)
+    }
+}
+
+/// 0 -> "—", 1048576 -> "1 048 576", 8192 -> "8 192".
+pub fn fmt_exact(n: u64) -> String {
+    if n == 0 {
+        return "—".to_string();
+    }
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push('\u{2009}');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// 0 -> "—", 1500 -> "1.5k", 131072 -> "131k", 1_048_576 -> "1M".

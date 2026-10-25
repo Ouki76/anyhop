@@ -433,20 +433,57 @@ a.quota-card { display: block; }
 .chip-btn:hover { color: var(--fg); border-color: var(--fg); }
 .chip-btn.has-limits { color: var(--fg); }
 
-/* Model-limits editor: fixed-width number fields so the per-field Reset button
-   stays next to its input (`.settings-grid .input` stretches to 100%). */
-.limits-grid {
-  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 18px 28px; margin-top: 6px;
+/* ---- model-limits editor ---- */
+.model-limits { padding: 0; overflow: hidden; }
+.limits-head {
+  display: flex; align-items: flex-start; gap: 16px;
+  padding: 18px 22px 14px; border-bottom: 1px solid var(--border);
 }
-.limits-grid .form-group { margin-bottom: 0; }
-.limits-grid .input { width: 150px; flex: none; }
-.limits-grid .row { flex-wrap: nowrap; }
-/* The per-field Reset is a primary affordance here, not a hover-only row action:
-   a ghost button would be invisible until the pointer happens to cross it. */
-.limits-grid .btn-ghost {
-  opacity: 1; border: 1px solid var(--border); border-radius: 6px;
-  padding: 5px 10px; font-size: 11.5px; letter-spacing: .04em;
+.limits-title { font-size: 17px; font-weight: 600; letter-spacing: -.01em; }
+.limits-model { font-family: var(--mono); font-size: 12px; color: var(--dim); margin-top: 3px; }
+.limits-head .btn { margin-left: auto; }
+.limits-note {
+  padding: 10px 22px; font-size: 12.5px; color: var(--dim);
+  background: var(--bg); border-bottom: 1px solid var(--border);
+}
+.limits-body { padding: 6px 22px 4px; }
+.lim-row {
+  display: grid; align-items: center; gap: 18px;
+  grid-template-columns: minmax(190px, 1.3fr) minmax(150px, 1fr) minmax(260px, 1.4fr);
+  padding: 13px 0; border-bottom: 1px solid var(--border);
+}
+.lim-row:last-child { border-bottom: 0; }
+.lim-headrow {
+  padding: 10px 0 8px; border-bottom: 1px solid var(--border);
+  font-family: var(--mono); font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: .09em; color: var(--dim);
+}
+.lim-name { font-size: 13.5px; }
+.lim-hint { font-size: 12px; color: var(--dim); margin-top: 2px; }
+.lim-effective {
+  font-family: var(--mono); font-size: 13px;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.lim-edit { display: flex; align-items: center; gap: 8px; }
+.lim-edit .input { width: 148px; flex: none; text-align: right; font-family: var(--mono); }
+.lim-edit .btn { flex: none; }
+.src-badge {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: .06em;
+  text-transform: uppercase; padding: 2px 6px; border-radius: 4px;
+  border: 1px solid var(--border); color: var(--dim);
+}
+.src-override { color: var(--fg); border-color: var(--fg); }
+.src-provider { color: var(--green-fg); border-color: var(--green-bg); }
+.src-builtin { color: var(--dim); border-style: dashed; }
+.src-unknown { opacity: .6; }
+.limits-foot {
+  display: flex; align-items: center; gap: 14px;
+  padding: 16px 22px; border-top: 1px solid var(--border);
+}
+@media (max-width: 760px) {
+  .lim-row { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .lim-headrow { display: none; }
+  .lim-edit .input { width: 100%; }
 }
 
 /* provider catalog — editorial list */

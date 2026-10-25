@@ -5,6 +5,13 @@ use crate::types::*;
 use crate::util::*;
 
 
+/// A small pill naming where a number came from (`override`, `provider`, …).
+fn src_badge(source: &str) -> View {
+    let cls = format!("src-badge src-{source}");
+    let text = source.to_string();
+    view! { span(class=cls) { (text) } }
+}
+
 /// Re-seed the editor's three fields from an API response.
 ///
 /// `bind:value` keeps whatever the operator typed, so after a reset (or a save the
@@ -16,6 +23,8 @@ fn apply_limits_json(
     out: Signal<String>,
     inp: Signal<String>,
 ) {
+    // The API answers with the operator's own values (`overridden` set), which is
+    // what the inputs show; the effective numbers stay beside them.
     let got = |k: &str| v.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
     if ctx.is_alive() {
         ctx.set(sig_str(got("context_window")));
@@ -112,9 +121,12 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
 
     let open_limits = move |id: String| {
         if let Some(m) = models.get_clone().into_iter().find(|m| m.id == id) {
-            lim_ctx.set(sig_str(m.limits.context_window));
-            lim_out.set(sig_str(m.limits.max_output_tokens));
-            lim_in.set(sig_str(m.limits.max_input_tokens));
+            // The inputs hold the operator's own numbers (empty when there is no
+            // override); the provider's or builtin value is shown beside them as the
+            // effective one, so typing replaces it instead of silently copying it.
+            lim_ctx.set(sig_str(m.override_of("context_window")));
+            lim_out.set(sig_str(m.override_of("max_output_tokens")));
+            lim_in.set(sig_str(m.override_of("max_input_tokens")));
         }
         lim_error.set(String::new());
         lim_saved.set(false);
@@ -288,14 +300,21 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                 }
             })
         }
-            // ---- per-model limits: view, override, reset ----
+            // ---- per-model limits: effective value, override, reset ----
             (match lim_current.get_clone() {
                 None => view! {},
                 Some(m) => {
                     let id = m.id.clone();
                     let id_save = m.id.clone();
-                    let id_cancel = m.id.clone();
-                    let inherited = !m.limits_source.is_empty() && m.limits_source != m.id;
+                    let ctx_eff = m.context_exact();
+                    let out_eff = m.output_exact();
+                    let in_eff = m.input_exact();
+                    let ctx_src = m.source_of("context_window");
+                    let out_src = m.source_of("max_output_tokens");
+                    let in_src = m.source_of("max_input_tokens");
+                    let inherited = !m.limits_source.is_empty()
+                        && m.limits_source != m.id
+                        && m.limits_source != format!("combo/{}", m.id);
                     let inherited_from = m.limits_source.clone();
                     let id_ctx_reset = m.id.clone();
                     let id_out_reset = m.id.clone();
@@ -303,34 +322,58 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                     let can_reset_ctx = m.is_overridden("context_window");
                     let can_reset_out = m.is_overridden("max_output_tokens");
                     let can_reset_in = m.is_overridden("max_input_tokens");
+                    // One clone per place the macro consumes the value. Plain digits
+                    // here: a number input renders its placeholder through a font
+                    // that swallows the thin-space grouping.
+                    // The effective number, so an empty field still says what would
+                    // be used. A prefix like "default 1048576" does not fit a number
+                    // input and gets clipped.
+                    let ph = |n: u64| if n == 0 { "—".to_string() } else { n.to_string() };
+                    let ctx_ph = ph(m.limits.context_window);
+                    let out_ph = ph(m.limits.max_output_tokens);
+                    let in_ph = ph(m.limits.max_input_tokens);
                     view! {
                         div(class="card model-limits") {
-                            div(class="section-title") {
-                                "Model limits"
-                                span(class="cnt") { (id.clone()) }
-                                button(class="btn btn-sm ml-auto", on:click=move |_| {
+                            div(class="limits-head") {
+                                div {
+                                    div(class="limits-title") { "Model limits" }
+                                    div(class="limits-model") { (id.clone()) }
+                                }
+                                button(class="btn btn-sm", on:click=move |_| {
                                     if lim_error.is_alive() { lim_error.set(String::new()); }
-                                    let _ = &id_cancel;
                                     limits_editing.set(None);
                                 }) { "Close" }
                             }
                             (if inherited {
-                                view! { div(class="form-hint") {
-                                    (format!("Values inherited from '{}'. Saving stores an override for this model only.", inherited_from))
+                                view! { div(class="limits-note") {
+                                    (format!("The stored values live on '{}' — a shared entry. Saving here creates an override for this model only.", inherited_from))
                                 } }
                             } else {
                                 view! {}
                             })
-                            div(class="limits-grid") {
-                                div(class="form-group") {
-                                    label(class="form-label") { "Context window, tokens" }
-                                    div(class="row gap-6") {
-                                        input(class="input", r#type="number", min="0",
-                                              max="10000000", placeholder="not set",
+                            div(class="limits-body") {
+                                div(class="lim-row lim-headrow") {
+                                    span { "Parameter" }
+                                    span { "Effective" }
+                                    span(title="empty = use the effective value") { "Your override" }
+                                }
+                                div(class="lim-row") {
+                                    div(class="lim-name") {
+                                        "Context window"
+                                        div(class="lim-hint") { "Prompt + completion, in tokens" }
+                                    }
+                                    div(class="lim-effective") {
+                                        (ctx_eff.clone())
+                                        (src_badge(&ctx_src))
+                                    }
+                                    div(class="lim-edit") {
+                                        input(class="input input-num", r#type="number", min="0",
+                                              max="10000000",
+                                              placeholder=ctx_ph.clone(),
                                               bind:value=lim_ctx)
                                         (if can_reset_ctx {
                                             view! {
-                                                button(class="btn-ghost btn-ghost-danger", title="remove this override",
+                                                button(class="btn btn-sm", title="remove this override",
                                                        on:click=move |_| {
                                                            let id = id_ctx_reset.clone();
                                                            spawn_local(async move {
@@ -339,9 +382,9 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                                                                    &serde_json::json!({"model": id, "context_window": null}),
                                                                ).await {
                                                                    Ok(v) => {
-                                                                   apply_limits_json(&v, lim_ctx, lim_out, lim_in);
-                                                                   reload_models(models).await;
-                                                               }
+                                                                       apply_limits_json(&v, lim_ctx, lim_out, lim_in);
+                                                                       reload_models(models).await;
+                                                                   }
                                                                    Err(e) => { if lim_error.is_alive() { lim_error.set(e); } }
                                                                }
                                                            });
@@ -351,17 +394,24 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                                             view! {}
                                         })
                                     }
-                                    div(class="form-hint") { "Total tokens the model can hold (prompt + completion)." }
                                 }
-                                div(class="form-group") {
-                                    label(class="form-label") { "Max output tokens" }
-                                    div(class="row gap-6") {
-                                        input(class="input", r#type="number", min="0",
-                                              max="1000000", placeholder="not set",
+                                div(class="lim-row") {
+                                    div(class="lim-name") {
+                                        "Max output tokens"
+                                        div(class="lim-hint") { "Cap on the completion" }
+                                    }
+                                    div(class="lim-effective") {
+                                        (out_eff.clone())
+                                        (src_badge(&out_src))
+                                    }
+                                    div(class="lim-edit") {
+                                        input(class="input input-num", r#type="number", min="0",
+                                              max="1000000",
+                                              placeholder=out_ph.clone(),
                                               bind:value=lim_out)
                                         (if can_reset_out {
                                             view! {
-                                                button(class="btn-ghost btn-ghost-danger", title="remove this override",
+                                                button(class="btn btn-sm", title="remove this override",
                                                        on:click=move |_| {
                                                            let id = id_out_reset.clone();
                                                            spawn_local(async move {
@@ -370,9 +420,9 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                                                                    &serde_json::json!({"model": id, "max_output_tokens": null}),
                                                                ).await {
                                                                    Ok(v) => {
-                                                                   apply_limits_json(&v, lim_ctx, lim_out, lim_in);
-                                                                   reload_models(models).await;
-                                                               }
+                                                                       apply_limits_json(&v, lim_ctx, lim_out, lim_in);
+                                                                       reload_models(models).await;
+                                                                   }
                                                                    Err(e) => { if lim_error.is_alive() { lim_error.set(e); } }
                                                                }
                                                            });
@@ -382,17 +432,24 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                                             view! {}
                                         })
                                     }
-                                    div(class="form-hint") { "Cap on the completion. Published in /v1/models as max_completion_tokens." }
                                 }
-                                div(class="form-group") {
-                                    label(class="form-label") { "Max input tokens" }
-                                    div(class="row gap-6") {
-                                        input(class="input", r#type="number", min="0",
-                                              max="10000000", placeholder="not set",
+                                div(class="lim-row") {
+                                    div(class="lim-name") {
+                                        "Max input tokens"
+                                        div(class="lim-hint") { "Prompt alone, when the provider states one" }
+                                    }
+                                    div(class="lim-effective") {
+                                        (in_eff.clone())
+                                        (src_badge(&in_src))
+                                    }
+                                    div(class="lim-edit") {
+                                        input(class="input input-num", r#type="number", min="0",
+                                              max="10000000",
+                                              placeholder=in_ph.clone(),
                                               bind:value=lim_in)
                                         (if can_reset_in {
                                             view! {
-                                                button(class="btn-ghost btn-ghost-danger", title="remove this override",
+                                                button(class="btn btn-sm", title="remove this override",
                                                        on:click=move |_| {
                                                            let id = id_in_reset.clone();
                                                            spawn_local(async move {
@@ -401,9 +458,9 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                                                                    &serde_json::json!({"model": id, "max_input_tokens": null}),
                                                                ).await {
                                                                    Ok(v) => {
-                                                                   apply_limits_json(&v, lim_ctx, lim_out, lim_in);
-                                                                   reload_models(models).await;
-                                                               }
+                                                                       apply_limits_json(&v, lim_ctx, lim_out, lim_in);
+                                                                       reload_models(models).await;
+                                                                   }
                                                                    Err(e) => { if lim_error.is_alive() { lim_error.set(e); } }
                                                                }
                                                            });
@@ -413,7 +470,6 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                                             view! {}
                                         })
                                     }
-                                    div(class="form-hint") { "Cap on the prompt alone, when the provider states one." }
                                 }
                             }
                             (if !lim_error.get_clone().is_empty() {
@@ -423,17 +479,16 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                             } else {
                                 view! {}
                             })
-                            div(class="card-foot") {
+                            div(class="limits-foot") {
                                 button(class="btn btn-primary", on:click=move |_| {
                                     let id = id_save.clone();
-                                    let parsed = (parse_opt(&lim_ctx.get_clone()),
-                                                  parse_opt(&lim_out.get_clone()),
-                                                  parse_opt(&lim_in.get_clone()));
-                                    let (ctx, out, input) = match parsed {
+                                    let (ctx, out, input) = match (parse_opt(&lim_ctx.get_clone()),
+                                                                   parse_opt(&lim_out.get_clone()),
+                                                                   parse_opt(&lim_in.get_clone())) {
                                         (Ok(c), Ok(o), Ok(i)) => (c, o, i),
                                         _ => {
                                             if lim_error.is_alive() {
-                                                lim_error.set("limits must be positive whole numbers (or empty)".to_string());
+                                                lim_error.set("limits must be whole numbers (or empty)".to_string());
                                             }
                                             return;
                                         }
@@ -460,6 +515,9 @@ pub fn ModelsTab(models: Signal<Vec<ModelItemDto>>) -> View {
                                         }
                                     });
                                 }) { "Save limits" }
+                                span(class="dim-text") {
+                                    "Stored in anyhop.toml and published in /v1/models."
+                                }
                             }
                         }
                     }

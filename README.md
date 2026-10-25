@@ -24,10 +24,19 @@ Single binary (~6MB), minimal resource footprint.
   (`[[client_keys]]` or via UI/API) with per-model access control
 - **Model management**: enable/disable models (`disabled_models` or via UI/API) —
   disabled models are hidden from `GET /v1/models` and rejected in `/v1/chat/completions`
-- **Per-model limits**: context window, max output and max input tokens
-  (`[[model_limits]]` or Models → the limits chip on a row, with a per-field **Reset**).
-  They are published in `/v1/models` as `context_length` / `max_completion_tokens` /
-  `max_input_tokens`, so clients can size their requests without guessing
+- **Per-model limits**: context window, max output and max input tokens, resolved
+  from four sources and published in `/v1/models` as `context_length` /
+  `max_completion_tokens` / `max_input_tokens`:
+
+  | Source | Where it comes from |
+  | --- | --- |
+  | `provider` | the provider's own model listing — Antigravity's `maxTokens`/`maxOutputTokens`, Gemini's `inputTokenLimit`/`outputTokenLimit`, OpenRouter-style `context_length`/`top_provider`, vLLM's `max_model_len`, llama.cpp's `n_ctx` |
+  | `builtin` | a small table of published numbers for well-known families (Gemini, Claude, GPT-4o/4.1), used only when the provider says nothing |
+  | `override` | `[[model_limits]]` in the config, or Models → the limits chip on a row |
+  | `unknown` | nobody states it — no field is published rather than a guess |
+
+  The editor shows the effective value with its source badge, an input for your own
+  number, and a **Reset** per field that only appears while that field is overridden.
 
   ![Model limits editor](docs/img/model-limits.png)
 - **`/v1/models` metadata**: a model id, owner and its limits — served from a
@@ -134,13 +143,12 @@ curl -s localhost:8080/healthz       # ok
 
 Two details that are easy to get wrong:
 
-* **Mount the config as a directory** (`./config:/etc/anyhop`), not as a single
-  file. The dashboard rewrites the config (enable/disable a model, add a client
-  key, edit a provider) and the rewrite is atomic — it creates a temp file next to
-  the config, which is impossible through a single-file mount (the parent is the
-  image's own read-only directory). A single-file mount still works for a
-  *static* config: use `./config/anyhop.toml:/etc/anyhop/anyhop.toml:ro,z` and
-  reload with `docker kill -s HUP anyhop`; dashboard writes will answer `500`.
+* **Mount the config as a directory** (`./config:/etc/anyhop`) if you want the
+  dashboard to manage it. A rewrite is atomic — it renames a temp file over the
+  config — and a single-file bind mount cannot be renamed onto. A file mount still
+  works: the writer detects `EBUSY` and rewrites in place (logged as
+  "not atomic"), so a dashboard edit lands, but a crash mid-write could truncate
+  the file. The directory mount keeps the atomic guarantee.
 * The directory must be **writable by uid 10001** (the image runs as that user,
   never as root) — that is the `chown` above.
 

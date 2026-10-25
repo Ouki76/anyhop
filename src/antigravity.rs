@@ -396,6 +396,10 @@ pub struct ModelQuota {
     /// 0.0–1.0 remaining quota, when reported.
     pub remaining_fraction: Option<f64>,
     pub reset_time: Option<String>,
+    /// `maxTokens` / `maxOutputTokens` from the same payload — the provider's own
+    /// numbers for the model, which the dashboard shows instead of a guess.
+    #[serde(skip)]
+    pub limits: crate::limits::Limits,
 }
 
 /// Fetch the account's available models (with quota info) from cloudcode.
@@ -476,6 +480,7 @@ pub async fn fetch_available_models(
                     id: id.clone(),
                     remaining_fraction,
                     reset_time,
+                    limits: crate::limits::from_json(m),
                 }
             })
             .collect(),
@@ -492,6 +497,7 @@ pub async fn fetch_available_models(
                     id,
                     remaining_fraction,
                     reset_time,
+                    limits: crate::limits::from_json(m),
                 })
             })
             .collect(),

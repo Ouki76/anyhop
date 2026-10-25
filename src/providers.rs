@@ -33,6 +33,32 @@ use crate::storage::Storage;
 /// (account label, per-model quotas)
 type AccountQuotas = Vec<(String, Vec<antigravity::ModelQuota>)>;
 
+/// What a provider's model listing yields: the ids, and whatever limits the
+/// provider stated for them.
+#[derive(Debug, Clone, Default)]
+pub struct Catalogue {
+    pub models: Vec<String>,
+    /// Keyed by the model id as the provider spells it.
+    pub limits: std::collections::HashMap<String, crate::limits::Limits>,
+}
+
+impl Catalogue {
+    fn push(&mut self, id: String, limits: crate::limits::Limits) {
+        if !limits.is_empty() {
+            self.limits.insert(id.clone(), limits);
+        }
+        if !self.models.contains(&id) {
+            self.models.push(id);
+        }
+    }
+
+    fn finish(mut self) -> Self {
+        self.models.sort();
+        self.models.dedup();
+        self
+    }
+}
+
 pub struct Provider {
     pub name: String,
     /// Per-provider overrides: some upstreams need minutes, others seconds.
@@ -70,6 +96,10 @@ pub struct Provider {
     /// lock there contended with the periodic refresh for no benefit. Loading is
     /// a single atomic read, and a refresh publishes a whole new snapshot.
     models_cache: arc_swap::ArcSwap<Option<(Instant, Arc<Vec<String>>)>>,
+    /// Limits parsed from the last successful upstream listing (model id -> limits).
+    /// Empty until the first refresh; a provider that publishes numbers is the most
+    /// accurate source there is, ahead of the builtin table.
+    discovered_limits: arc_swap::ArcSwap<std::collections::HashMap<String, crate::limits::Limits>>,
     quota_cache: Mutex<Option<(Instant, AccountQuotas)>>,
 }
 
@@ -209,6 +239,7 @@ impl Provider {
             ag_accounts,
             codex_accounts,
             models_cache: arc_swap::ArcSwap::from_pointee(None),
+            discovered_limits: arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
             quota_cache: Mutex::new(None),
         })
     }
@@ -247,6 +278,24 @@ impl Provider {
     /// the network when models are explicitly configured.
     /// Returns a shared handle: `/v1/models` and the dashboard poll this on every
     /// request, and cloning a 124-element `Vec<String>` each time was pure waste.
+    /// Test hook: pretend the last refresh reported these limits.
+    #[cfg(test)]
+    pub fn set_discovered_limits_for_test(
+        &self,
+        limits: std::collections::HashMap<String, crate::limits::Limits>,
+    ) {
+        self.discovered_limits.store(Arc::new(limits));
+    }
+
+    /// What this provider stated about one model's limits, if anything.
+    ///
+    /// Keyed by the id the provider publishes, which is what `effective_models`
+    /// hands out, so the lookup is a plain hash probe.
+    pub fn discovered_limits(&self, model: &str) -> Option<crate::limits::Limits> {
+        let map = self.discovered_limits.load();
+        map.get(model).copied().filter(|l| !l.is_empty())
+    }
+
     pub async fn effective_models(&self) -> Arc<Vec<String>> {
         {
             let cache = self.models_cache.load();
@@ -262,7 +311,7 @@ impl Provider {
         Arc::new(self.refresh_models().await)
     }
 
-    pub async fn fetch_upstream_models(&self) -> Result<Vec<String>, String> {
+    pub async fn fetch_upstream_models(&self) -> Result<Catalogue, String> {
         match self.kind {
             ProviderKind::Antigravity => {
                 let Some(key) = self.pool.pick("", None) else {
@@ -280,7 +329,11 @@ impl Provider {
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-                Ok(list.into_iter().map(|m| m.id).collect())
+                let mut cat = Catalogue::default();
+                for m in list {
+                    cat.push(m.id, m.limits);
+                }
+                Ok(cat.finish())
             }
             ProviderKind::OpenaiCompat => {
                 let Some(key) = self.pool.pick("", None) else {
@@ -304,11 +357,14 @@ impl Provider {
                     return Err(format!("upstream returned status {}", resp.status()));
                 }
                 let val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-                let mut models = Vec::new();
+                let mut cat = Catalogue::default();
+                let mut take = |item: &serde_json::Value, id: &str| {
+                    cat.push(id.to_string(), crate::limits::from_json(item));
+                };
                 if let Some(arr) = val.get("data").and_then(|v| v.as_array()) {
                     for item in arr {
                         if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                            models.push(id.to_string());
+                            take(item, id);
                         }
                     }
                 } else if let Some(arr) = val.get("models").and_then(|v| v.as_array()) {
@@ -318,13 +374,11 @@ impl Provider {
                             .or_else(|| item.get("name"))
                             .and_then(|v| v.as_str())
                         {
-                            models.push(id.to_string());
+                            take(item, id);
                         }
                     }
                 }
-                models.sort();
-                models.dedup();
-                Ok(models)
+                Ok(cat.finish())
             }
             ProviderKind::Gemini => {
                 let Some(key) = self.pool.pick("", None) else {
@@ -350,7 +404,7 @@ impl Provider {
                     return Err(format!("gemini returned status {}", resp.status()));
                 }
                 let val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-                let mut models = Vec::new();
+                let mut cat = Catalogue::default();
                 if let Some(arr) = val.get("models").and_then(|v| v.as_array()) {
                     for item in arr {
                         if let Some(methods) = item
@@ -364,13 +418,11 @@ impl Provider {
                         }
                         if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
                             let clean_id = name.strip_prefix("models/").unwrap_or(name);
-                            models.push(clean_id.to_string());
+                            cat.push(clean_id.to_string(), crate::limits::from_json(item));
                         }
                     }
                 }
-                models.sort();
-                models.dedup();
-                Ok(models)
+                Ok(cat.finish())
             }
             ProviderKind::Anthropic => {
                 let Some(key) = self.pool.pick("", None) else {
@@ -403,22 +455,23 @@ impl Provider {
                     return Err(format!("anthropic returned status {}", resp.status()));
                 }
                 let val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-                let mut models = Vec::new();
+                let mut cat = Catalogue::default();
                 if let Some(arr) = val.get("data").and_then(|v| v.as_array()) {
                     for item in arr {
                         if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                            models.push(id.to_string());
+                            cat.push(id.to_string(), crate::limits::from_json(item));
                         }
                     }
                 }
-                models.sort();
-                models.dedup();
-                Ok(models)
+                Ok(cat.finish())
             }
             ProviderKind::Codex => {
                 // Codex (Responses API) has no model-list endpoint —
                 // use the static config only, invent nothing.
-                Ok(self.models.as_ref().clone())
+                Ok(Catalogue {
+                    models: self.models.as_ref().clone(),
+                    limits: std::collections::HashMap::new(),
+                })
             }
         }
     }
@@ -427,9 +480,12 @@ impl Provider {
     /// Combines any models statically configured in TOML with dynamically discovered ones.
     pub async fn refresh_models(&self) -> Vec<String> {
         match self.fetch_upstream_models().await {
-            Ok(fetched) if !fetched.is_empty() => {
+            Ok(fetched) if !fetched.models.is_empty() => {
+                // The provider's own numbers replace the previous snapshot: a model
+                // that vanished must not keep publishing a stale window.
+                self.discovered_limits.store(Arc::new(fetched.limits));
                 let mut all = self.models.as_ref().clone();
-                for m in fetched {
+                for m in fetched.models {
                     if !all.contains(&m) {
                         all.push(m);
                     }
