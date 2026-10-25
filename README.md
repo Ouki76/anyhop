@@ -69,13 +69,18 @@ Single binary (~6MB), minimal resource footprint.
   client keys (names, model allowlists, rate limits), live events and a raw-TOML editor.
   Runtime: `[server] dashboard = false`. Build without UI: `cargo build --no-default-features`.
   Build the UI: `cd ui && trunk build --release`
-- **FIM endpoint** `/v1/fim/completions` (+ alias `/v1/completions`) for IDE autocomplete
+- **FIM endpoint** `/v1/fim/completions` (+ alias `/v1/completions`) for IDE
+  autocomplete: native pass-through to an OpenAI-compatible provider's own
+  `/completions` (so code models keep their `<|fim_prefix|>…` tokens and `suffix`),
+  marker-wrapped chat only for providers that have no such endpoint
 - **Embeddings** `/v1/embeddings` — passed through for `openai_compat`, translated for `gemini`
   (`:batchEmbedContents`); OAuth kinds report a clear 400
 - **Per-key rate limiting** — `rpm`(+ optional `burst`) on any client key, token bucket,
   `429` with `Retry-After`, visible in `/metrics`
 - **Streaming** without buffering in all modes (SSE→SSE for gemini/antigravity with translation)
-- **Tool calls**: full cycle (tools, tool_choice, parallel calls, functionResponse)
+- **Tool calls**: full cycle (tools, tool_choice, parallel calls, functionResponse),
+  on `/v1/chat/completions` and on `/v1/responses` (`function_call` in and out, in
+  streaming too)
 - **Thinking**: reasoning_effort → thinkingConfig, thoughts are returned as reasoning_content,
   thoughtSignature is captured and replayed back (Gemini 3)
 
@@ -413,12 +418,12 @@ Errors are always the same envelope, including for malformed bodies:
 | Gateway (`/v1`) | Method | Purpose |
 | --- | --- | --- |
 | `/v1/chat/completions` | POST | chat, streaming via `"stream": true` |
-| `/v1/completions` | POST | legacy completion / FIM |
-| `/v1/fim/completions` | POST | fill-in-the-middle |
+| `/v1/completions` | POST | legacy completion / FIM (alias of `/v1/fim/completions`) |
+| `/v1/fim/completions` | POST | fill-in-the-middle: `{model, prompt, suffix?, max_tokens?}`. OpenAI-compatible providers get the request forwarded to their own `/completions` untouched (native FIM tokens/`suffix`); Gemini/Anthropic/Codex/Antigravity have no such endpoint and are asked with a `<FILL_HERE>` marker |
 | `/v1/embeddings` | POST | embeddings (openai_compat, gemini) |
 | `/v1/models` | GET | everything enabled, combos included (cached per catalogue epoch) |
 | `/v1/models/{id}` | GET | one model, `provider/model` or a combo name |
-| `/v1/responses` | POST | OpenAI Responses API (`input`, `instructions`, `max_output_tokens`; streaming events; `previous_response_id` replays a stored conversation) |
+| `/v1/responses` | POST | OpenAI Responses API: `input` (messages, `function_call`, `function_call_output`), `tools`/`tool_choice`/`parallel_tool_calls`, `reasoning.effort`, `instructions`, `max_output_tokens`, `store`/`metadata`, streaming events, `previous_response_id` replays a stored conversation (tool calls included) |
 | `/v1/images/generations` | POST | pass-through, needs `capabilities = ["images"]` on an openai_compat provider |
 | `/v1/images/edits` | POST | multipart pass-through (body forwarded byte-identical) |
 | `/v1/audio/speech` | POST | TTS pass-through, binary relayed as-is (`capabilities = ["audio"]`) |
@@ -436,8 +441,10 @@ Errors are always the same envelope, including for malformed bodies:
 | `/api/models/enable-all`, `/api/models/disable-all` | POST | bulk switch |
 | `/api/combos` | GET | virtual models and their chains |
 | `/api/combos/add`, `/api/combos/update`, `/api/combos/delete` | POST | combo lifecycle |
-| `/api/client-keys` | GET/POST | list / create client keys |
-| `/api/client-keys/add`, `/api/client-keys/update`, `/api/client-keys/delete` | POST | client key lifecycle (incl. `rpm`/`burst`) |
+| `/api/client-keys` | GET/POST | list / create client keys — the listing carries `id` + `masked`, never the secret |
+| `/api/client-keys/add`, `/api/client-keys/update`, `/api/client-keys/delete` | POST | client key lifecycle (incl. `rpm`/`burst`; `id` or the raw `key`) |
+| `/api/client-keys/reveal` | POST | `{"id": "…"}` → the secret, admin-only, recorded as an event |
+| `/api/models/limits` | GET/POST | per-model context window / token caps; `null` clears a field, clearing the last one removes the entry |
 | `/api/requests`, `/api/quotas` | GET | recent attempts and quota snapshots |
 | `/api/events` | GET | live events (SSE stream) |
 | `/api/server`, `/api/server/update` | GET/POST | `[server]` + `[tuning]`, secrets write-only |
