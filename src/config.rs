@@ -705,6 +705,23 @@ impl Config {
                 "provider '{}': drain_below_pct must be <= 100",
                 p.name
             );
+            if let Some(u) = p
+                .limits_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+            {
+                anyhow::ensure!(
+                    u.starts_with("http://") || u.starts_with("https://"),
+                    "provider '{}': limits_url must start with http:// or https://",
+                    p.name
+                );
+                anyhow::ensure!(
+                    !u.chars().any(|c| c.is_control()),
+                    "provider '{}': limits_url must not contain control characters",
+                    p.name
+                );
+            }
             // A provider with no credentials can never serve a request. The
             // per-kind check below mirrors `Provider::from_config` exactly:
             // validate() is what guards the config file, so anything it accepts
@@ -1125,6 +1142,16 @@ pub struct ProviderConfig {
     /// Extra headers sent to upstream on every request (e.g. OpenRouter referer).
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Where to read per-model limits from, when the provider's OpenAI-compatible
+    /// `/models` does not carry them.
+    ///
+    /// DashScope is the reason this exists: `compatible-mode/v1/models` returns
+    /// only id/object/created/owned_by, while its native catalogue
+    /// (`/api/v1/models`) publishes `model_info.context_window` and friends. Left
+    /// empty, the gateway probes that native path automatically for
+    /// `*.aliyuncs.com` hosts and skips it everywhere else.
+    #[serde(default)]
+    pub limits_url: Option<String>,
     /// Upstream proxy: http://, https://, socks5://, socks5h://.
     #[serde(default)]
     pub proxy: Option<String>,

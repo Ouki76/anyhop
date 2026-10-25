@@ -30,13 +30,17 @@ Single binary (~6MB), minimal resource footprint.
 
   | Source | Where it comes from |
   | --- | --- |
-  | `provider` | the provider's own model listing — Antigravity's `maxTokens`/`maxOutputTokens`, Gemini's `inputTokenLimit`/`outputTokenLimit`, OpenRouter-style `context_length`/`top_provider`, vLLM's `max_model_len`, llama.cpp's `n_ctx` |
+  | `provider` | the provider's own model listing — Antigravity's `maxTokens`/`maxOutputTokens`, Gemini's `inputTokenLimit`/`outputTokenLimit`, OpenRouter-style `context_length`/`top_provider`, vLLM's `max_model_len`, llama.cpp's `n_ctx`, DashScope's native `model_info` |
   | `builtin` | a small table of published numbers for well-known families (Gemini, Claude, GPT-4o/4.1), used only when the provider says nothing |
   | `override` | `[[model_limits]]` in the config, or Models → the limits chip on a row |
   | `unknown` | nobody states it — no field is published rather than a guess |
 
   The editor shows the effective value with its source badge, an input for your own
   number, and a **Reset** per field that only appears while that field is overridden.
+
+  A provider whose OpenAI-compatible `/models` is bare (DashScope returns only
+  `id/object/created/owned_by`) is read from its native catalogue instead — for
+  `*.aliyuncs.com` automatically, for anything else via `limits_url` on the provider.
 
   ![Model limits editor](docs/img/model-limits.png)
 - **`/v1/models` metadata**: a model id, owner and its limits — served from a

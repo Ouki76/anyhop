@@ -314,6 +314,28 @@ mod tests {
         );
     }
 
+    /// DashScope's native catalogue nests everything under `model_info` (the
+    /// OpenAI-compatible `/models` has no numbers at all).
+    #[test]
+    fn dashscope_model_info_is_understood() {
+        let native = json!({
+            "model": "qwen3.8-max",
+            "name": "Qwen3.8-Max",
+            "model_info": {
+                "context_window": 1000000,
+                "max_input_tokens": 991808,
+                "max_output_tokens": 131072,
+                "max_reasoning_tokens": 262144
+            },
+            "features": ["cache", "function-calling"],
+            "prices": []
+        });
+        let l = from_json(&native);
+        assert_eq!(l.context_window, 1_000_000);
+        assert_eq!(l.max_input_tokens, 991_808);
+        assert_eq!(l.max_output_tokens, 131_072);
+    }
+
     #[test]
     fn openrouter_and_vllm_shapes_are_understood() {
         let openrouter = json!({

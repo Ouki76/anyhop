@@ -96,6 +96,8 @@ pub struct Provider {
     /// lock there contended with the periodic refresh for no benefit. Loading is
     /// a single atomic read, and a refresh publishes a whole new snapshot.
     models_cache: arc_swap::ArcSwap<Option<(Instant, Arc<Vec<String>>)>>,
+    /// Optional URL of a richer catalogue to read limits from (`limits_url`).
+    limits_url: Option<String>,
     /// Limits parsed from the last successful upstream listing (model id -> limits).
     /// Empty until the first refresh; a provider that publishes numbers is the most
     /// accurate source there is, ahead of the builtin table.
@@ -236,6 +238,12 @@ impl Provider {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             capabilities: cfg.capabilities.clone(),
+            limits_url: cfg
+                .limits_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(str::to_string),
             ag_accounts,
             codex_accounts,
             models_cache: arc_swap::ArcSwap::from_pointee(None),
@@ -378,6 +386,14 @@ impl Provider {
                         }
                     }
                 }
+                // The OpenAI-compatible catalogue often carries no limits at all
+                // (DashScope: only id/object/created/owned_by). Fill them from a
+                // richer catalogue when there is one.
+                if cat.limits.is_empty() || self.limits_url.is_some() {
+                    for (id, l) in self.fetch_limits_catalogue(&key.secret).await {
+                        cat.limits.entry(id).or_insert(l);
+                    }
+                }
                 Ok(cat.finish())
             }
             ProviderKind::Gemini => {
@@ -474,6 +490,97 @@ impl Provider {
                 })
             }
         }
+    }
+
+    /// Read per-model limits from a vendor's native catalogue.
+    ///
+    /// Used when the OpenAI-compatible `/models` says nothing: DashScope publishes
+    /// `model_info.context_window` / `max_input_tokens` / `max_output_tokens` on
+    /// `/api/v1/models`, but only `id` on `/compatible-mode/v1/models`. The page
+    /// walk is bounded (10 x 100) so a misbehaving catalogue cannot hang a refresh,
+    /// and any failure is a debug log — limits are metadata, never a reason to fail
+    /// the model list.
+    async fn fetch_limits_catalogue(
+        &self,
+        key: &str,
+    ) -> std::collections::HashMap<String, crate::limits::Limits> {
+        let mut out = std::collections::HashMap::new();
+        let Ok(base) = reqwest::Url::parse(&self.base_url) else {
+            return out;
+        };
+        let meta_base = match self.limits_url.as_deref() {
+            Some(u) => u.to_string(),
+            None => {
+                // Only auto-probe the vendor that needs it, by host.
+                let host = base.host_str().unwrap_or_default().to_string();
+                if !host.ends_with("aliyuncs.com") {
+                    return out;
+                }
+                format!("{}://{host}/api/v1/models", base.scheme())
+            }
+        };
+        for page in 1..=10u32 {
+            let sep = if meta_base.contains('?') { '&' } else { '?' };
+            let url = format!("{meta_base}{sep}page_size=100&page_no={page}");
+            let resp = match self
+                .client
+                .get(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .timeout(self.tuning.meta_timeout())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(provider = %self.name, "limits catalogue: {e}");
+                    break;
+                }
+            };
+            if !resp.status().is_success() {
+                tracing::debug!(
+                    provider = %self.name,
+                    status = %resp.status(),
+                    "limits catalogue returned an error status"
+                );
+                break;
+            }
+            let Ok(v) = resp.json::<serde_json::Value>().await else {
+                break;
+            };
+            let entries = v
+                .pointer("/output/models")
+                .and_then(|m| m.as_array())
+                .or_else(|| v.get("models").and_then(|m| m.as_array()))
+                .or_else(|| v.get("data").and_then(|m| m.as_array()));
+            let Some(entries) = entries else { break };
+            let n = entries.len();
+            for e in entries {
+                let Some(id) = e
+                    .get("model")
+                    .or_else(|| e.get("id"))
+                    .or_else(|| e.get("name"))
+                    .and_then(|i| i.as_str())
+                else {
+                    continue;
+                };
+                let limits = crate::limits::from_json(e);
+                if !limits.is_empty() {
+                    out.entry(id.trim_start_matches("models/").to_string())
+                        .or_insert(limits);
+                }
+            }
+            if n < 100 {
+                break;
+            }
+        }
+        if !out.is_empty() {
+            tracing::debug!(
+                provider = %self.name,
+                models = out.len(),
+                "limits read from the vendor catalogue"
+            );
+        }
+        out
     }
 
     /// Refresh models from upstream and update the cache.
