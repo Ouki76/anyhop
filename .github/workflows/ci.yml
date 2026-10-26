@@ -87,6 +87,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test, ui]
     timeout-minutes: 45
+    # `permissions` cannot be set on a *step* — GitHub rejects the whole workflow
+    # for it. The write scope the failure-log step needs therefore lives here, on
+    # the job, and stays as narrow as the workflow default allows: `actions: read`
+    # is what the artifact download needs, `contents: write` only the log push.
+    permissions:
+      contents: write
+      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (v4)
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -117,9 +124,6 @@ jobs:
       # throwaway branch so the failure can be inspected from a checkout.
       - name: Publish failure logs
         if: failure() && github.event_name == 'push'
-        # Only this step needs to write; the workflow default stays `read`.
-        permissions:
-          contents: write
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
