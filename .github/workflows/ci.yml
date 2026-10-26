@@ -73,9 +73,14 @@ jobs:
       # issue. It used to be checked only by the local audit.sh, i.e. never in CI.
       - name: Dependency advisories
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 (v2)
+        # `command` is the subcommand and `command-arguments` its arguments, while
+        # `arguments` are the cargo-level ones (the action defaults those to
+        # `--all-features`). Putting the whole `check advisories bans sources` into
+        # `command` left `--all-features` as a *check* argument, which cargo-deny
+        # rejects — the job failed on argument parsing, not on a finding.
         with:
-          command: check advisories bans sources
-          arguments: --all-features
+          command: check
+          command-arguments: advisories bans sources
 
   # End-to-end: real HTTP against mock providers, including access control and the UI.
   integration:
