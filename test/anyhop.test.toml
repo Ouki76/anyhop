@@ -5,6 +5,11 @@ max_retries = 4
 attempt_timeout_secs = 10
 state_file = ""
 api_key = "test-gw-key"
+# The admin credential is separate on purpose: the gateway key is handed to every
+# client and must not open /api/* (see middleware::require_admin_key). The harness
+# uses the same literal for both roles, which is the operator's choice, not the
+# code's default.
+admin_key = "test-gw-key"
 
 [[providers]]
 name = "mock"

@@ -23,7 +23,10 @@ attempt_timeout_secs = 120
 # proxy = "socks5://user:pass@127.0.0.1:1080"
 # Inbound auth: clients must send Authorization: Bearer <api_key>
 # api_key = "sk-anyhop-change-me"
-# Separate key for /api/* and the dashboard (defaults to api_key):
+# Separate key for /api/* and the dashboard. Not optional in practice: /api/*
+# accepts ONLY this, never api_key — the gateway key is handed to every client and
+# must not be able to read provider secrets. Required as soon as [[client_keys]]
+# exist.
 # admin_key = "admin-secret"
 # Max request body size (bytes):
 # max_body_bytes = 33554432
@@ -78,7 +81,9 @@ models = ["openai/gpt-4o-mini", "deepseek/deepseek-chat"]
 # (both "provider/model" and the bare model name are accepted):
 # disabled_models = ["openrouter/deepseek-chat", "flash"]
 
-# Client API keys with per-model access control (models = [] means all models):
+# Client API keys with per-model access control (models = [] means all models).
+# Client keys also require [server] admin_key (see above): /api/* is admin-only so a
+# leaked gateway key cannot read provider secrets.
 # [[client_keys]]
 # name = "Cursor IDE"
 # key = "sk-hop-cursor-12345"
@@ -117,6 +122,10 @@ max_cooldown_secs = 3600          # hard cap on a benched key
 capacity_wait_ms = 5000           # wait for a free slot before answering 429
 shutdown_grace_secs = 10          # SIGTERM drain budget before aborting streams
 client_body_timeout_secs = 30     # per-chunk request-body deadline (slowloris)
+# How long a connection has to send its request headers. Bounds slowloris:
+# a client that opens a socket and never speaks is dropped instead of
+# holding a file descriptor. 1..=300, default 10.
+client_header_timeout_secs = 10
 sticky_mode = "hash"              # stateless rendezvous routing (multi-instance)
 base_backoff_secs = 5             # 5xx/network backoff base (doubles per failure)
 rate_limit_cooldown_secs = 60     # 429 without Retry-After

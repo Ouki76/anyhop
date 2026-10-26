@@ -524,13 +524,17 @@ mod tests {
         );
     }
 
-    /// Adding a client key on a gateway with no admin credential must be refused.
+    /// Adding a client key on a gateway whose config would become invalid must be
+    /// refused, and nothing may be written.
     ///
-    /// This handler used to splice the file directly and write it *without*
-    /// `Config::validate`, so it happily produced `[[client_keys]]` next to a
-    /// missing `[server] api_key` — a document the validator rejects. From then on
-    /// every later writer, `POST /api/reload`, SIGHUP and the next start refused the
-    /// config, i.e. the admin API locked itself out of its own file.
+    /// Two shapes are refused now. The original one: a document with client keys
+    /// and *no* credential at all (the validator rejects it, so the write would
+    /// brick every later writer, reload and restart). And the newer one: client
+    /// keys with an `api_key` but no `admin_key`, which the validator also refuses
+    /// because `api_key` is handed to every client and must not open `/api/*`.
+    ///
+    /// The fixture here is the first shape, which is the one this handler's own
+    /// write path can produce from a bare `[server] listen = …`.
     #[tokio::test]
     async fn a_client_key_without_an_admin_credential_is_refused_and_writes_nothing() {
         let path = temp_config(
@@ -599,7 +603,7 @@ listen = "127.0.0.1:18080"
             burst: None,
             max_concurrent: Some(4),
         };
-        let ratelimit = st.rt().ratelimit;
+        let ratelimit = st.rt().ratelimit.clone();
         let rt = Arc::new(crate::proxy::ClientKeyRuntime::new_with(cfg, &ratelimit));
         ck_write(&st).insert("sk-hop-attrib".to_string(), rt);
 
@@ -636,7 +640,7 @@ listen = "127.0.0.1:18080"
             burst: None,
             max_concurrent: None,
         };
-        let ratelimit = st.rt().ratelimit;
+        let ratelimit = st.rt().ratelimit.clone();
         ck_write(&st).insert(
             "sk-hop-name".to_string(),
             Arc::new(crate::proxy::ClientKeyRuntime::new_with(cfg, &ratelimit)),

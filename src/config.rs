@@ -3,6 +3,22 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+/// Is this an `http(s)://` URL within the length the gateway accepts?
+///
+/// One rule for both entry points. The dashboard edit path had it; the TOML path
+/// did not, so a hand-written `base_url = "file:///etc/passwd"`, a `gopher://` or a
+/// link-local metadata address reached `reqwest` verbatim — with the provider key
+/// attached, because the runtime builds upstream URLs by concatenation
+/// (`format!("{base}/chat/completions")`) and never re-checks the scheme.
+pub fn is_http_url(url: &str) -> bool {
+    let u = url.trim();
+    !u.is_empty()
+        && u.len() <= 2048
+        && (u.starts_with("http://") || u.starts_with("https://"))
+        // `http://` with nothing after it would concatenate into `http:///v1/...`.
+        && u.len() > "https://".len()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -118,6 +134,12 @@ pub struct Tuning {
     /// How long a client may take to send (each chunk of) a request body.
     /// Bounds slowloris; 0 is not allowed because it would disable the guard.
     pub client_body_timeout_secs: u64,
+    /// How long an accepted connection has to send its request **headers**.
+    /// The body deadline starts only after the first byte, so without this a
+    /// client that opens a socket and never writes holds a file descriptor
+    /// (slowloris). Bounds the pre-request phase; 0 is not allowed because it
+    /// would disable the guard.
+    pub client_header_timeout_secs: u64,
     /// How long a request waits for a free upstream slot when every key is at its
     /// concurrency cap, before the gateway answers `429 + Retry-After: 1`.
     /// Saturation is "come back in a moment", not an outage: failing fast turned
@@ -153,6 +175,7 @@ impl Default for Tuning {
             sse_keepalive_secs: 15,
             shutdown_grace_secs: 10,
             client_body_timeout_secs: 30,
+            client_header_timeout_secs: 10,
             capacity_wait_ms: 5000,
             quota_cache_ttl_secs: 60,
             response_store_max: 1000,
@@ -195,6 +218,10 @@ impl Tuning {
     /// Per-chunk request-body read deadline (slowloris guard).
     pub fn client_body_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.client_body_timeout_secs.clamp(1, 300))
+    }
+    /// Deadline for a connection to send its request headers.
+    pub fn client_header_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.client_header_timeout_secs.clamp(1, 300))
     }
     /// How long one admission round may wait for a free in-flight slot.
     ///
@@ -261,6 +288,10 @@ impl Tuning {
         anyhow::ensure!(
             (1..=300).contains(&self.client_body_timeout_secs),
             "tuning.client_body_timeout_secs must be between 1 and 300"
+        );
+        anyhow::ensure!(
+            (1..=300).contains(&self.client_header_timeout_secs),
+            "tuning.client_header_timeout_secs must be between 1 and 300"
         );
         anyhow::ensure!(
             self.capacity_wait_ms <= 30_000,
@@ -634,6 +665,13 @@ impl Config {
             (1024..=256 * 1024 * 1024).contains(&self.server.max_body_bytes),
             "server.max_body_bytes must be between 1024 and 268435456"
         );
+        // 0 disables the accounting (the pre-existing behaviour); otherwise it must
+        // be at least one request's worth, or every request would be refused.
+        anyhow::ensure!(
+            self.server.max_inflight_body_bytes == 0
+                || self.server.max_inflight_body_bytes >= self.server.max_body_bytes as u64,
+            "server.max_inflight_body_bytes must be 0 (off) or at least max_body_bytes"
+        );
         anyhow::ensure!(
             self.server.events_history <= 100_000,
             "server.events_history must be <= 100000"
@@ -763,6 +801,23 @@ impl Config {
                         "provider '{}': base_url is required",
                         p.name
                     );
+                    // The dashboard edit path already validated the scheme; the
+                    // TOML path did not, so `base_url = "file:///etc/passwd"` or a
+                    // link-local metadata address reached `reqwest` verbatim — with
+                    // the provider key attached. The runtime composes URLs by
+                    // concatenation (`format!("{base}/chat/completions")`), so the
+                    // scheme is the only thing standing between a config typo and a
+                    // request to an unintended host. Same rule, one place.
+                    // An empty value stays legal for the kinds that have a
+                    // default endpoint (anthropic); anything actually given must
+                    // be an http(s) URL.
+                    anyhow::ensure!(
+                        p.base_url.trim().is_empty() || is_http_url(&p.base_url),
+                        "provider '{}': base_url must be an http(s) URL of at most 2048 \
+                         characters (got '{}')",
+                        p.name,
+                        p.base_url
+                    );
                 }
                 ProviderKind::Antigravity | ProviderKind::Codex => {
                     let auth_cmd = if matches!(p.kind, ProviderKind::Antigravity) {
@@ -822,18 +877,32 @@ impl Config {
             }
         }
 
-        // A client-key deployment is a *shared* gateway by definition, but `/api/*`
-        // is gated only by `admin_key`/`api_key`. With neither configured, the
-        // tenant keys locked `/v1/*` while the raw-TOML editor, provider CRUD and
-        // the OAuth endpoints stayed unauthenticated — `GET /api/config` handed
-        // out every provider secret. Refuse that combination outright.
+        // A client-key deployment is a *shared* gateway by definition, so it must
+        // carry an `admin_key`. Two distinct shapes are refused here:
+        //
+        // 1. no credential at all — historically this produced a file that every
+        //    later writer, `POST /api/reload`, SIGHUP and the next start rejected,
+        //    i.e. the admin API locked itself out of its own config;
+        // 2. `api_key` present but no `admin_key` — `/api/*` used to accept the
+        //    gateway key, so this used to pass. It no longer does: that key is
+        //    handed to every client and must not reach the control plane
+        //    (`middleware::require_admin_key`), so such a gateway would have
+        //    settings nobody can open.
+        //
+        // Configuring `admin_key` is the one extra line this boundary costs.
         anyhow::ensure!(
             self.client_keys.is_empty()
                 || self.server.api_key.is_some()
                 || self.server.admin_key.is_some(),
             "client_keys are configured but neither server.api_key nor server.admin_key is set: \
              /api/* (raw config editor, provider keys, OAuth) would accept unauthenticated \
-             requests. Set [server] api_key (it also secures /api/*) or remove the client keys"
+             requests. Set [server] admin_key (and api_key for /v1/*) or remove the client keys"
+        );
+        anyhow::ensure!(
+            self.client_keys.is_empty() || self.server.admin_key.is_some(),
+            "client_keys are configured but [server] admin_key is not set: /api/* (raw config \
+             editor, provider keys, OAuth) accepts only admin_key, because api_key is handed to \
+             every client and must not be able to read provider secrets. Set [server] admin_key"
         );
 
         let mut key_values = std::collections::HashSet::new();
@@ -938,6 +1007,15 @@ pub struct ServerConfig {
     /// Max request body size (bytes).
     #[serde(default = "default_max_body")]
     pub max_body_bytes: usize,
+    /// Total bytes of request bodies allowed in memory across ALL in-flight
+    /// requests. `max_body_bytes` bounds one request and `client_key_max_concurrent`
+    /// bounds the count; without this, N concurrent large requests each pass their
+    /// own limit while together exceeding the container's memory. 0 = no accounting.
+    ///
+    /// The default (256 MiB) is deliberately generous: it only bites when many
+    /// large requests overlap, which is exactly the case that used to reach the
+    /// memory limit. Set it to roughly half the container's memory budget.
+    pub max_inflight_body_bytes: u64,
     /// Serve the web dashboard at /dashboard (the JSON API stays on regardless).
     #[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
     #[serde(default = "default_true")]
@@ -950,8 +1028,15 @@ pub struct ServerConfig {
     /// Log format: "text" (default) or "json" for log shippers.
     #[serde(default = "default_log_format")]
     pub log_format: String,
-    /// Per-client-key concurrency cap (0 = unlimited) unless the key overrides it.
-    #[serde(default)]
+    /// Per-client-key concurrency cap unless the key overrides it.
+    ///
+    /// Defaults to 64 rather than unlimited: an absent cap means the counter at
+    /// `middleware.rs` is never even incremented, so a runaway client is invisible
+    /// in the metrics *and* can head-of-line-block every other tenant for up to
+    /// `capacity_wait_ms` before their requests turn into 429s. 64 is far above any
+    /// interactive workload and keeps the 32 MiB × 64 worst case inside a normal
+    /// container budget. Set it to 0 to restore the old unlimited behaviour.
+    #[serde(default = "default_client_key_max_concurrent")]
     pub client_key_max_concurrent: u32,
     /// Failed-auth attempts from one IP before it is throttled.
     #[serde(default = "default_auth_fail_burst")]
@@ -986,6 +1071,14 @@ fn default_models_refresh_secs() -> u64 {
 
 fn default_max_body() -> usize {
     32 * 1024 * 1024 // 32 MiB
+}
+
+fn default_client_key_max_concurrent() -> u32 {
+    64
+}
+
+fn default_max_inflight_body() -> u64 {
+    256 * 1024 * 1024 // 256 MiB: 8 concurrent max-size requests
 }
 
 fn default_log_format() -> String {
@@ -1029,10 +1122,11 @@ impl Default for ServerConfig {
             tls_cert: None,
             tls_key: None,
             log_format: default_log_format(),
-            client_key_max_concurrent: 0,
+            client_key_max_concurrent: default_client_key_max_concurrent(),
             auth_fail_burst: default_auth_fail_burst(),
             auth_fail_window_secs: default_auth_fail_window_secs(),
             max_body_bytes: default_max_body(),
+            max_inflight_body_bytes: default_max_inflight_body(),
             models_refresh_secs: default_models_refresh_secs(),
             cors_origins: Vec::new(),
         }
@@ -1119,29 +1213,45 @@ pub fn write_atomic(path: &str, contents: &str) -> std::io::Result<()> {
 
 /// Truncate and rewrite `path`, creating it 0600 when it does not exist yet.
 fn write_in_place(path: &str, contents: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
+    use std::io::{Seek as _, Write as _};
+
+    // Rewrite the *existing* inode rather than rename over it: a single-file
+    // bind mount (the containerised deploy) cannot be replaced by rename, which is
+    // exactly why this fallback exists.
+    //
+    // The bytes are written **over** the current content, never after
+    // `truncate(true)`: truncating first meant a crash, ENOSPC or a full disk
+    // between the truncate and the write left an **empty** anyhop.toml — the
+    // gateway would then fail to start with no way back except a backup. Writing
+    // first and truncating to the new length afterwards means a failure leaves the
+    // file *longer* than intended, or with a stale tail, but never empty, and the
+    // very next successful write repairs it.
     #[cfg(unix)]
-    {
+    let mut f = {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(true)
+            // Deliberately NOT `truncate(true)`: the new bytes are written over
+            // the existing content and the length is fixed afterwards, so a crash
+            // or ENOSPC mid-write leaves a stale tail rather than an empty file.
+            .truncate(false)
             .mode(0o600)
-            .open(path)?;
-        f.write_all(contents.as_bytes())?;
-        f.sync_all()
-    }
+            .open(path)?
+    };
     #[cfg(not(unix))]
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        f.write_all(contents.as_bytes())?;
-        f.sync_all()
-    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        // See the unix branch: truncating first would risk an empty config.
+        .truncate(false)
+        .open(path)?;
+
+    f.write_all(contents.as_bytes())?;
+    // Drop any tail from a previously longer config, then make the length durable.
+    f.set_len(contents.len() as u64)?;
+    f.rewind()?;
+    f.sync_all()
 }
 
 /// A unique sibling path for the atomic write: `<path>.tmp.<pid>.<counter>`.
@@ -1258,6 +1368,57 @@ pub enum Strategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The in-place fallback (single-file bind mounts) must never leave the
+    /// config **empty**.
+    ///
+    /// It used to `truncate(true)` before writing, so a crash or a full disk in
+    /// that window produced a zero-byte `anyhop.toml` — a gateway that cannot
+    /// start and a config that is gone. Writing over the existing bytes and
+    /// truncating to the new length afterwards means the worst case is a stale
+    /// tail, which the next successful write repairs.
+    ///
+    /// This test pins the *observable contract* (no stale tail, valid TOML, 0600).
+    /// The crash window itself cannot be reproduced in-process — it needs the
+    /// process to die between two syscalls — so the ordering is enforced by the
+    /// code shape and this comment, not by the assertion.
+    #[test]
+    fn writing_in_place_never_truncates_before_the_bytes_are_there() {
+        let path = std::env::temp_dir().join(format!(
+            "anyhop-inplace-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let p = path.to_str().expect("utf-8 temp path").to_string();
+
+        // A long config, then a shorter one: the tail must not survive.
+        let long = "# a long comment line\n".repeat(50) + "[server]\nlisten = \"127.0.0.1:1\"\n";
+        write_in_place(&p, &long).expect("first write");
+        assert_eq!(std::fs::read_to_string(&p).expect("read"), long);
+
+        let short = "[server]\nlisten = \"127.0.0.1:2\"\n";
+        write_in_place(&p, short).expect("second write");
+        let after = std::fs::read_to_string(&p).expect("read");
+        assert_eq!(after, short, "a shorter config must not keep the old tail");
+        // And it must still parse.
+        toml::from_str::<Config>(&after).expect("the file is a valid config");
+
+        // The file is not empty at any point we can observe, and it is 0600.
+        assert!(!after.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "secrets file must stay 0600");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// A minimal valid config: one openai_compat provider with one key.
     const VALID: &str = r#"
@@ -1432,10 +1593,12 @@ mod tests {
             name = "team"
             "#
         );
-        // `api_key` belongs to [server]; splice it there.
+        // Admin credentials belong to [server]; splice them there. `admin_key` is
+        // required as soon as client keys exist, and a valid document is what lets
+        // this test reach the check it is actually about.
         let cfg = cfg.replace(
             "listen = \"127.0.0.1:8080\"",
-            "listen = \"127.0.0.1:8080\"\napi_key = \"master-key-1\"",
+            "listen = \"127.0.0.1:8080\"\napi_key = \"master-key-1\"\nadmin_key = \"admin-key-1\"",
         );
         let msg = error_of(&cfg);
         assert!(msg.contains("duplicates the name"), "{msg}");
@@ -1448,6 +1611,85 @@ mod tests {
         parse(VALID)
             .validate()
             .expect("the baseline config is valid");
+    }
+
+    /// `base_url` must be an http(s) URL, from the TOML path too.
+    ///
+    /// The dashboard edit path validated the scheme; `Config::validate` only
+    /// checked "not empty". The runtime concatenates URLs
+    /// (`format!("{base}/chat/completions")`) and attaches the provider key, so a
+    /// hand-written `file://`, `gopher://` or link-local metadata address reached
+    /// `reqwest` verbatim — an SSRF from a config file, reachable through
+    /// `PUT /api/config`.
+    #[test]
+    fn a_base_url_that_is_not_http_is_rejected() {
+        for bad in [
+            "file:///etc/passwd",
+            "gopher://127.0.0.1:6379/_INFO",
+            "ftp://example.com/v1",
+            "ws://example.com/v1",
+            "javascript:alert(1)",
+            "not a url",
+            "http://",
+        ] {
+            let text = format!(
+                r#"
+                [[providers]]
+                name = "p"
+                type = "openai_compat"
+                base_url = "{bad}"
+                keys = ["sk-1"]
+                "#
+            );
+            let e = error_of(&text);
+            assert!(
+                e.contains("base_url must be an http(s) URL"),
+                "{bad:?} must be rejected, got: {e}"
+            );
+        }
+
+        // A normal endpoint still validates.
+        for good in ["https://api.example.com/v1", "http://127.0.0.1:9100/v1"] {
+            let text = format!(
+                r#"
+                [[providers]]
+                name = "p"
+                type = "openai_compat"
+                base_url = "{good}"
+                keys = ["sk-1"]
+                "#
+            );
+            parse(&text)
+                .validate()
+                .unwrap_or_else(|e| panic!("{good:?} should be valid: {e}"));
+        }
+
+        // A link-local metadata address is a *valid* http URL: blocking it is a
+        // separate policy decision (an operator may legitimately proxy through a
+        // cloud metadata-adjacent host), so it validates and is documented as an
+        // operator responsibility in RESIDUAL-RISKS.md.
+        parse(
+            r#"
+                [[providers]]
+                name = "p"
+                type = "openai_compat"
+                base_url = "http://169.254.169.254/v1"
+                keys = ["sk-1"]
+            "#,
+        )
+        .validate()
+        .expect("http is http; the host is the operator's call");
+
+        // And the predicate itself draws the line where the docs say it does.
+        assert!(is_http_url("https://a.example/v1"));
+        assert!(is_http_url("http://127.0.0.1:1/v1"));
+        assert!(!is_http_url(""));
+        assert!(!is_http_url("   "));
+        assert!(!is_http_url("http://"));
+        assert!(!is_http_url(&format!(
+            "https://a.example/{}",
+            "x".repeat(2048)
+        )));
     }
 
     /// Every shape `Provider::from_config` rejects must be rejected here too:

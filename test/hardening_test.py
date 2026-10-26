@@ -66,6 +66,9 @@ def write_config(path, port, extra_server=""):
             f"""[server]
 listen = "127.0.0.1:{port}"
 api_key = "{KEY}"
+# /api/* accepts only admin_key: the gateway key is handed to every client, so
+# it must not be able to read provider secrets (middleware::require_admin_key).
+admin_key = "{KEY}"
 state_file = ""
 {extra_server}
 [[providers]]

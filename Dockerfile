@@ -12,7 +12,10 @@
 #     listen = "0.0.0.0:8080"
 
 # ---------- stage 1: dashboard bundle (Sycamore -> WASM) ----------
-FROM rust:1-slim-bookworm AS ui
+# Base images are pinned by manifest-list digest, not by tag: a tag can be moved
+# to different content, a digest cannot. Multi-arch index (amd64 + arm64) so the
+# digest is valid on either build platform.
+FROM rust:1-slim-bookworm@sha256:86234e857a413004348b471d11a4ebe1aa92d2eae2b6b143cac68fd1ac3c48be AS ui
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -26,6 +29,10 @@ RUN rustup target add wasm32-unknown-unknown
 # The release asset name carries the *host* architecture, so it must follow the
 # build platform: an arm64 build that downloaded the x86_64 binary would fail (or,
 # worse under emulation, silently run the wrong one).
+#
+# `TRUNK_SHA256` below pins the release asset: a plain `curl | tar` trusts whatever
+# GitHub serves at that URL, so a replaced or tampered asset would produce a
+# backdoored image with no signal. With the checksum it is a hard build failure.
 ARG TRUNK_VERSION=v0.21.14
 ARG TARGETARCH
 RUN case "$TARGETARCH" in \
@@ -33,9 +40,16 @@ RUN case "$TARGETARCH" in \
       arm64) TRUNK_ARCH=aarch64-unknown-linux-gnu ;; \
       *) echo "unsupported build platform '$TARGETARCH' (amd64 and arm64 only)" >&2; exit 1 ;; \
     esac \
- && curl -fsSL \
+ && case "$TRUNK_ARCH" in \
+      x86_64-unknown-linux-gnu) TRUNK_SHA256=f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b ;; \
+      aarch64-unknown-linux-gnu) TRUNK_SHA256=b1d8e60e454f7fc182d9a4d95d1506ffbae947d8ba90f8f6f02da93b60f980f9 ;; \
+      *) echo "no pinned checksum for '$TRUNK_ARCH'" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/trunk.tar.gz \
       "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-${TRUNK_ARCH}.tar.gz" \
-    | tar -xz -C /usr/local/bin trunk \
+ && echo "${TRUNK_SHA256}  /tmp/trunk.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/trunk.tar.gz -C /usr/local/bin trunk \
+ && rm -f /tmp/trunk.tar.gz \
  && trunk --version
 
 WORKDIR /src/ui
@@ -43,7 +57,7 @@ COPY ui/ ./
 RUN trunk build --release
 
 # ---------- stage 2: gateway ----------
-FROM rust:1-slim-bookworm AS build
+FROM rust:1-slim-bookworm@sha256:86234e857a413004348b471d11a4ebe1aa92d2eae2b6b143cac68fd1ac3c48be AS build
 
 # tikv-jemalloc-sys compiles C, so a toolchain is required even for a "pure" Rust crate.
 RUN apt-get update \
@@ -63,7 +77,7 @@ COPY --from=ui /src/ui/dist ./ui/dist
 RUN cargo build --release --locked
 
 # ---------- stage 3: runtime ----------
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \

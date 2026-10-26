@@ -277,7 +277,12 @@ impl KeyPool {
             Strategy::LeastUsed => keys
                 .iter()
                 .filter(|k| k.is_available(model) && ready(k))
-                .min_by_key(|k| k.requests.load(Ordering::Relaxed))
+                // Live load first: in-flight requests are what a concurrent burst
+                // competes over, while `requests` only moves after a round trip —
+                // ranking on it alone made this strategy behave like `fill_first`
+                // under exactly the load it exists for. Lifetime count breaks ties
+                // so sustained traffic still spreads evenly.
+                .min_by_key(|k| (k.in_flight(), k.requests.load(Ordering::Relaxed)))
                 .cloned(),
             Strategy::FillFirst => keys
                 .iter()
@@ -699,6 +704,38 @@ mod tests {
             0,
             "least_used picked the busy key"
         );
+    }
+
+    /// `least_used` must spread a *concurrent* burst, not just sequential calls.
+    ///
+    /// It ranked on `requests`, which increments only after a round trip: every
+    /// request in a burst read the same counts, picked the same key, and the
+    /// strategy degenerated into `fill_first` — pinning one key while the rest
+    /// sat idle, exactly the pattern `has_capacity` was added to fix.
+    #[test]
+    fn least_used_spreads_a_concurrent_burst() {
+        // Unlimited concurrency, so admission never masks the choice.
+        let p = pool_with_capacity(Strategy::LeastUsed, &["a", "b", "c"], 0);
+        // Simulate a burst: five picks taken *before* any of them reports back.
+        let mut guards = Vec::new();
+        for _ in 0..3 {
+            let key = p.pick("m", None).expect("a key");
+            guards.push(key.try_acquire().expect("a slot"));
+        }
+        let in_flight: Vec<u32> = p.snapshot().iter().map(|k| k.in_flight).collect();
+        assert_eq!(
+            in_flight.iter().filter(|n| **n == 0).count(),
+            0,
+            "every key should have taken one request, got {in_flight:?}"
+        );
+        assert!(
+            in_flight.iter().all(|n| *n == 1),
+            "the burst must spread one per key, got {in_flight:?}"
+        );
+        // A sixth request still gets a key (unlimited capacity) — and it lands on
+        // the least loaded one rather than stacking on the first.
+        let extra = p.pick("m", None).expect("a key");
+        assert_eq!(extra.in_flight(), 1);
     }
 
     // ----- failure classification -----

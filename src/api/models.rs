@@ -7,7 +7,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
-use super::persist::{save_disabled_models, save_model_limits};
 use super::{ApiResult, ok_json};
 use crate::config::{ModelLimit, ModelLimits};
 use crate::limits::{Limits, Resolved};
@@ -103,23 +102,48 @@ fn dm_read(state: &AppState) -> RwLockReadGuard<'_, HashSet<String>> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// The disabled set as a sorted list (stable output, no duplicate spellings).
-fn current_disabled(state: &Arc<AppState>) -> Vec<String> {
-    let mut all: Vec<_> = dm_read(state).iter().cloned().collect();
-    all.sort();
-    all.dedup();
-    all
-}
-
-/// Persist the whole disabled list through the config writer (validate → write →
-/// install) and return any error to the caller.
-async fn save_disabled(
+/// Apply `edit` to the disabled set with the read-modify-write **inside**
+/// `config_lock`.
+///
+/// Callers used to snapshot `current_disabled(&state)` first and write the result
+/// afterwards, so two dashboard tabs toggling different models each wrote the list
+/// they had read and the first toggle was silently reverted — in the TOML and in
+/// memory. `persist.rs` documents this exact race as fixed for client keys.
+async fn edit_disabled<F>(
     state: &Arc<AppState>,
-    list: &[String],
-) -> Result<(), Box<axum::response::Response>> {
-    save_disabled_models(state, list).await?;
+    edit: F,
+) -> Result<Vec<String>, Box<axum::response::Response>>
+where
+    F: FnOnce(&mut HashSet<String>) -> Result<(), Box<axum::response::Response>>,
+{
+    let mut produced = Vec::new();
+    crate::api::persist::with_locked_list(
+        state,
+        |st| -> Vec<String> {
+            let mut all: Vec<_> = st
+                .disabled_models
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned()
+                .collect();
+            all.sort();
+            all.dedup();
+            all
+        },
+        |current| {
+            let mut set: HashSet<String> = current.into_iter().collect();
+            edit(&mut set)?;
+            let mut list: Vec<String> = set.into_iter().collect();
+            list.sort();
+            produced = list.clone();
+            Ok::<Vec<String>, Box<axum::response::Response>>(list)
+        },
+        |path, list| crate::api::persist::disabled_models_text(path, list),
+    )
+    .await?;
     state.invalidate_catalog();
-    Ok(())
+    Ok(produced)
 }
 
 /// Map a boxed error response to the typed error `ApiResult` wants.
@@ -335,66 +359,81 @@ pub async fn models_limits_set(
         ));
     }
 
-    // Work from the installed snapshot, not from a pre-lock read: the writer below
-    // re-validates and rebuilds from the file, and a concurrent edit must not be
-    // overwritten with a stale list.
-    let mut list: Vec<ModelLimit> = state
-        .model_limits
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .entries()
-        .to_vec();
-
-    // The entry the operator is editing: the id itself, or an inherited bare-name
-    // entry when they are looking at `provider/model` that inherits from `model`.
-    let idx = list.iter().position(|l| l.model == model).or_else(|| {
-        // Inherited from a bare-name entry: find the entry it came from.
-        let inherited = state
-            .model_limits
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&model)?
-            .model
-            .clone();
-        list.iter().position(|l| l.model == inherited)
-    });
-
-    let mut entry = match idx {
-        // The entry the operator is editing: replace it in place.
-        Some(i) if list[i].model == model => list.remove(i),
-        // Inherited from a shared bare-name entry: copy its values into a dedicated
-        // entry and leave the shared one alone (a `provider/model` edit must not
-        // silently change every other provider serving that model).
-        Some(i) => ModelLimit {
-            model: model.clone(),
-            ..list[i].clone()
+    // The read-modify-write happens **inside** `config_lock` (see
+    // `persist::with_locked_list`): a snapshot taken before the lock let two
+    // dashboard tabs each write the list they read, and the first edit vanished
+    // from the config file *and* from memory. This is the same race `persist.rs`
+    // documents as fixed for client keys.
+    let model_for_edit = model.clone();
+    let mut entry: Option<ModelLimit> = None;
+    crate::api::persist::with_locked_list(
+        &state,
+        |st| -> Vec<ModelLimit> {
+            st.model_limits
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .entries()
+                .to_vec()
         },
-        None => ModelLimit {
-            model: model.clone(),
-            ..Default::default()
+        |mut list| {
+            // The entry the operator is editing: the id itself, or an inherited
+            // bare-name entry when they are looking at `provider/model` that
+            // inherits from `model`.
+            let idx = list
+                .iter()
+                .position(|l| l.model == model_for_edit)
+                .or_else(|| {
+                    // Inherited from a bare-name entry: that entry is the one to edit.
+                    let inherited = crate::config::ModelLimits::build(list.clone())
+                        .get(&model_for_edit)
+                        .map(|l| l.model.clone())?;
+                    list.iter().position(|l| l.model == inherited)
+                });
+
+            let mut e = match idx {
+                // Editing an existing entry: replace it in place.
+                Some(i) if list[i].model == model_for_edit => list.remove(i),
+                // Inherited from a shared bare-name entry: copy its values into a
+                // dedicated entry and leave the shared one alone (a
+                // `provider/model` edit must not silently change every other
+                // provider serving that model).
+                Some(i) => ModelLimit {
+                    model: model_for_edit.clone(),
+                    ..list[i].clone()
+                },
+                None => ModelLimit {
+                    model: model_for_edit.clone(),
+                    ..Default::default()
+                },
+            };
+            apply_field(&mut e.context_window, update.context_window);
+            apply_field(&mut e.max_output_tokens, update.max_output_tokens);
+            apply_field(&mut e.max_input_tokens, update.max_input_tokens);
+
+            if let Err(err) = e.check() {
+                // `check()` also rejects an all-zero entry; that is the "reset
+                // everything" case, which must remove the entry rather than fail.
+                let reset = e.is_empty();
+                let existed = idx.is_some_and(|i| list.get(i).is_some_and(|_| true));
+                if !(reset && (existed || idx.is_some())) {
+                    use axum::response::IntoResponse as _;
+                    return Err(Box::new(
+                        super::ApiError::BadRequest(format!("{err}")).into_response(),
+                    ));
+                }
+            }
+            if !e.is_empty() {
+                list.push(e.clone());
+            }
+            list.sort_by(|a, b| a.model.cmp(&b.model));
+            entry = Some(e);
+            Ok::<Vec<ModelLimit>, Box<axum::response::Response>>(list)
         },
-    };
-    apply_field(&mut entry.context_window, update.context_window);
-    apply_field(&mut entry.max_output_tokens, update.max_output_tokens);
-    apply_field(&mut entry.max_input_tokens, update.max_input_tokens);
-
-    if let Err(e) = entry.check() {
-        // `check()` also rejects an all-zero entry; that is the "reset everything"
-        // case, which must remove the entry rather than fail.
-        let reset = entry.is_empty();
-        let existed = idx.is_some_and(|i| list.get(i).is_some_and(|l| l.model == model));
-        if !(reset && (existed || idx.is_some())) {
-            return Err(super::ApiError::BadRequest(format!("{e}")));
-        }
-    }
-    if !entry.is_empty() {
-        list.push(entry.clone());
-    }
-    list.sort_by(|a, b| a.model.cmp(&b.model));
-
-    save_model_limits(&state, &list)
-        .await
-        .map_err(|resp| boxed(&resp))?;
+        |path, list| crate::api::persist::model_limits_text(path, list),
+    )
+    .await
+    .map_err(|resp| boxed(&resp))?;
+    let entry = entry.unwrap_or_default();
     state.invalidate_catalog();
     state.events.emit_simple(
         "models",
@@ -464,18 +503,14 @@ pub async fn model_enable(
 ) -> ApiResult {
     validate_model_action(&a)?;
     let model = normalize(&a).to_string();
-    // Compute the list this request wants; the writer validates, writes and
-    // installs it. Mutating the live set first meant a concurrent config write
-    // could revert it while the request had already answered "enabled".
-    let mut list = current_disabled(&state);
-    {
-        let dm: HashSet<String> = list.iter().cloned().collect();
-        let mut dm = dm;
-        clear_model(&mut dm, &model);
-        list = dm.into_iter().collect();
-    }
-    list.sort();
-    save_disabled(&state, &list).await.map_err(|r| boxed(&r))?;
+    // Compute the list this request wants with the read-modify-write inside the
+    // config lock, so a concurrent toggle of another model cannot be reverted.
+    edit_disabled(&state, |dm| {
+        clear_model(dm, &model);
+        Ok(())
+    })
+    .await
+    .map_err(|r| boxed(&r))?;
 
     state.events.emit_simple(
         "models",
@@ -493,11 +528,12 @@ pub async fn model_disable(
 ) -> ApiResult {
     validate_model_action(&a)?;
     let model = normalize(&a).to_string();
-    let mut list = current_disabled(&state);
-    if !list.iter().any(|m| m == &model) {
-        list.push(model.clone());
-    }
-    save_disabled(&state, &list).await.map_err(|r| boxed(&r))?;
+    edit_disabled(&state, |dm| {
+        dm.insert(model.clone());
+        Ok(())
+    })
+    .await
+    .map_err(|r| boxed(&r))?;
 
     state.events.emit_simple(
         "models",
@@ -515,22 +551,21 @@ pub async fn model_toggle(
 ) -> ApiResult {
     validate_model_action(&a)?;
     let model = normalize(&a).to_string();
-    let mut list = current_disabled(&state);
-    let new_enabled = {
-        let mut dm: HashSet<String> = list.iter().cloned().collect();
-        // Toggle must agree with `models_list`/the request path: an entry in any
-        // spelling counts as disabled, and enabling clears all of them.
-        if is_disabled(&dm, &model) {
-            clear_model(&mut dm, &model);
-            list = dm.into_iter().collect();
-            list.sort();
-            true
+    // Toggle must agree with `models_list`/the request path: an entry in any
+    // spelling counts as disabled, and enabling clears all of them. The decision
+    // is made inside the lock, so it sees the state it is about to write.
+    let mut new_enabled = false;
+    edit_disabled(&state, |dm| {
+        if is_disabled(dm, &model) {
+            clear_model(dm, &model);
+            new_enabled = true;
         } else {
-            list.push(model.clone());
-            false
+            dm.insert(model.clone());
         }
-    };
-    save_disabled(&state, &list).await.map_err(|r| boxed(&r))?;
+        Ok(())
+    })
+    .await
+    .map_err(|r| boxed(&r))?;
 
     let kind = if new_enabled { "backoff" } else { "dead" };
     state.events.emit_simple(
@@ -547,7 +582,12 @@ pub async fn model_toggle(
 }
 
 pub async fn models_enable_all(State(state): State<Arc<AppState>>) -> ApiResult {
-    save_disabled(&state, &[]).await.map_err(|r| boxed(&r))?;
+    edit_disabled(&state, |dm| {
+        dm.clear();
+        Ok(())
+    })
+    .await
+    .map_err(|r| boxed(&r))?;
     state
         .events
         .emit_simple("models", "", "backoff", "all models enabled".into());
@@ -566,13 +606,16 @@ pub async fn models_disable_all(State(state): State<Arc<AppState>>) -> ApiResult
         all_ids.push(c.name.clone());
     }
 
-    let mut list = current_disabled(&state);
-    for id in all_ids {
-        if !list.iter().any(|m| m == &id) {
-            list.push(id);
+    // Merge the *currently* disabled entries with these, inside the lock, so a
+    // concurrent single-model toggle is preserved rather than overwritten.
+    edit_disabled(&state, |dm| {
+        for id in &all_ids {
+            dm.insert(id.clone());
         }
-    }
-    save_disabled(&state, &list).await.map_err(|r| boxed(&r))?;
+        Ok(())
+    })
+    .await
+    .map_err(|r| boxed(&r))?;
 
     state
         .events
@@ -809,6 +852,92 @@ mod tests {
             assert_eq!(
                 body["top_provider"]["max_completion_tokens"], 64_000,
                 "{body}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Two concurrent toggles of *different* models must both survive.
+    ///
+    /// The handlers used to snapshot `current_disabled()` and write the result
+    /// afterwards, so two dashboard tabs each wrote the list they had read and one
+    /// toggle was silently reverted — in the TOML and in memory. The fix moves the
+    /// read-modify-write inside `config_lock`; this test is the regression.
+    #[tokio::test]
+    async fn concurrent_toggles_of_different_models_do_not_lose_an_edit() {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+
+        // Ten distinct models disabled at once, as ten independent requests.
+        let mut tasks = Vec::new();
+        for i in 0..10 {
+            let st = st.clone();
+            tasks.push(tokio::spawn(async move {
+                model_disable(State(st), action(&format!("mock/model-{i}"))).await
+            }));
+        }
+        for t in tasks {
+            t.await.expect("task").expect("disable");
+        }
+
+        // Every one of them must be in memory…
+        let live: std::collections::HashSet<String> = dm_read(&st).iter().cloned().collect();
+        for i in 0..10 {
+            assert!(
+                live.contains(&format!("mock/model-{i}")),
+                "model-{i} was lost from memory: {live:?}"
+            );
+        }
+        // …and on disk, which is what a restart reads.
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let cfg: crate::config::Config = toml::from_str(&raw).expect("parses");
+        let on_disk: std::collections::HashSet<String> =
+            cfg.disabled_models.iter().cloned().collect();
+        for i in 0..10 {
+            assert!(
+                on_disk.contains(&format!("mock/model-{i}")),
+                "model-{i} was lost from the config file: {on_disk:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same race on `[[model_limits]]`: two concurrent edits of different
+    /// models must both be present afterwards.
+    #[tokio::test]
+    async fn concurrent_model_limit_edits_do_not_lose_an_edit() {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+
+        let set = |model: &str, ctx: u64| {
+            Json(
+                serde_json::from_str::<LimitsUpdate>(&format!(
+                    r#"{{"model":"{model}","context_window":{ctx}}}"#
+                ))
+                .expect("deserialize"),
+            )
+        };
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let st = st.clone();
+            let model = format!("mock/limit-{i}");
+            let ctx = 1000 + i as u64;
+            tasks.push(tokio::spawn(async move {
+                models_limits_set(State(st), set(&model, ctx)).await
+            }));
+        }
+        for t in tasks {
+            t.await.expect("task").expect("set limits");
+        }
+
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let cfg: crate::config::Config = toml::from_str(&raw).expect("parses");
+        let models: std::collections::HashSet<&str> =
+            cfg.model_limits.iter().map(|l| l.model.as_str()).collect();
+        for i in 0..8 {
+            assert!(
+                models.contains(format!("mock/limit-{i}").as_str()),
+                "limit-{i} was lost from the config file: {models:?}"
             );
         }
         let _ = std::fs::remove_file(&path);

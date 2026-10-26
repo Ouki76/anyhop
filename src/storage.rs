@@ -813,7 +813,8 @@ fn dispatch(
                     std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
-                        "storage: {MAX_PENDING_REQUEUE} writes are already queued for a                          state file that is not accepting them; dropping new records"
+                        "storage: {MAX_PENDING_REQUEUE} writes are already queued for a \
+                        state file that is not accepting them; dropping new records"
                     );
                 }
                 return;

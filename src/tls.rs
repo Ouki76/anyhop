@@ -841,3 +841,276 @@ mod tests {
         assert_eq!(ok(pem_blocks(&pem, "NOT A LABEL")).len(), 0);
     }
 }
+
+/// Bounds the window between `accept` and the first request byte.
+///
+/// This is the one phase with no deadline: `[tuning] client_body_timeout_secs`
+/// bounds the body, the HTTP keep-alive idle timeout bounds a parked connection,
+/// and `HANDSHAKE_TIMEOUT` bounds a TLS handshake — but a plain-HTTP client that
+/// connects and sends nothing (or one byte per minute) held a file descriptor
+/// forever. Enough of those and the accept loop starves.
+///
+/// A guard inside `poll_read` does **not** work here, and that was measured before
+/// this was written: hyper does not poll for data until it decides the connection
+/// is ready, so for a silent client `poll_read` is never called and the guard
+/// never runs. The only place the deadline can be enforced is *around* accept,
+/// which means reading the first byte ourselves and handing hyper a stream that
+/// starts with it buffered.
+pub struct FirstByteTimeout<T> {
+    inner: T,
+    /// The bytes read while waiting for the first one, replayed on first read.
+    peeked: Option<Vec<u8>>,
+}
+
+impl<T> FirstByteTimeout<T> {
+    /// Waits for the first byte under `timeout`, then wraps the stream.
+    ///
+    /// `None` means the client never spoke: the caller drops the connection.
+    pub async fn new_with_peek(mut inner: T, timeout: Duration) -> io::Result<Option<Self>>
+    where
+        T: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 8192];
+        let n = match tokio::time::timeout(timeout, inner.read(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_completed) => return Ok(None),
+        };
+        if n == 0 {
+            // Clean EOF before any request: the peer hung up.
+            return Ok(None);
+        }
+        // One byte is not a request. A slowloris client sends `G` and then stalls,
+        // which satisfied the "first byte" rule and then held the socket open
+        // again — measured: still alive after 25 s. So the deadline keeps running
+        // until the *request line* is complete (a CRLF), which is the real
+        // boundaries between "a client is there" and "a client is stalling".
+        let mut seen = buf[..n].to_vec();
+        let deadline_at = tokio::time::Instant::now() + timeout;
+        // Wait for the *end of the header block* (`\r\n\r\n`), not just the first
+        // line. A client that sends `GET / HTTP/1.1\r\nHost: x\r\n` and then
+        // stalls is still a slowloris: measured, it held the socket past 25 s
+        // while every other shape was dropped at the deadline.
+        while !seen.windows(4).any(|w| w == b"\r\n\r\n") && seen.len() < 64 * 1024 {
+            let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let mut more = [0u8; 8192];
+            match tokio::time::timeout(remaining, inner.read(&mut more)).await {
+                Ok(Ok(0)) => return Ok(None),
+                Ok(Ok(k)) => seen.extend_from_slice(&more[..k]),
+                Ok(Err(e)) => return Err(e),
+                Err(_completed) => return Ok(None),
+            }
+        }
+        let n = seen.len();
+        buf[..n].copy_from_slice(&seen);
+        Ok(Some(Self {
+            inner,
+            peeked: Some(buf[..n].to_vec()),
+        }))
+    }
+}
+
+impl<T> tokio::io::AsyncRead for FirstByteTimeout<T>
+where
+    T: tokio::io::AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let me = self.get_mut();
+        // Replay the peeked bytes first: hyper must see a stream that begins
+        // exactly where the client's request does.
+        if let Some(mut peeked) = me.peeked.take() {
+            let take = peeked.len().min(buf.remaining());
+            buf.put_slice(&peeked[..take]);
+            peeked.drain(..take);
+            if !peeked.is_empty() {
+                me.peeked = Some(peeked);
+            }
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut me.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T> tokio::io::AsyncWrite for FirstByteTimeout<T>
+where
+    T: tokio::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// The header deadline must not cut a legitimate slow upload.
+///
+/// The bound covers the *header block* only: once `\r\n\r\n` has arrived the
+/// stream is handed over untouched, and a request that then uploads a body at
+/// 1 KiB/s is limited by `client_body_timeout_secs`, not by this.
+#[cfg(test)]
+mod header_deadline_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Enough of a request line to prove the fold-in works byte for byte.
+    #[tokio::test]
+    async fn a_complete_header_block_is_replayed_untouched() {
+        let raw = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"
+            .to_vec();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let to_send = raw.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            client.write_all(&to_send).await.expect("write");
+        });
+        let wrapped = FirstByteTimeout::new_with_peek(server, Duration::from_secs(5))
+            .await
+            .expect("no IO error")
+            .expect("a live client");
+        use tokio::io::AsyncReadExt;
+        let mut out = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wrapped.take(4096).read_to_end(&mut out),
+        )
+        .await
+        .expect("completes")
+        .expect("reads");
+        assert_eq!(
+            out, raw,
+            "the bytes hyper sees must be exactly what the client sent"
+        );
+    }
+
+    /// A client that sends one byte and stalls is dropped at the deadline.
+    #[tokio::test]
+    async fn a_stalled_client_is_dropped_at_the_deadline() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            client.write_all(b"G").await.expect("write");
+            // …and then never another byte.
+            std::future::pending::<()>().await;
+        });
+        let started = std::time::Instant::now();
+        let got = FirstByteTimeout::new_with_peek(server, Duration::from_millis(150))
+            .await
+            .expect("no IO error");
+        let elapsed = started.elapsed();
+        assert!(got.is_none(), "a stalled client must be dropped");
+        assert!(
+            elapsed >= Duration::from_millis(140) && elapsed < Duration::from_secs(2),
+            "dropped at the deadline, not before or long after: {elapsed:?}"
+        );
+    }
+
+    /// Silence from the very first byte is dropped too.
+    #[tokio::test]
+    async fn a_silent_client_is_dropped_at_the_deadline() {
+        let (_client, server) = tokio::io::duplex(4096);
+        let started = std::time::Instant::now();
+        let got = FirstByteTimeout::new_with_peek(server, Duration::from_millis(100))
+            .await
+            .expect("no IO error");
+        assert!(got.is_none(), "a silent client must be dropped");
+        assert!(started.elapsed() >= Duration::from_millis(90));
+    }
+}
+
+/// A listener that applies [`FirstByteTimeout`] to every accepted connection.
+pub struct HeaderDeadline<L> {
+    inner: L,
+    timeout: Duration,
+}
+
+impl<L> HeaderDeadline<L> {
+    pub fn new(inner: L, timeout: Duration) -> Self {
+        Self { inner, timeout }
+    }
+}
+
+impl<L> Listener for HeaderDeadline<L>
+where
+    L: Listener,
+    L::Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    L::Addr: Clone + Send + std::fmt::Debug + 'static,
+{
+    type Io = FirstByteTimeout<L::Io>;
+    type Addr = L::Addr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (io, addr) = self.inner.accept().await;
+            match FirstByteTimeout::new_with_peek(io, self.timeout).await {
+                Ok(Some(wrapped)) => return (wrapped, addr),
+                // Silent or already-closed peer: drop it and take the next one.
+                Ok(None) => {
+                    debug!("connection dropped: no request within the header deadline");
+                    continue;
+                }
+                Err(e) => {
+                    debug!(error = %e, "connection dropped while reading its first byte");
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+/// The peer address the router sees through [`HeaderDeadline`].
+///
+/// axum implements `Connected` for `SocketAddr` against its *own* concrete
+/// listener types only, and the orphan rule forbids adding one for a foreign
+/// stream type. A local newtype sidesteps that: `ip_of`/`ClientIp` need nothing
+/// more than the socket address, which this carries unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PeerAddr(pub std::net::SocketAddr);
+
+impl std::ops::Deref for PeerAddr {
+    type Target = std::net::SocketAddr;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PeerAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<L> axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, HeaderDeadline<L>>>
+    for PeerAddr
+where
+    L: Listener<Addr = std::net::SocketAddr>,
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, HeaderDeadline<L>>) -> Self {
+        PeerAddr(*stream.remote_addr())
+    }
+}

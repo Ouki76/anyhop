@@ -705,6 +705,25 @@ impl RedisPool {
 
     /// Run one command, borrowing a pooled connection for its duration.
     async fn call(&self, args: &[&[u8]]) -> Result<Resp, RedisError> {
+        self.call_with(args, true).await
+    }
+
+    /// `replay_on_reconnect` decides what happens when a *reused* socket fails at
+    /// the IO level (a peer that restarted or failed over while the socket sat
+    /// idle).
+    ///
+    /// Replaying is only safe for a command that does not mutate state. The
+    /// token-bucket `EVAL` does: if Redis executed the script and the socket died
+    /// before the reply arrived, a replay consumes a **second** token, so after any
+    /// restart the shared bucket drained at up to 2× `rpm` and a client running at
+    /// exactly `rpm` saw spurious 429s. It therefore passes `false`: the caller
+    /// gets the transport error, and the limiter's own policy decides (`fail_open`,
+    /// or a 429 with `Retry-After` — the client's retry is the natural replay unit).
+    async fn call_with(
+        &self,
+        args: &[&[u8]],
+        replay_on_reconnect: bool,
+    ) -> Result<Resp, RedisError> {
         // Held for the whole command: it is this call's slot in the pool.
         let _permit = match tokio::time::timeout(self.timeout, self.slots.acquire()).await {
             Ok(Ok(p)) => p,
@@ -736,11 +755,13 @@ impl RedisPool {
             }
             // A *reused* socket that fails at the IO level is almost always a peer
             // that restarted or failed over while the socket sat idle: it is not
-            // evidence that Redis is unavailable. Reconnect once and replay the
-            // command (every command sent through this pool is idempotent). Without
-            // this, the first requests after a Redis restart got a spurious 429
-            // (`fail_open = false`) even though the server was healthy again.
-            Err(e) if reuse && e.is_transport() => {
+            // evidence that Redis is unavailable. For a read-only command,
+            // reconnect once and replay it. Without this, the first requests after
+            // a Redis restart got a spurious 429 (`fail_open = false`) even though
+            // the server was healthy again.
+            //
+            // A state-mutating command is never replayed (see `call_with`).
+            Err(e) if replay_on_reconnect && reuse && e.is_transport() => {
                 drop(conn);
                 let mut fresh = Conn::connect(&self.url, self.timeout).await?;
                 let retry = fresh.call(self.timeout, args).await;
@@ -837,7 +858,8 @@ impl RedisPool {
         frame.push(numkeys.as_bytes());
         frame.extend(keys.iter().map(|k| k.as_bytes()));
         frame.extend_from_slice(args);
-        self.call(&frame).await
+        // Not replayable: a replay of a read-modify-write charges the bucket twice.
+        self.call_with(&frame, false).await
     }
 }
 
@@ -1544,6 +1566,34 @@ mod tests {
         assert!(RedisError::Server("ERR bad".into()).keeps_connection());
         assert!(!RedisError::Server("ERR bad".into()).is_transport());
         assert!(!RedisError::Timeout("slow".into()).is_transport());
+    }
+
+    /// A state-mutating command must **not** be replayed on a dead reused socket.
+    ///
+    /// The token-bucket `EVAL` is a read-modify-write. If Redis executes it and the
+    /// socket dies before the reply arrives, replaying charges the bucket a second
+    /// time: after any restart/failover the shared budget drains at up to 2× `rpm`,
+    /// so a client running at exactly `rpm` starts getting 429s. The caller must see
+    /// the transport error and let the limiter's policy decide.
+    #[tokio::test]
+    async fn a_state_mutating_command_is_not_replayed_on_a_dead_socket() {
+        let fake = FakeRedis::start().await;
+        let p = pool(&fake, 500);
+        p.ping().await.expect("warm up");
+        fake.drop_after(1);
+        let err = p
+            .eval("return 1", &["anyhop:rl:k"], &[b"1", b"1", b"1", b"1"])
+            .await
+            .expect_err("a non-idempotent command must surface the transport error");
+        assert!(
+            err.is_transport(),
+            "the caller must be able to fall back to its own policy: {err:?}"
+        );
+
+        // A read-only command on the same dead socket *is* repaired, so the pool
+        // still recovers rather than staying broken.
+        p.ping().await.expect("the next command reconnects");
+        assert!(fake.connections() >= 2, "the dead socket must be replaced");
     }
 
     #[tokio::test]

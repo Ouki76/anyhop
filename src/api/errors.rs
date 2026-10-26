@@ -283,7 +283,12 @@ mod tests {
             let body = body_json(resp).await;
             assert_eq!(
                 body,
-                json!({"error": {"code": code, "message": message, "type": kind}}),
+                json!({"error": {
+                    "code": crate::proxy::error_code_for(kind),
+                    "message": message,
+                    "type": kind,
+                    "param": null,
+                }}),
                 "body for {code}"
             );
         }

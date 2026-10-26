@@ -2908,7 +2908,7 @@ mod tests {
 
         Arc::new(AppState {
             router: arc_swap::ArcSwap::from_pointee(router),
-            cfg: RwLock::new(super::super::RtConfig {
+            cfg: arc_swap::ArcSwap::from_pointee(super::super::RtConfig {
                 max_retries: 2,
                 attempt_timeout: Duration::from_secs(30),
                 api_key: None,
@@ -2931,6 +2931,8 @@ mod tests {
             auth_start_lock: tokio::sync::Mutex::new(()),
             auth_fails: Mutex::new(crate::middleware::AuthFailures::default()),
             catalog_epoch: AtomicU64::new(0),
+            model_first_seen: std::sync::Mutex::new(std::collections::HashMap::new()),
+            inflight_bytes: crate::proxy::InflightBytes::new(0),
             tls_enabled_flag: std::sync::atomic::AtomicBool::new(false),
             models_cache: Mutex::new(None),
             request_log: Mutex::new(VecDeque::new()),

@@ -13,7 +13,21 @@ pub fn build_http_client_with(
     let mut b = reqwest::Client::builder()
         .user_agent(concat!("anyhop/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(tuning.connect_timeout())
-        .pool_max_idle_per_host(tuning.sticky_max_entries.min(64));
+        .pool_max_idle_per_host(tuning.sticky_max_entries.min(64))
+        // Ambient proxy variables are deliberately ignored.
+        //
+        // reqwest 0.12 enables its `system-proxy` feature by default, so
+        // `HTTPS_PROXY`/`ALL_PROXY`/`HTTP_PROXY` were honoured even with no proxy
+        // configured here. For a gateway that *forwards credentials*, that is the
+        // difference between "the operator chose a proxy" and "whoever can set an
+        // environment variable — an `EnvironmentFile=`, a compose `env_file`, a
+        // parent process, a CI runner — receives `Authorization: Bearer <provider
+        // key>`, `x-api-key` and `x-goog-api-key` for every upstream call, plus the
+        // plaintext replies", with no config change and no warning.
+        //
+        // A proxy is therefore opt-in and explicit: `[server] proxy` or a
+        // per-provider/per-account `proxy` key. Nothing else routes traffic.
+        .no_proxy();
     if let Some(p) = proxy {
         let proxy =
             reqwest::Proxy::all(p).map_err(|e| anyhow::anyhow!("invalid proxy url '{p}': {e}"))?;
@@ -769,6 +783,106 @@ impl ProviderRouter {
 mod tests {
     use super::*;
     use crate::pool::FailKind;
+
+    /// A proxy in the environment must not silently receive provider credentials.
+    ///
+    /// `reqwest` 0.12 enables its `system-proxy` feature by default, so before
+    /// `.no_proxy()` a bare `HTTPS_PROXY=…` (an `EnvironmentFile=`, a compose
+    /// `env_file`, a parent process) captured every upstream call — and with it
+    /// every `Authorization`/`x-api-key` header. The proof here is behavioural, not
+    /// a config inspection: point the proxy variable at a listener that records
+    /// what it is asked to CONNECT to, run a real request to a *different* live
+    /// upstream, and require that the proxy saw nothing.
+    #[tokio::test]
+    async fn ambient_proxy_env_does_not_intercept_upstream_calls() {
+        // The upstream the client really talks to.
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let upstream_addr = upstream.local_addr().expect("upstream addr");
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let served_here = served.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let (mut sock, _) = upstream.accept().await.expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            served_here.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+        });
+
+        // The proxy that must stay idle.
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let proxied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let proxied_here = proxied.clone();
+        tokio::spawn(async move {
+            if tokio::time::timeout(Duration::from_millis(700), proxy.accept())
+                .await
+                .is_ok()
+            {
+                proxied_here.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        // SAFETY-equivalent of a hostile environment: the variable is set for the
+        // duration of this one client build, which is read at build time.
+        //
+        // `set_var` is unsafe from Rust 2024 on and is racy across threads, so the
+        // client is built while holding a lock that no other test in this binary
+        // takes; the value is restored immediately afterwards.
+        // `set_var` is unsafe in edition 2024 (it races with concurrent readers).
+        // Serialised by a lock no other test in this binary takes, restored
+        // immediately, and the crate denies `unsafe_code` everywhere else.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = (
+            std::env::var_os("HTTP_PROXY"),
+            std::env::var_os("http_proxy"),
+        );
+        let proxy_url = format!("http://{proxy_addr}");
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("HTTP_PROXY", &proxy_url);
+            std::env::set_var("http_proxy", &proxy_url);
+        }
+        let client = build_http_client_with(None, &crate::config::Tuning::default());
+        #[allow(unsafe_code)]
+        unsafe {
+            match previous.0 {
+                Some(v) => std::env::set_var("HTTP_PROXY", v),
+                None => std::env::remove_var("HTTP_PROXY"),
+            }
+            match previous.1 {
+                Some(v) => std::env::set_var("http_proxy", v),
+                None => std::env::remove_var("http_proxy"),
+            }
+        }
+        drop(guard);
+
+        let client = client.expect("client builds");
+        let resp = client
+            .get(format!("http://{upstream_addr}/probe"))
+            .header("x-api-key", "sk-must-not-leak")
+            .send()
+            .await
+            .expect("the request must reach the upstream directly");
+        assert_eq!(resp.status(), 200);
+        // Let the proxy's acceptor notice (it should not).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !proxied.load(std::sync::atomic::Ordering::SeqCst),
+            "a proxy from the environment received the request (credential leak)"
+        );
+        assert!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            "the upstream was never contacted"
+        );
+    }
 
     fn provider(extra: &str) -> Provider {
         let src = format!(

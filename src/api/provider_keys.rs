@@ -19,14 +19,13 @@ use crate::proxy::AppState;
 /// rejected it — and the request builder then treated the value as an upstream
 /// URL. http(s) only, bounded length.
 fn validate_base_url(url: &str) -> Result<(), String> {
-    let u = url.trim();
-    if u.is_empty() {
-        return Err("base_url must not be empty".to_string());
+    // The same predicate `Config::validate` uses, so the dashboard and a
+    // hand-written TOML cannot disagree about what an upstream URL may be.
+    if crate::config::is_http_url(url) {
+        Ok(())
+    } else {
+        Err("base_url must be an http(s) URL of at most 2048 characters".to_string())
     }
-    if !(u.starts_with("http://") || u.starts_with("https://")) || u.len() > 2048 {
-        return Err("base_url must be an http(s) URL of at most 2048 characters".to_string());
-    }
-    Ok(())
 }
 
 /// In-flight cap per key: `0` is documented as "unlimited", everything else is a
@@ -708,26 +707,23 @@ pub async fn key_delete(State(state): State<Arc<AppState>>, Json(a): Json<KeyAct
         }
     }
 
-    // Clear the runtime copy *before* the reload. The reload merges every secret
-    // the state file still lists back into the pool, so clearing it afterwards
-    // kept the deleted key alive until the *next* reload. The list is restored
-    // below if the config write is refused, so a rejected edit cannot drop
-    // runtime-added keys.
-    let extras_before = state
-        .storage
-        .as_ref()
-        .map(|s| s.list_extra_keys(&provider_name))
-        .unwrap_or_default();
+    // Write first, then clear the runtime copy — never the other way round.
+    //
+    // The reload merges every secret the state file still lists back into the pool,
+    // so the runtime entry does have to go, or the deleted key survives until the
+    // *next* reload. But doing it first meant a **refused** write had already
+    // emptied the persisted list: the in-memory restore below was an async send to
+    // the writer task, so a process that exited before its next flush (2 s) left
+    // the state file saying "this provider has no runtime keys" while the TOML
+    // still listed them. On restart those credentials silently disappeared from the
+    // pool. The reload that follows a *successful* write is what purges them, and
+    // it happens inside `write_validated`.
+    if let Err(resp) = write_validated(&state, &doc).await {
+        return Ok(*resp);
+    }
     if let Some(s) = &state.storage {
         s.delete_extra_key(&provider_name, &secret);
         s.set_extra_keys(&provider_name, Vec::new());
-    }
-
-    if let Err(resp) = write_validated(&state, &doc).await {
-        if let Some(s) = &state.storage {
-            s.set_extra_keys(&provider_name, extras_before);
-        }
-        return Ok(*resp);
     }
     state.events.emit_simple(
         "config",
@@ -961,6 +957,7 @@ mod edit_tests {
         [server]
         listen = "127.0.0.1:18080"
         api_key = "test-gw-key"
+        admin_key = "test-admin-key"
     "#;
 
     fn load(path: &std::path::Path) -> crate::config::Config {
@@ -1022,6 +1019,201 @@ mod edit_tests {
         assert_eq!(body["name"], "openai_compat-2", "{body}");
         assert_eq!(load(&path).providers.len(), 4);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ----- key lifecycle: add / enable / disable / delete -----
+
+    /// A state whose live router actually reflects `path`.
+    ///
+    /// `test_support::state` starts with an empty router (every other handler
+    /// test builds what it needs by calling a mutating endpoint first), but the
+    /// key handlers operate on `state.router`, so the config has to be installed
+    /// or every call answers "unknown provider".
+    fn installed_state(path: &std::path::Path) -> std::sync::Arc<AppState> {
+        let st = state(path);
+        crate::reload_config(&st).expect("the fixture must install");
+        st
+    }
+
+    /// `key_add` appends a credential to its provider, writes a config that still
+    /// loads, and installs it in the live pool. It had no test at all.
+    #[tokio::test]
+    async fn adding_a_key_appends_it_and_keeps_the_config_loadable() {
+        let path = temp_config(TWO);
+        let st = installed_state(&path);
+
+        key_add(
+            State(st.clone()),
+            json(r#"{"provider":"mock","secret":"sk-second-key"}"#),
+        )
+        .await
+        .expect("added");
+
+        let cfg = load(&path);
+        let mock = cfg
+            .providers
+            .iter()
+            .find(|p| p.name == "mock")
+            .expect("mock provider");
+        assert_eq!(
+            mock.keys,
+            vec!["sk-one".to_string(), "sk-second-key".to_string()],
+            "the new key must be appended, not replace the old one"
+        );
+        // The live pool follows the file, or the dashboard reports a key the
+        // gateway will not use.
+        let live = st.router.load();
+        let pool = &live
+            .providers
+            .iter()
+            .find(|p| p.name == "mock")
+            .unwrap()
+            .pool;
+        assert_eq!(pool.len(), 2, "the reload must reach the live pool");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Disabling and re-enabling a key is a live toggle: it changes the pool's
+    /// health, not the config file (the operator asked for "not right now", not
+    /// "forget this credential").
+    #[tokio::test]
+    async fn a_key_can_be_disabled_and_enabled_without_touching_the_file() {
+        let path = temp_config(TWO);
+        let st = installed_state(&path);
+        let before = std::fs::read_to_string(&path).expect("read");
+
+        let id = {
+            let live = st.router.load();
+            live.providers
+                .iter()
+                .find(|p| p.name == "mock")
+                .expect("mock")
+                .pool
+                .snapshot()
+                .first()
+                .expect("a key")
+                .id
+                .clone()
+        };
+
+        key_disable(
+            State(st.clone()),
+            json(&format!(r#"{{"provider":"mock","id":"{id}"}}"#)),
+        )
+        .await
+        .expect("disabled");
+        let status = |st: &std::sync::Arc<AppState>| {
+            st.router
+                .load()
+                .providers
+                .iter()
+                .find(|p| p.name == "mock")
+                .unwrap()
+                .pool
+                .snapshot()
+                .into_iter()
+                .find(|k| k.id == id)
+                .expect("the key is still listed")
+                .status
+        };
+        assert_ne!(
+            status(&st),
+            "active",
+            "a disabled key must not be available"
+        );
+
+        key_enable(
+            State(st.clone()),
+            json(&format!(r#"{{"provider":"mock","id":"{id}"}}"#)),
+        )
+        .await
+        .expect("enabled");
+        assert_eq!(status(&st), "active", "re-enabling must restore it");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            before,
+            "a live toggle must not rewrite the config file"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Deleting the *last* credential of a provider is refused: it would leave the
+    /// provider unusable and the config unbuildable. Deleting the provider is the
+    /// honest operation.
+    #[tokio::test]
+    async fn deleting_the_last_key_of_a_provider_is_refused() {
+        let path = temp_config(TWO);
+        let st = installed_state(&path);
+        let id = {
+            let live = st.router.load();
+            live.providers
+                .iter()
+                .find(|p| p.name == "mock")
+                .expect("mock")
+                .pool
+                .snapshot()
+                .first()
+                .expect("a key")
+                .id
+                .clone()
+        };
+        let err = key_delete(
+            State(st.clone()),
+            json(&format!(r#"{{"provider":"mock","id":"{id}"}}"#)),
+        )
+        .await
+        .expect_err("the last key must not be deletable");
+        assert!(
+            format!("{err:?}").contains("last key") || format!("{err:?}").contains("only one"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            load(&path).providers[0].keys.len(),
+            1,
+            "nothing was removed"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An unknown provider or key id is a 404, not a silent success — the
+    /// dashboard tells the operator what happened.
+    #[tokio::test]
+    async fn key_actions_on_unknown_targets_are_not_found() {
+        let path = temp_config(TWO);
+        let st = installed_state(&path);
+        // Each handler returns its own opaque future, so they are checked in
+        // turn rather than collected.
+        let err = key_enable(State(st.clone()), json(r#"{"provider":"nope","id":"x"}"#))
+            .await
+            .expect_err("enable/unknown provider");
+        assert!(format!("{err:?}").contains("unknown"), "{err:?}");
+
+        let err = key_disable(
+            State(st.clone()),
+            json(r#"{"provider":"mock","id":"0000"}"#),
+        )
+        .await
+        .expect_err("disable/unknown key");
+        assert!(format!("{err:?}").contains("unknown"), "{err:?}");
+
+        let err = key_delete(
+            State(st.clone()),
+            json(r#"{"provider":"mock","id":"0000"}"#),
+        )
+        .await
+        .expect_err("delete/unknown key");
+        assert!(format!("{err:?}").contains("unknown"), "{err:?}");
+
+        let err = key_add(
+            State(st.clone()),
+            json(r#"{"provider":"nope","secret":"sk-x"}"#),
+        )
+        .await
+        .expect_err("add/unknown provider");
+        assert!(format!("{err:?}").contains("unknown"), "{err:?}");
         let _ = std::fs::remove_file(&path);
     }
 

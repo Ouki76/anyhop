@@ -28,7 +28,12 @@ pub(super) fn internal_body_error() -> Response {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TargetFailure {
     /// Keys are alive but every in-flight slot is taken: retry shortly.
-    Capacity { attempts: usize },
+    Capacity {
+        attempts: usize,
+        /// What is left of this target's capacity budget — advertised as
+        /// `Retry-After`, because that is when a slot may actually be free.
+        retry_after: Duration,
+    },
     /// No key can serve the model right now (cooling down / dead / empty pool).
     Unavailable {
         attempts: usize,
@@ -44,7 +49,10 @@ pub(super) enum TargetFailure {
 /// Turn a target failure into the client's answer.
 pub(super) fn failure_response(provider: &str, failure: TargetFailure) -> Response {
     match failure {
-        TargetFailure::Capacity { attempts } => busy_response(provider, attempts),
+        TargetFailure::Capacity {
+            attempts,
+            retry_after,
+        } => busy_response(provider, attempts, retry_after),
         TargetFailure::Unavailable { attempts, wake } => {
             exhausted_response(provider, attempts, wake)
         }
@@ -73,16 +81,26 @@ pub(super) fn failure_response(provider: &str, failure: TargetFailure) -> Respon
 /// slot free. That is "come back in a moment", not "this provider is down" — so
 /// it is a 429 with a Retry-After instead of a bare 503 (and never a 503 without
 /// the header, which leaves the client to guess).
-pub(super) fn busy_response(provider: &str, attempts: usize) -> Response {
+pub(super) fn busy_response(provider: &str, attempts: usize, retry_after: Duration) -> Response {
     let mut resp = error_response(
         StatusCode::TOO_MANY_REQUESTS,
         format!(
             "provider '{provider}' is at its concurrency limit \
-             ({attempts} upstream attempt(s) made); retry shortly"
+             ({attempts} upstream attempt(s) made); retry in {}s",
+            crate::middleware::retry_after_secs_of(retry_after)
         ),
         "rate_limit_exceeded",
     );
-    if let Ok(v) = header::HeaderValue::from_str("1") {
+    // The advertised wait must be the one the caller actually faces.
+    //
+    // This used to be a hard-coded `1`: with `[tuning] capacity_wait_ms = 30000`
+    // the request had already spent up to 30 s polling before answering `Busy`, so
+    // a client that obeyed `Retry-After: 1` walked straight back into another 30 s
+    // wait — a permanent 429 loop that looks like a broken gateway. The caller
+    // passes what remains of the budget.
+    if let Ok(v) = header::HeaderValue::from_str(
+        &crate::middleware::retry_after_secs_of(retry_after).to_string(),
+    ) {
         resp.headers_mut().insert(header::RETRY_AFTER, v);
     }
     resp
@@ -183,6 +201,81 @@ pub(super) fn parse_reset_duration(s: &str) -> Option<Duration> {
 /// while the other keys sat idle.
 ///
 /// Returns whole seconds, clamped to `1..=MAX_RESET`.
+/// Refuse a request that names a provider-hosted tool.
+///
+/// `web_search`, `file_search`, `code_interpreter` (and MCP-style remote tools) run
+/// on the provider's side. A translating backend has no such service, so forwarding
+/// the name would change what the request means; dropping the entry is worse —
+/// the client gets HTTP 200 and an answer written as if it had never asked.
+/// `README.md` documents a 400 and `/v1/responses` produces one; this is the same
+/// rule for the chat path, shared by every translator.
+pub(crate) fn ensure_no_hosted_tools(body: &serde_json::Value) -> Result<(), String> {
+    let Some(tools) = body.get("tools").and_then(|t| t.as_array()) else {
+        return Ok(());
+    };
+    for tool in tools {
+        let kind = tool.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if matches!(
+            kind,
+            "web_search" | "web_search_preview" | "file_search" | "code_interpreter" | "mcp"
+        ) {
+            return Err(format!(
+                "'{kind}' is a provider-hosted tool and this gateway cannot run it; it is \
+                 refused rather than forwarded without the service behind it. Use a provider \
+                 that implements it natively, or pass a function tool instead"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod hosted_tool_tests {
+    use super::*;
+
+    /// A hosted tool must be refused by name, not silently dropped.
+    ///
+    /// `README.md` promises a 400 for `web_search`/`file_search`/
+    /// `code_interpreter`. `/v1/responses` produced one; the chat path through a
+    /// translating provider filtered the entry out and answered 200 as if the
+    /// client had never asked.
+    #[test]
+    fn hosted_tools_are_refused_by_name() {
+        for kind in [
+            "web_search",
+            "web_search_preview",
+            "file_search",
+            "code_interpreter",
+            "mcp",
+        ] {
+            let body = serde_json::json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": kind}],
+            });
+            let err = ensure_no_hosted_tools(&body).expect_err("{kind} must be refused");
+            assert!(err.contains(kind), "the message must name the tool: {err}");
+            assert!(err.contains("400") || err.contains("refused"), "{err}");
+        }
+    }
+
+    /// Function tools — and anything without a hosted `type` — pass through.
+    #[test]
+    fn function_tools_are_not_refused() {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}},
+            ],
+        });
+        ensure_no_hosted_tools(&body).expect("a function tool is fine");
+
+        // No tools at all is fine too.
+        ensure_no_hosted_tools(&serde_json::json!({"messages": []})).expect("no tools");
+        // A malformed `tools` value is left for the translator to report.
+        ensure_no_hosted_tools(&serde_json::json!({"tools": "nope"})).expect("not an array");
+    }
+}
+
 pub(crate) fn parse_retry_after(value: &str) -> Option<u64> {
     let v = value.trim();
     if let Ok(secs) = v.parse::<u64>() {
@@ -470,7 +563,30 @@ mod tests {
     /// "unavailable after 4 attempts" (which also lied about the attempt count).
     #[test]
     fn a_saturated_gateway_answers_429_with_retry_after() {
-        let resp = busy_response("openai", 0);
+        // A busy answer must advertise the wait the client actually faces.
+        //
+        // It used to be a hard-coded `Retry-After: 1` even when
+        // `capacity_wait_ms` was 30 000 — a client that obeyed it walked straight
+        // back into another 30 s poll.
+        let long = busy_response("openai", 2, Duration::from_millis(30_000));
+        assert_eq!(
+            long.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("30"),
+            "the remaining capacity budget must be advertised"
+        );
+        let short = busy_response("openai", 2, Duration::from_millis(200));
+        assert_eq!(
+            short
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "a sub-second wait rounds up, never to zero"
+        );
+
+        let resp = busy_response("openai", 0, Duration::from_secs(1));
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             resp.headers()
@@ -482,7 +598,7 @@ mod tests {
         let body = futures::executor::block_on(body).expect("the body collects");
         let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON envelope");
         assert_eq!(v["error"]["type"], "rate_limit_exceeded");
-        assert_eq!(v["error"]["code"], 429);
+        assert_eq!(v["error"]["code"], "rate_limit_exceeded");
         assert!(
             v["error"]["message"]
                 .as_str()

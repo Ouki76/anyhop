@@ -2131,8 +2131,11 @@ def main(argv) -> int:
                 state_file=os.path.join(TMPDIR, "gw2.redb"),
                 models=("fast", "ok", "slow-stream"),
                 provider_max_concurrent=2, max_retries=4,
+                # `max_concurrent = 0`: these scenarios measure the *upstream pool*
+                # saturating, and the client-key cap (now 64 by default) must not
+                # trip first or the pool contract is never exercised.
                 client_keys='\n[[client_keys]]\nkey = "sk-load"\n'
-                            'name = "load"\nmodels = []\n',
+                            'name = "load"\nmodels = []\nmax_concurrent = 0\n',
                 mock_port=mock_port)
             gw2 = start_gateway("gw2", cfg2, port2)
 
@@ -2183,8 +2186,11 @@ max_concurrent = 1
             cfg3 = base_config(
                 port3, state_file=state3,
                 models=("ok", "slow-stream", "fast"),
+                # `max_concurrent = 0`: these scenarios measure the *upstream pool*
+                # saturating, and the client-key cap (now 64 by default) must not
+                # trip first or the pool contract is never exercised.
                 client_keys='\n[[client_keys]]\nkey = "sk-load"\n'
-                            'name = "load"\nmodels = []\n',
+                            'name = "load"\nmodels = []\nmax_concurrent = 0\n',
                 mock_port=mock_port)
             gw3 = start_gateway("gw5a", cfg3, port3)
             run("5", scenario5, gw3, cfg3, state3)

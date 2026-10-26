@@ -386,6 +386,14 @@ async fn run_target(
     session: Option<u64>,
     client_key: Option<&str>,
 ) -> Result<Response, TargetFailure> {
+    // `stream_options.include_usage` asks for ONE extra `choices: []` chunk
+    // carrying `usage` before `[DONE]`. No translator used to see it: Anthropic
+    // emitted the chunk unconditionally and Gemini attached `usage` to a content
+    // chunk, a shape the schema does not allow.
+    let include_usage = payload
+        .and_then(|p| p.pointer("/stream_options/include_usage"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // Translated payloads are prebuilt once, before the retry loop
     // (the antigravity envelope additionally needs a per-account project id).
     // The caller guarantees a DOM whenever a non-pass-through target is present;
@@ -461,7 +469,13 @@ async fn run_target(
                 // keep_specific, not a hard assignment: a busy round after a real
                 // 5xx used to erase the cause, and the client was told "your key is
                 // at its concurrency limit" for a provider that had just failed.
-                keep_specific(&mut last, TargetFailure::Capacity { attempts: made });
+                keep_specific(
+                    &mut last,
+                    TargetFailure::Capacity {
+                        attempts: made,
+                        retry_after: remaining,
+                    },
+                );
                 if remaining.is_zero() {
                     break;
                 }
@@ -726,7 +740,16 @@ async fn run_target(
             // at 5k rps that is 5k writes/s and the log becomes useless. The
             // dashboard's Requests tab is the per-request view instead.
             tracing::debug!(provider = %provider.name, key = %key.masked(), model, "ok");
-            return Ok(success_response(provider, model, body, is_stream, key, guard).await);
+            return Ok(success_response(
+                provider,
+                model,
+                body,
+                is_stream,
+                include_usage,
+                key,
+                guard,
+            )
+            .await);
         }
         drop(guard);
 
@@ -814,7 +837,10 @@ async fn run_target(
     // Report the real cause: a saturated gateway is a 429 with a Retry-After, a
     // provider that is down is a 503 carrying its wake time.
     Err(match last {
-        Some(TargetFailure::Capacity { .. }) => TargetFailure::Capacity { attempts: made },
+        Some(TargetFailure::Capacity { retry_after, .. }) => TargetFailure::Capacity {
+            attempts: made,
+            retry_after,
+        },
         Some(TargetFailure::BadBody { content_type, .. }) => TargetFailure::BadBody {
             attempts: made,
             content_type,
@@ -973,7 +999,11 @@ fn empty_pool_failure(
     made: usize,
 ) -> TargetFailure {
     if pool_busy(pool, max_concurrent) {
-        return TargetFailure::Capacity { attempts: made };
+        return TargetFailure::Capacity {
+            attempts: made,
+            // No slot at all and no budget left to wait for one.
+            retry_after: Duration::from_secs(1),
+        };
     }
     TargetFailure::Unavailable {
         attempts: made,
@@ -1039,7 +1069,10 @@ mod tests {
 
         assert_eq!(
             empty_pool_failure(&pool, "m", 1, 7),
-            TargetFailure::Capacity { attempts: 7 }
+            TargetFailure::Capacity {
+                attempts: 7,
+                retry_after: Duration::from_secs(1)
+            }
         );
 
         // Once the slot is free again it is no longer a capacity problem.
@@ -1220,6 +1253,7 @@ mod tests {
                 stream: body,
             },
             true,
+            false,
             key,
             guard,
         )
@@ -1276,7 +1310,13 @@ mod tests {
             "the budget must bound the wait ({waited:?})"
         );
 
-        let resp = failure_response("up", TargetFailure::Capacity { attempts: 0 });
+        let resp = failure_response(
+            "up",
+            TargetFailure::Capacity {
+                attempts: 0,
+                retry_after: Duration::from_secs(1),
+            },
+        );
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             resp.headers()
@@ -1394,7 +1434,10 @@ mod tests {
         );
         assert_eq!(
             empty_pool_failure(&provider.pool, "m", 1, 0),
-            TargetFailure::Capacity { attempts: 0 },
+            TargetFailure::Capacity {
+                attempts: 0,
+                retry_after: Duration::from_secs(1)
+            },
             "a busy pool is 429, never 503"
         );
         drop(resp);

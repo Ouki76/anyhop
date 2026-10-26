@@ -263,6 +263,8 @@ def gateway_parity(binary, port, workers):
 [server]
 listen = "127.0.0.1:{gw_port}"
 api_key = "parity-key"
+# /api/* accepts only admin_key (the gateway key is handed to every client).
+admin_key = "parity-key"
 state_file = ""
 max_retries = 1
 attempt_timeout_secs = 5

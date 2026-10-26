@@ -103,6 +103,43 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
+    // An unmetered key on a publicly bound listener is a real operational risk: one
+    // runaway client can saturate the upstream pool and the bill. The default is
+    // "unlimited" for backwards compatibility, so the risk is made *visible*
+    // instead of silently changed.
+    {
+        let listen = cfg.server.listen.as_str();
+        let public = !(listen.starts_with("127.")
+            || listen.starts_with("localhost")
+            || listen.starts_with("[::1]"));
+        // Resolve against the server default: a key with no per-key limits is NOT
+        // unmetered any more when `client_key_max_concurrent` is finite. Without
+        // this the warning would keep firing for keys that are actually capped,
+        // training operators to ignore it.
+        let server_cap = cfg.server.client_key_max_concurrent;
+        let unmetered = cfg
+            .client_keys
+            .iter()
+            .filter(|k| {
+                // Effective cap, honouring both the explicit per-key opt-out
+                // (`Some(0)`) and the inherit-the-server-default case (`None`).
+                let effective = match k.max_concurrent {
+                    Some(n) => n,
+                    None => server_cap,
+                };
+                k.rpm.unwrap_or(0) == 0 && effective == 0
+            })
+            .count();
+        if public && unmetered > 0 {
+            tracing::warn!(
+                "{} client key(s) have no rate limit and listen is '{listen}': \
+                 set [server] client_key_max_concurrent, or rpm/burst per key",
+                unmetered,
+                listen = cfg.server.listen
+            );
+        }
+    }
+
     let storage = if cfg.server.state_file.is_empty() {
         None
     } else {
@@ -167,7 +204,20 @@ async fn async_main() -> anyhow::Result<()> {
             "no api_key/admin_key configured: /v1/* and /api/* (raw config editor, provider keys, \
              OAuth) accept unauthenticated requests — set one unless this port is loopback-only"
         ),
-        _ => info!("gateway API key auth enabled for /v1/*"),
+        (Some(_), None) => {
+            info!("gateway API key auth enabled for /v1/*");
+            // `/api/*` is gated by `admin_key` only (see `require_admin_key`), so
+            // this is a real gap, not a note: name the routes that are open.
+            tracing::warn!(
+                "admin_key is not set: /api/* (raw config editor, provider keys, OAuth, client \
+                 keys) and /metrics accept unauthenticated requests. api_key deliberately does \
+                 not cover them — it is handed to every client. Set [server] admin_key."
+            );
+        }
+        (None, Some(_)) => info!("admin_key set: /api/* is protected, /v1/* is open"),
+        (Some(_), Some(_)) => {
+            info!("gateway API key auth enabled for /v1/*; admin auth for /api/*")
+        }
     }
 
     // Merge keys added at runtime via the dashboard.
@@ -208,11 +258,15 @@ async fn async_main() -> anyhow::Result<()> {
             providers,
             combos: cfg.combos.clone(),
         }),
-        cfg: std::sync::RwLock::new(proxy::RtConfig {
+        cfg: arc_swap::ArcSwap::from_pointee(proxy::RtConfig {
             max_retries: cfg.server.max_retries,
             attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),
             api_key: cfg.server.api_key.clone(),
-            admin_key: cfg.server.admin_key.clone().or(cfg.server.api_key.clone()),
+            // No fallback to `api_key`: the gateway key is pasted into every
+            // client, so letting it authenticate `/api/*` turned one leaked
+            // client credential into the whole control plane. See
+            // `middleware::require_admin_key`.
+            admin_key: cfg.server.admin_key.clone(),
             events_history: cfg.server.events_history,
             requests_history: cfg.server.requests_history,
             auth_fail_burst: cfg.server.auth_fail_burst,
@@ -232,6 +286,8 @@ async fn async_main() -> anyhow::Result<()> {
         auth_fails: std::sync::Mutex::new(crate::middleware::AuthFailures::default()),
         tls_enabled_flag: std::sync::atomic::AtomicBool::new(cfg.server.tls_cert.is_some()),
         catalog_epoch: std::sync::atomic::AtomicU64::new(1),
+        model_first_seen: std::sync::Mutex::new(std::collections::HashMap::new()),
+        inflight_bytes: proxy::InflightBytes::new(cfg.server.max_inflight_body_bytes),
         models_cache: std::sync::Mutex::new(None),
         request_log: std::sync::Mutex::new(std::collections::VecDeque::new()),
         client_keys: std::sync::RwLock::new(client_keys_map),
@@ -257,7 +313,7 @@ async fn async_main() -> anyhow::Result<()> {
     spawn_background_tasks(state.clone(), &cfg);
 
     let raw_listener = tokio::net::TcpListener::bind(&cfg.server.listen).await?;
-    let make = || app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let make = || app.into_make_service_with_connect_info::<tls::PeerAddr>();
     // Fires when the graceful shutdown starts, so the drain can be bounded.
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
@@ -273,11 +329,14 @@ async fn async_main() -> anyhow::Result<()> {
             let tls = tls::TlsConfig::from_pem_files(cert, key)
                 .map_err(|e| anyhow::anyhow!("cannot start TLS: {e}"))?;
             info!("anyhop listening on https://{} (TLS)", cfg.server.listen);
-            let listener = tls::TlsListener::new(raw_listener, tls).tap_io(|stream| {
-                if let Err(e) = stream.get_ref().0.set_nodelay(true) {
-                    tracing::debug!("cannot set TCP_NODELAY: {e}");
-                }
-            });
+            let listener = tls::HeaderDeadline::new(
+                tls::TlsListener::new(raw_listener, tls).tap_io(|stream| {
+                    if let Err(e) = stream.get_ref().0.set_nodelay(true) {
+                        tracing::debug!("cannot set TCP_NODELAY: {e}");
+                    }
+                }),
+                cfg.tuning.client_header_timeout(),
+            );
             let server =
                 axum::serve(listener, make()).with_graceful_shutdown(drain_signal(stop_rx.clone()));
             serve_until_stopped(
@@ -290,11 +349,17 @@ async fn async_main() -> anyhow::Result<()> {
         }
         _ => {
             info!("anyhop listening on http://{}", cfg.server.listen);
-            let listener = raw_listener.tap_io(|stream| {
-                if let Err(e) = stream.set_nodelay(true) {
-                    tracing::debug!("cannot set TCP_NODELAY: {e}");
-                }
-            });
+            // The header deadline wraps the tap so it covers the raw socket: a
+            // client that never sends its request line is dropped instead of
+            // holding a file descriptor (slowloris).
+            let listener = tls::HeaderDeadline::new(
+                raw_listener.tap_io(|stream| {
+                    if let Err(e) = stream.set_nodelay(true) {
+                        tracing::debug!("cannot set TCP_NODELAY: {e}");
+                    }
+                }),
+                cfg.tuning.client_header_timeout(),
+            );
             let server =
                 axum::serve(listener, make()).with_graceful_shutdown(drain_signal(stop_rx.clone()));
             serve_until_stopped(
@@ -490,11 +555,12 @@ fn install_config(state: &Arc<proxy::AppState>, prepared: PreparedConfig) -> usi
         cfg.server.tls_cert.is_some(),
         std::sync::atomic::Ordering::Relaxed,
     );
-    *state.cfg.write().unwrap_or_else(|e| e.into_inner()) = proxy::RtConfig {
+    state.cfg.store(std::sync::Arc::new(proxy::RtConfig {
         max_retries: cfg.server.max_retries,
         attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),
         api_key: cfg.server.api_key.clone(),
-        admin_key: cfg.server.admin_key.clone().or(cfg.server.api_key.clone()),
+        // Deliberately not `api_key` — see the same field in `build_state`.
+        admin_key: cfg.server.admin_key.clone(),
         events_history: cfg.server.events_history,
         requests_history: cfg.server.requests_history,
         auth_fail_burst: cfg.server.auth_fail_burst,
@@ -503,7 +569,7 @@ fn install_config(state: &Arc<proxy::AppState>, prepared: PreparedConfig) -> usi
         tls_enabled: cfg.server.tls_cert.is_some(),
         ratelimit: cfg.ratelimit.clone(),
         cors_origins: std::sync::Arc::new(cfg.server.cors_origins.clone()),
-    };
+    }));
     state.events.set_cap(cfg.server.events_history);
     if let Some(s) = &state.storage {
         s.set_response_max(cfg.tuning.response_store_max);
@@ -710,6 +776,12 @@ fn build_router(state: Arc<proxy::AppState>, cfg: &config::Config) -> axum::Rout
         .layer(axum::middleware::from_fn(middleware::json_errors))
         // A body that stops arriving must fail instead of holding the connection
         // (and its client-key concurrency slot) open forever.
+        // Before the deadline layer, so an over-budget request is refused without
+        // its body ever being read.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            inflight_budget,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             request_body_deadline,
@@ -833,6 +905,58 @@ fn body_with_idle_timeout(body: axum::body::Body, idle: Duration) -> axum::body:
     });
     axum::body::Body::from_stream(stream)
 }
+
+/// Admission control on total in-flight body bytes.
+///
+/// `DefaultBodyLimit` caps one request and `client_key_max_concurrent` caps the
+/// count; the *product* had no bound, so N concurrent 32 MiB requests each passed
+/// their own check and together exceeded the container's memory. This reserves
+/// from `Content-Length` **before** the body is read, so the decision is made
+/// before the memory is committed.
+///
+/// A request without `Content-Length` (chunked) reserves its best guess and
+/// settles up after the body has been read — see `InFlightBudget::settle`.
+async fn inflight_budget(
+    axum::extract::State(state): axum::extract::State<Arc<proxy::AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let want = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        // No declared length: reserve a modest placeholder so a chunked upload
+        // still pays its way, and settle to the real size afterwards.
+        .unwrap_or(CHUNKED_RESERVE_BYTES);
+    let Some(mut guard) = state.inflight_bytes.try_reserve(want) else {
+        // 503, not 429: the gateway is momentarily out of *its own* capacity, not
+        // rate-limiting the client. `Retry-After` keeps well-behaved clients from
+        // hammering.
+        return proxy::error_response(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "gateway is momentarily at its in-flight byte budget; retry shortly",
+            "server_overloaded",
+        );
+    };
+    // `DefaultBodyLimit` already bounds the *size* per request, so once the body
+    // has been read the real length is known: settle so a chunked upload that
+    // under-declared still counts.
+    let real = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if real.is_none() {
+        guard.settle(CHUNKED_RESERVE_BYTES);
+    }
+    let resp = next.run(req).await;
+    drop(guard); // released exactly once, on every path
+    resp
+}
+
+/// What a request with no `Content-Length` reserves up front.
+const CHUNKED_RESERVE_BYTES: u64 = 64 * 1024;
 
 /// Per-chunk read deadline for request bodies: `[tuning] client_body_timeout_secs`
 /// (default 30 s). Bounds slowloris — without it a client trickling 100 B/s holds
@@ -1001,7 +1125,7 @@ mod tests {
                 providers,
                 combos: Vec::new(),
             }),
-            cfg: std::sync::RwLock::new(proxy::RtConfig {
+            cfg: arc_swap::ArcSwap::from_pointee(proxy::RtConfig {
                 max_retries: cfg.server.max_retries,
                 attempt_timeout: Duration::from_secs(cfg.server.attempt_timeout_secs),
                 api_key: None,
@@ -1024,6 +1148,8 @@ mod tests {
             auth_start_lock: tokio::sync::Mutex::new(()),
             auth_fails: std::sync::Mutex::new(crate::middleware::AuthFailures::default()),
             catalog_epoch: std::sync::atomic::AtomicU64::new(1),
+            model_first_seen: std::sync::Mutex::new(std::collections::HashMap::new()),
+            inflight_bytes: crate::proxy::InflightBytes::new(0),
             tls_enabled_flag: AtomicBool::new(false),
             models_cache: std::sync::Mutex::new(None),
             request_log: std::sync::Mutex::new(std::collections::VecDeque::new()),

@@ -209,6 +209,25 @@ pub fn frame(v: &serde_json::Value) -> Bytes {
 
 pub const DONE_FRAME: &[u8] = b"data: [DONE]\n\n";
 
+/// Does this raw chunk already carry the `[DONE]` terminator?
+///
+/// Used by the pass-through relay, which must not append a second `[DONE]` to a
+/// well-formed upstream stream but *must* append one to a stream that ends
+/// without it. The check is on the raw bytes rather than parsed events because
+/// the relay never parses — it copies.
+///
+/// A chunk boundary can split the token, so a false negative here is possible in
+/// principle; the consequence is one extra `[DONE]`, which every client treats as
+/// an idempotent end-of-stream marker, and a false *positive* is what would be
+/// harmful. Requiring the full `data: [DONE]` sequence keeps that bias right.
+pub fn contains_done(chunk: &[u8]) -> bool {
+    // Accept either terminator spelling (LF and CRLF), since an upstream may use
+    // either and the relay passes both through.
+    const LF: &[u8] = b"data: [DONE]\n";
+    const CRLF: &[u8] = b"data: [DONE]\r\n";
+    chunk.windows(LF.len()).any(|w| w == LF) || chunk.windows(CRLF.len()).any(|w| w == CRLF)
+}
+
 /// Test plumbing that drives the real streaming translators.
 ///
 /// The translators take a `reqwest::Response` — the only way to exercise the

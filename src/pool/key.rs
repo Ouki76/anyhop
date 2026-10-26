@@ -167,6 +167,17 @@ impl KeyState {
         self.max_concurrent == 0 || self.in_flight.load(Ordering::Relaxed) < self.max_concurrent
     }
 
+    /// How many requests this key is serving right now.
+    ///
+    /// `least_used` used to rank on `requests`, which only increments *after* the
+    /// upstream round trip: a concurrent burst read the same counts, picked the
+    /// same key every time, and the strategy collapsed into `fill_first` exactly
+    /// when it was most needed. Live in-flight count is the load that matters at
+    /// pick time.
+    pub fn in_flight(&self) -> u32 {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
     pub fn try_acquire(self: &Arc<Self>) -> Option<KeyGuard> {
         let limit = self.max_concurrent;
         loop {

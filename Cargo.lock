@@ -24,6 +24,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "hyper",
+ "hyper-util",
  "memchr",
  "mimalloc",
  "mime_guess",

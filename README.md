@@ -77,12 +77,24 @@ Single binary (~6MB), minimal resource footprint.
   (`:batchEmbedContents`); OAuth kinds report a clear 400
 - **Per-key rate limiting** — `rpm`(+ optional `burst`) on any client key, token bucket,
   `429` with `Retry-After`, visible in `/metrics`
+- **Memory is bounded end to end**: `max_body_bytes` caps one request,
+  `max_inflight_body_bytes` caps the sum across all in-flight requests (the case
+  that used to reach the container limit while no single limit was exceeded),
+  and client keys are capped at 64 concurrent requests by default (set
+  `[server] client_key_max_concurrent = 0` for the old unlimited behaviour).
 - **Streaming** without buffering in all modes (SSE→SSE for gemini/antigravity with translation)
 - **Tool calls**: full cycle (tools, tool_choice, parallel calls, functionResponse),
   on `/v1/chat/completions` and on `/v1/responses` (`function_call` in and out, in
   streaming too)
-- **Thinking**: reasoning_effort → thinkingConfig, thoughts are returned as reasoning_content,
-  thoughtSignature is captured and replayed back (Gemini 3)
+- **Model objects** carry the full OpenAI shape (`id`, `object`, `created`, `owned_by`)
+  plus the limit spellings clients read; `created` is stamped when the process first
+  serves the model, so it does not churn between requests.
+- **Thinking**: thoughts always come back for models that have them (as
+  `reasoning_content`), with or without a `reasoning_effort` — `includeThoughts` is
+  what makes the provider emit them at all, and a gateway that swallowed them made
+  every reasoning panel look empty. An explicit `reasoning_effort` still wins:
+  `none` hides them, `high` also raises the budget. `thoughtSignature` is captured
+  and replayed back (Gemini 3)
 
 ## Quick start
 
@@ -539,9 +551,12 @@ burst = 20       # optional spike allowance (default: same as rpm)
 - The live bucket survives a config reload (`SIGHUP`) as long as the limits did not
   change, so editing one key does not hand every tenant a fresh quota.
 - Visible/edit in the dashboard (API Keys tab) and via `POST /api/client-keys/add|update`.
-- `[[client_keys]]` requires `[server] api_key` (or `admin_key`): client keys secure `/v1/*`,
-  and an admin credential is what keeps `/api/*` — the raw TOML editor, provider CRUD and the
-  OAuth endpoints — closed. `Config::validate` refuses the combination without one.
+- `[[client_keys]]` requires `[server] admin_key`. `api_key` and `admin_key` are
+  **different credentials with different powers**: `api_key` (or a client key) opens `/v1/*`,
+  while `/api/*` — the raw TOML editor, provider CRUD, client-key reveal and the OAuth
+  endpoints — accepts `admin_key` *only*. That split is deliberate: the gateway key is pasted
+  into every client, so equating the two meant one leaked client credential could read every
+  provider secret. `Config::validate` refuses a config with client keys and no `admin_key`.
 - The per-key concurrency cap (`max_concurrent`) counts a request until its **body** is done,
   so a long SSE stream holds its slot for as long as it is open.
 

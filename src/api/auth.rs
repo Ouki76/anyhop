@@ -233,10 +233,21 @@ pub async fn auth_start(
     let kind = body.kind.clone();
     // Headless: the provider redirects back to this gateway instead of a loopback
     // port, so a panel served from a domain (or opened elsewhere) can finish.
-    let public_url = crate::config::Config::load(&state.config_path)
-        .ok()
-        .and_then(|c| c.server.public_url)
-        .map(|u| u.trim_end_matches('/').to_string());
+    // A broken config must not silently fall back to "loopback only": the
+    // operator would then wait for a callback their browser cannot reach and get
+    // an authorization timeout minutes later, instead of the parse error that
+    // actually explains it.
+    let public_url = match crate::config::Config::load(&state.config_path) {
+        Ok(c) => c
+            .server
+            .public_url
+            .map(|u| u.trim_end_matches('/').to_string()),
+        Err(e) => {
+            return Err(super::ApiError::internal(format!(
+                "cannot read the config to choose the OAuth redirect target: {e}"
+            )));
+        }
+    };
     let redirect_uri = public_url
         .as_ref()
         .map(|base| format!("{base}/api/auth/callback"));

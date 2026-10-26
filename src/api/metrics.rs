@@ -238,6 +238,107 @@ mod tests {
         assert_eq!(esc("a\nb"), "a\\nb");
     }
 
+    /// The exposition body is what a Prometheus scraper parses, and a malformed
+    /// one is rejected wholesale — taking every series with it. `run_all.sh`
+    /// greps three of these lines; nothing asserted the document as a whole.
+    #[tokio::test]
+    async fn the_exposition_is_a_well_formed_prometheus_document() {
+        // The histogram registry is process-wide and other tests reset it, so the
+        // scrape must not interleave with them. A `std::sync` guard may not cross
+        // an `.await`, so the lock is held around a `block_on` of the handler
+        // rather than across the test's own await points.
+        let st = crate::api::server::test_support::state(&std::path::PathBuf::from(
+            "/tmp/anyhop-metrics-test-not-a-file.toml",
+        ));
+        let resp = {
+            let _registry = crate::api::histograms::test_guard();
+            futures::executor::block_on(metrics(State(st)))
+        };
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; version=0.0.4; charset=utf-8"),
+            "the Prometheus text format names its version in the content type"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8(body.to_vec()).expect("utf-8");
+
+        let mut type_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        let mut saw_help: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for line in body.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                let name = rest.split_whitespace().next().expect("HELP has a name");
+                assert!(saw_help.insert(name), "{name} has a duplicate # HELP line");
+            } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let mut it = rest.split_whitespace();
+                let name = it.next().expect("TYPE has a name");
+                let kind = it.next().expect("TYPE has a kind");
+                assert!(
+                    matches!(
+                        kind,
+                        "counter" | "gauge" | "histogram" | "summary" | "untyped"
+                    ),
+                    "{name}: unknown metric type {kind}"
+                );
+                assert!(
+                    type_of.insert(name, kind).is_none(),
+                    "{name} has a duplicate # TYPE line"
+                );
+            } else {
+                assert!(!line.starts_with('#'), "unexpected comment form: {line}");
+                let (sample, value) = line
+                    .rsplit_once(' ')
+                    .unwrap_or_else(|| panic!("sample line without a value: {line}"));
+                let name = sample.split('{').next().unwrap_or(sample);
+                // Every sample must belong to a declared family, and a `_total`
+                // counter must not claim to be a gauge (Prometheus rejects a
+                // counter/gauge name clash).
+                // A histogram's samples carry a required suffix that is not part
+                // of the family name (`_bucket`, `_sum`, `_count`), and a counter
+                // may be written as `_total`. Strip one and look again.
+                let family = ["_bucket", "_sum", "_count", "_total"]
+                    .iter()
+                    .find_map(|suffix| {
+                        name.strip_suffix(suffix)
+                            .filter(|base| type_of.contains_key(base))
+                    })
+                    .unwrap_or(name);
+                assert!(
+                    type_of.contains_key(family),
+                    "sample {name} has no # TYPE line (family {family})"
+                );
+                assert!(
+                    value.parse::<f64>().is_ok(),
+                    "sample {name} has a non-numeric value {value:?}"
+                );
+            }
+        }
+
+        // The handful of series the runbook relies on must actually be present.
+        for required in [
+            "anyhop_up 1",
+            "anyhop_providers ",
+            "anyhop_keys_available ",
+            "anyhop_process_resident_memory_bytes ",
+        ] {
+            assert!(
+                body.contains(required),
+                "the exposition is missing {required:?}:\n{body}"
+            );
+        }
+        assert!(
+            !body.contains("NaN") && !body.contains("inf"),
+            "a gauge must never render as NaN/inf: {body}"
+        );
+    }
+
     #[test]
     fn rss_lookup_does_not_panic() {
         // Either a plausible number or None — never a panic.

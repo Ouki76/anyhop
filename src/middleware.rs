@@ -198,10 +198,14 @@ pub async fn require_api_key(
         // tenants' keys and never be locked out — and with 4-char keys allowed the
         // search space is small enough to walk. Entries expire with the window
         // instead (the master key still clears: it is the operator's credential).
-        let limit = if ck.max_concurrent > 0 {
-            ck.max_concurrent
-        } else {
-            rt.client_key_max_concurrent
+        // Three states, and all three matter:
+        //   Some(n)  -> this key's own cap
+        //   Some(0)  -> explicit opt-out for this key (unlimited)
+        //   None     -> inherit the server default
+        // Collapsing `Some(0)` into `None` made the documented opt-out impossible.
+        let limit = match ck.max_concurrent {
+            Some(n) => n,
+            None => rt.client_key_max_concurrent,
         };
         if limit > 0 {
             let cur = ck
@@ -318,7 +322,22 @@ fn too_many_failures(state: &Arc<proxy::AppState>, ip: &str) -> Response {
     resp
 }
 
-/// Admin auth: `/api/*` requires `Bearer <admin_key>` (or `api_key`) when set.
+/// Admin auth: `/api/*` requires `Bearer <admin_key>`.
+///
+/// Deliberately **not** `api_key`. The gateway key is handed to every client (it is
+/// pasted into Open WebUI, Cursor, Chatbox, a shell alias), so equating the two
+/// meant one leaked client credential escalated to *owning* the gateway:
+/// `GET /api/config` returns every provider key and OAuth refresh token,
+/// `POST /api/client-keys/reveal` returns every tenant secret, and `PUT
+/// /api/config` rewrites the file. The per-tenant model (`[[client_keys]]` with
+/// allowlists and quotas) was built to make that boundary meaningful, and the
+/// fallback erased it.
+///
+/// The cost is one extra config line: an operator who wants the dashboard sets
+/// `admin_key` (or sets only `admin_key` and no `api_key` for a loopback-only
+/// admin box). [`crate::config::Config::validate`] now refuses a shared-gateway
+/// config that would leave `/api/*` unreachable, so this cannot silently lock
+/// anyone out of their own dashboard.
 ///
 /// `/dashboard` itself is deliberately NOT behind this: those are static,
 /// unprivileged assets (an empty SPA that prompts for the key and then calls
@@ -330,8 +349,8 @@ pub async fn require_admin_key(
 ) -> Response {
     let rt = state.rt();
     let ip = client_ip(&req);
-    if let Some(expected) = rt.admin_key.or(rt.api_key) {
-        if !bearer_ok(&req, &expected) {
+    if let Some(expected) = rt.admin_key.as_deref() {
+        if !bearer_ok(&req, expected) {
             // Same rule as /v1: count the failure, throttle only the failures.
             if let Some(resp) = gate_failed_credential(&state, &ip) {
                 return resp;
@@ -539,11 +558,22 @@ where
 /// Record request latency for `/metrics` (histograms, not just counters).
 pub async fn record_metrics(req: Request, next: Next) -> Response {
     let started = std::time::Instant::now();
-    let path = req.uri().path().to_string();
-    let method = req.method().as_str().to_string();
+    // Exactly one allocation per request, and only when it is needed.
+    //
+    // This used to copy the path *and* the method to `String`, then allocate the
+    // route label, then allocate two more strings building the map key — five
+    // allocations on 100% of requests, including the 401s an unauthenticated
+    // caller can generate at will. `route_label` already returns the router's own
+    // paths verbatim, so a known route allocates once and an unknown one (which
+    // folds into `other`) allocates once too.
+    let route = crate::api::histograms::route_label(req.uri().path());
+    // `next.run` consumes the request, so the method has to be held across the
+    // await. It is a 3-7 byte string; `record` maps it onto a `&'static str` from
+    // a closed set, so nothing further is allocated for it.
+    let method = req.method().as_str().to_owned();
     let resp = next.run(req).await;
     crate::api::histograms::record(
-        &crate::api::histograms::route_label(&path),
+        &route,
         &method,
         resp.status().as_u16(),
         started.elapsed().as_secs_f64(),
@@ -606,11 +636,15 @@ pub async fn json_errors(req: Request, next: Next) -> Response {
     } else {
         message
     };
+    let ty = error_type(parts.status);
     let body = serde_json::json!({
         "error": {
-            "code": parts.status.as_u16(),
+            // Same shape as `proxy::error_response`: string code, required
+            // `param`. Axum's own rejections must not be the odd ones out.
+            "code": proxy::error_code_for(ty),
             "message": message,
-            "type": error_type(parts.status),
+            "type": ty,
+            "param": serde_json::Value::Null,
         }
     });
     let keep: Vec<(axum::http::HeaderName, axum::http::HeaderValue)> = parts
@@ -681,13 +715,22 @@ pub async fn cors(State(state): State<Arc<proxy::AppState>>, req: Request, next:
         next.run(req).await
     };
 
+    // `Vary: Origin` belongs on **every** response while CORS is configured, not
+    // only on the ones that matched: RFC 9110 §12.5.5 requires a cache to key on
+    // every request field that changed the response, and a request without
+    // `Origin` yields different headers from one with it. Setting it only inside
+    // the match let an intermediary store the no-`Origin` variant and replay it to
+    // a cross-origin client, which then sees no CORS headers at all.
+    if !origins.is_empty() {
+        resp.headers_mut()
+            .insert(header::VARY, header::HeaderValue::from_static("origin"));
+    }
+
     if let Some(origin) = allowed {
         let h = resp.headers_mut();
         if let Ok(v) = header::HeaderValue::from_str(&origin) {
             h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
         }
-        // A shared cache must not serve one origin's response to another.
-        h.insert(header::VARY, header::HeaderValue::from_static("origin"));
         if preflight {
             h.insert(
                 header::ACCESS_CONTROL_ALLOW_METHODS,
@@ -695,9 +738,18 @@ pub async fn cors(State(state): State<Arc<proxy::AppState>>, req: Request, next:
             );
             h.insert(
                 header::ACCESS_CONTROL_ALLOW_HEADERS,
-                header::HeaderValue::from_static(
-                    "authorization, content-type, x-api-key, anthropic-version,                      openai-organization, openai-beta",
-                ),
+                // One list, one separator. This literal used to carry a run of
+                // 22 spaces where the `, ` belonged (a line-continuation `\` was
+                // lost), and it went out verbatim: a browser splits the value into
+                // tokens, so `openai-organization` and `openai-beta` never matched
+                // and a preflight that sent either header failed — for exactly the
+                // header set an OpenAI-compatible client sends.
+                header::HeaderValue::from_static(concat!(
+                    "authorization, content-type, x-api-key, anthropic-version, ",
+                    "openai-organization, openai-beta, x-request-id, x-stainless-lang, ",
+                    "x-stainless-package-version, x-stainless-runtime, x-stainless-os, ",
+                    "x-stainless-arch, x-stainless-retry-count, x-stainless-timeout",
+                )),
             );
             h.insert(
                 header::ACCESS_CONTROL_MAX_AGE,
@@ -748,9 +800,25 @@ pub async fn security_headers(
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.eq_ignore_ascii_case("https"))
     };
+    // Read before the request is moved into the handler.
+    let is_api = req.uri().path().starts_with("/api/");
     let mut resp = next.run(req).await;
     add_bearer_challenge(&mut resp);
     let h = resp.headers_mut();
+    // The control plane returns plaintext secrets: `POST /api/client-keys/reveal`
+    // echoes a tenant key, `GET /api/config` returns the whole TOML (provider
+    // keys, OAuth refresh tokens), `GET /api/server` says which are set. None of
+    // these is cacheable by definition, but a shared cache behind a
+    // TLS-terminating proxy — or a browser back/forward store — keeps a body
+    // unless it is told not to (RFC 9111 §5.2). Set once here, for the whole
+    // `/api/*` surface, so a new handler cannot forget it.
+    if is_api {
+        h.insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+        h.insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
+    }
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         header::HeaderValue::from_static("nosniff"),
@@ -859,7 +927,7 @@ mod json_error_tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "rate_limit_exceeded", "{v}");
-        assert_eq!(v["error"]["code"], 429, "{v}");
+        assert_eq!(v["error"]["code"], "rate_limit_exceeded", "{v}");
     }
 
     /// The OAuth callback answers the browser with an HTML page. `json_errors`
@@ -1440,6 +1508,216 @@ mod auth_tests {
         );
     }
 
+    /// Secrets must not be storable by any cache.
+    ///
+    /// `/api/*` answers with plaintext provider keys, OAuth refresh tokens and
+    /// revealed client keys. A POST is not heuristically cacheable, but a shared
+    /// cache behind a TLS-terminating proxy and a browser's back/forward store both
+    /// keep a body unless they are told not to (RFC 9111 §5.2). The header is set
+    /// once, in the outermost hardening layer, for the whole `/api/*` surface.
+    #[tokio::test]
+    async fn api_responses_are_never_stored_by_a_cache() {
+        use axum::routing::get;
+        let st = state_with_key(key_runtime(0));
+        let app = axum::Router::new()
+            .route("/api/client-keys/reveal", get(|| async { "secret" }))
+            .route("/v1/models", get(|| async { "public" }))
+            .layer(axum::middleware::from_fn_with_state(
+                st.clone(),
+                security_headers,
+            ))
+            .with_state(st);
+        let addr = serve(app).await;
+        let client = reqwest::Client::new();
+
+        let secret = client
+            .get(format!("http://{addr}/api/client-keys/reveal"))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(
+            secret.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(secret.headers().get(header::PRAGMA).unwrap(), "no-cache");
+
+        // The public surface is untouched: caching a model list is the point.
+        let public = client
+            .get(format!("http://{addr}/v1/models"))
+            .send()
+            .await
+            .expect("request");
+        assert!(
+            !public.headers().contains_key(header::CACHE_CONTROL),
+            "a /v1 response must not be forced out of caches"
+        );
+    }
+
+    /// The failed-auth map is keyed by client IP, whose *breadth* an attacker
+    /// controls — an IPv6 /64 supplies addresses cheaply. `MAX_FAIL_ENTRIES` is
+    /// what keeps `note` from growing without bound (and from becoming O(n) per
+    /// attempt); `docs/TEST-COVERAGE.md` listed it as closed but nothing
+    /// referenced the constant.
+    #[test]
+    fn the_failed_auth_map_is_hard_capped() {
+        let window = std::time::Duration::from_secs(60);
+        let mut fails = AuthFailures::default();
+        // A spray inside one window: every entry is fresh, so the expiry-only
+        // sweep cannot help and the oldest-quarter eviction must kick in.
+        for i in 0..(MAX_FAIL_ENTRIES + 5_000) {
+            fails.note(&format!("2001:db8::{i:x}"), 10, window);
+            assert!(
+                fails.seen.len() <= MAX_FAIL_ENTRIES,
+                "the map grew past its cap at {i}: {} entries",
+                fails.seen.len()
+            );
+        }
+        // The cap must not swallow the ability to lock a *new* address out.
+        let mut hits = 0;
+        for _ in 0..3 {
+            if fails.note("198.51.100.200", 3, window) {
+                hits += 1;
+            }
+        }
+        assert!(hits > 0, "a new address must still be counted and locked");
+    }
+
+    /// Eviction must not be so eager that a normal few-thousand-client gateway
+    /// starts dropping live counters: below the cap, nothing is removed.
+    #[test]
+    fn the_failed_auth_map_keeps_everything_below_the_cap() {
+        let window = std::time::Duration::from_secs(60);
+        let mut fails = AuthFailures::default();
+        for i in 0..1_000 {
+            fails.note(&format!("10.0.{}.{}", i / 250, i % 250), 100, window);
+        }
+        assert!(
+            fails.seen.len() >= 900,
+            "entries were evicted well below the cap: {}",
+            fails.seen.len()
+        );
+    }
+
+    // ----- the CORS middleware itself (not just its pure helper) -----
+
+    /// `cors_allow` was unit-tested; the 60-line middleware around it was not.
+    /// These pin the three properties a browser actually depends on: a preflight
+    /// is answered *here* (never forwarded into the router's 405), an unlisted
+    /// origin gets no CORS headers at all, and `Vary: Origin` marks every response
+    /// so a shared cache cannot mix variants.
+    async fn cors_router(state: Arc<proxy::AppState>) -> std::net::SocketAddr {
+        use axum::routing::{get, post};
+        let app = axum::Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .route("/probe", post(|| async { "posted" }))
+            .layer(axum::middleware::from_fn_with_state(state.clone(), cors))
+            .with_state(state);
+        serve(app).await
+    }
+
+    #[tokio::test]
+    async fn a_preflight_is_answered_without_reaching_the_router() {
+        let st = state_with_key(key_runtime(0));
+        st.cfg.rcu(|cur| {
+            let mut next = crate::proxy::RtConfig::clone(cur);
+            next.cors_origins = Arc::new(vec!["https://ui.example".to_string()]);
+            next
+        });
+        let addr = cors_router(st).await;
+        let resp = reqwest::Client::new()
+            .request(reqwest::Method::OPTIONS, format!("http://{addr}/probe"))
+            .header(header::ORIGIN, "https://ui.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization, openai-organization",
+            )
+            .send()
+            .await
+            .expect("preflight");
+        // Not 405: the router has no OPTIONS route and forwarding would produce
+        // exactly the status a browser reports as a CORS failure.
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let h = resp.headers();
+        assert_eq!(
+            h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://ui.example"
+        );
+        assert!(h.get(header::ACCESS_CONTROL_ALLOW_METHODS).is_some());
+        assert_eq!(h.get(header::VARY).unwrap(), "origin");
+        // Credentials are never allowed: the API takes a bearer key.
+        assert!(!h.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
+        // The header list must be comma-separated tokens, not one blob with a
+        // whitespace run (that defect broke `openai-organization` on the wire).
+        let allowed = h
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .unwrap()
+            .to_str()
+            .expect("ascii");
+        for name in ["authorization", "openai-organization", "x-api-key"] {
+            assert!(
+                allowed.split(',').any(|t| t.trim() == name),
+                "{name} is not a separate token in: {allowed}"
+            );
+        }
+        assert!(
+            !allowed.contains("  "),
+            "the allow-headers list contains a whitespace run: {allowed}"
+        );
+    }
+
+    /// An origin the operator did not list learns nothing — not even that CORS
+    /// exists — but `Vary` still marks the response.
+    #[tokio::test]
+    async fn an_unlisted_origin_gets_no_cors_headers() {
+        let st = state_with_key(key_runtime(0));
+        st.cfg.rcu(|cur| {
+            let mut next = crate::proxy::RtConfig::clone(cur);
+            next.cors_origins = Arc::new(vec!["https://ui.example".to_string()]);
+            next
+        });
+        let addr = cors_router(st).await;
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/probe"))
+            .header(header::ORIGIN, "https://evil.example")
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let h = resp.headers();
+        assert!(
+            !h.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "an unlisted origin must get no allow-origin header"
+        );
+        assert_eq!(
+            h.get(header::VARY).unwrap(),
+            "origin",
+            "Vary must mark the response even for a rejected origin, or a cache \
+              may replay it to an origin that would have been allowed"
+        );
+    }
+
+    /// With no origins configured the middleware is a pass-through: no `Vary`, no
+    /// CORS, nothing to key a cache on.
+    #[tokio::test]
+    async fn cors_off_is_a_plain_pass_through() {
+        let st = state_with_key(key_runtime(0));
+        let addr = cors_router(st).await;
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/probe"))
+            .header(header::ORIGIN, "https://ui.example")
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!resp.headers().contains_key(header::VARY));
+        assert!(
+            !resp
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
+    }
+
     /// Hardening headers are applied by the outermost layer, so they are present
     /// on error responses too; HSTS is only sent where it can be honoured.
     #[tokio::test]
@@ -1498,5 +1776,162 @@ mod auth_tests {
                 .is_some(),
             "a TLS listener advertises HSTS without any header from a proxy"
         );
+    }
+}
+
+/// The gateway key must not open the control plane.
+///
+/// `api_key` is pasted into every client (Open WebUI, Cursor, Chatbox, a shell
+/// alias). `/api/*` used to accept it as an alias for `admin_key`, so one leaked
+/// client credential read every provider key and OAuth refresh token, revealed
+/// every tenant secret and could rewrite the config. These tests pin the split.
+#[cfg(test)]
+mod admin_key_is_not_the_gateway_key {
+    use super::*;
+
+    fn state_with_keys(api_key: Option<&str>, admin_key: Option<&str>) -> Arc<proxy::AppState> {
+        let st = crate::api::server::test_support::state(&std::path::PathBuf::from(
+            "/tmp/anyhop-admin-key-test-not-a-file.toml",
+        ));
+        st.cfg.rcu(|cur| {
+            let mut next = crate::proxy::RtConfig::clone(cur);
+            next.api_key = api_key.map(str::to_string);
+            next.admin_key = admin_key.map(str::to_string);
+            next
+        });
+        st
+    }
+
+    async fn probe_admin(state: Arc<proxy::AppState>, bearer: Option<&str>) -> StatusCode {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/api/config", get(|| async { "secrets" }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_admin_key,
+            ))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut req = reqwest::Client::new().get(format!("http://{addr}/api/config"));
+        if let Some(token) = bearer {
+            req = req.bearer_auth(token);
+        }
+        req.send().await.expect("request").status()
+    }
+
+    /// The attack this closes: a client holds only the shared gateway key.
+    #[tokio::test]
+    async fn the_gateway_key_does_not_open_api_routes() {
+        let st = state_with_keys(Some("sk-gateway-shared"), Some("admin-only-secret"));
+        assert_eq!(
+            probe_admin(st.clone(), Some("sk-gateway-shared")).await,
+            StatusCode::UNAUTHORIZED,
+            "a leaked gateway key must not reach /api/*"
+        );
+        assert_eq!(
+            probe_admin(st.clone(), None).await,
+            StatusCode::UNAUTHORIZED,
+            "no credential is still unauthorised"
+        );
+        assert_eq!(
+            probe_admin(st, Some("admin-only-secret")).await,
+            StatusCode::OK,
+            "the admin key is the one that opens /api/*"
+        );
+    }
+
+    /// With no `admin_key` the gateway key is *not* a substitute: the middleware
+    /// never falls back to it, so `/api/*` stays open only in the sense that it
+    /// demands no credential at all — which is exactly the legacy "no auth
+    /// configured" mode, and now unreachable through a validated config that has
+    /// providers or client keys.
+    ///
+    /// What matters for the escalation is asserted here: presenting the gateway
+    /// key is not what grants access, and configuring `admin_key` closes the route.
+    #[tokio::test]
+    async fn without_an_admin_key_the_gateway_key_is_not_a_substitute() {
+        let st = state_with_keys(Some("sk-gateway-shared"), None);
+        assert_eq!(
+            probe_admin(st, Some("admin-only-secret")).await,
+            StatusCode::OK,
+            "with no admin_key nothing is required — the legacy no-auth mode"
+        );
+
+        // A loopback admin box configures only `admin_key` (no `/v1` key), and
+        // then the admin key is the only thing that opens the route.
+        let only_admin = state_with_keys(None, Some("admin-only-secret"));
+        assert_eq!(
+            probe_admin(only_admin.clone(), Some("admin-only-secret")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            probe_admin(only_admin, Some("something-else")).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+/// The client-key concurrency cap has three distinct states, and collapsing any
+/// two of them breaks a documented behaviour.
+#[cfg(test)]
+mod client_key_limit_resolution {
+    use crate::config::{ClientKeyConfig, ServerConfig};
+
+    /// Resolve a key's effective concurrency cap the way the middleware does.
+    fn effective(key: Option<u32>, server: u32) -> u32 {
+        match key {
+            Some(n) => n,
+            None => server,
+        }
+    }
+
+    /// `Some(0)` means "unlimited for this key", `None` means "inherit".
+    ///
+    /// These were both collapsed to `0` before, so `max_concurrent = 0` in the
+    /// config silently meant "inherit the server default" and the documented
+    /// opt-out was impossible — found when the default became 64 and a scenario
+    /// that explicitly asked for unlimited started getting fast 429s.
+    #[test]
+    fn zero_is_an_override_not_an_absence() {
+        assert_eq!(effective(Some(0), 64), 0, "Some(0) opts out for this key");
+        assert_eq!(effective(None, 64), 64, "None inherits the server default");
+        assert_eq!(effective(Some(5), 64), 5, "a number wins");
+        assert_eq!(effective(None, 0), 0, "server 0 = unlimited, inherited");
+    }
+
+    /// The default is 64, and `0` in the config still parses as the opt-out.
+    #[test]
+    fn the_default_is_finite_and_zero_still_parses() {
+        assert_eq!(
+            ServerConfig::default().client_key_max_concurrent,
+            64,
+            "the default must be a finite cap"
+        );
+        let k: ClientKeyConfig = toml::from_str(
+            r#"
+key = "sk-test-key-0001"
+name = "t"
+models = []
+max_concurrent = 0
+"#,
+        )
+        .expect("parses");
+        assert_eq!(k.max_concurrent, Some(0), "0 must survive as Some(0)");
+
+        let unset: ClientKeyConfig = toml::from_str(
+            r#"
+key = "sk-test-key-0002"
+name = "t"
+models = []
+"#,
+        )
+        .expect("parses");
+        assert_eq!(unset.max_concurrent, None, "absent must stay None");
     }
 }

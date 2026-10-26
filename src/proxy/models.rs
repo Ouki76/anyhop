@@ -57,7 +57,7 @@ pub async fn list_models(
                 continue;
             }
             let resolved = resolved_for(&limits, p.discovered_limits(m), &id);
-            data.push(model_json(resolved, &id, &p.name));
+            data.push(model_json(resolved, &id, &p.name, created_for(&state, &id)));
         }
     }
     for c in &router.combos {
@@ -72,7 +72,12 @@ pub async fn list_models(
             continue;
         }
         let resolved = resolved_for(&limits, None, &c.name);
-        data.push(model_json(resolved, &c.name, "combo"));
+        data.push(model_json(
+            resolved,
+            &c.name,
+            "combo",
+            created_for(&state, &c.name),
+        ));
     }
     let body = serde_json::json!({ "object": "list", "data": data }).to_string();
     if allowed.is_none() {
@@ -135,7 +140,8 @@ pub async fn get_model(
                     break;
                 }
                 let resolved = resolved_for(&limits, p.discovered_limits(model), &id);
-                return Json(model_json(resolved, &id, &p.name)).into_response();
+                return Json(model_json(resolved, &id, &p.name, created_for(&state, &id)))
+                    .into_response();
             }
         }
     }
@@ -148,7 +154,13 @@ pub async fn get_model(
                 break;
             }
             let resolved = resolved_for(&limits, None, &c.name);
-            return Json(model_json(resolved, &c.name, "combo")).into_response();
+            return Json(model_json(
+                resolved,
+                &c.name,
+                "combo",
+                created_for(&state, &c.name),
+            ))
+            .into_response();
         }
     }
     super::error_response(
@@ -165,10 +177,37 @@ pub async fn get_model(
 /// `context_length`, OpenAI's `max_completion_tokens`). They are only emitted when
 /// the operator set them — inventing a number for an unknown model would be worse
 /// than saying nothing.
-fn model_json(limits: crate::limits::Limits, id: &str, owner: &str) -> serde_json::Value {
+/// When this process first served `id`, for the `created` field.
+///
+/// Stamp-once-then-remember: the map is only touched on first sight of a model, so
+/// the steady state is one read lock and a hash lookup. A restart starts a new map,
+/// which is the honest answer for a catalogue this process discovers itself.
+fn created_for(state: &AppState, id: &str) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut seen = state
+        .model_first_seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *seen.entry(id.to_string()).or_insert(now)
+}
+
+fn model_json(
+    limits: crate::limits::Limits,
+    id: &str,
+    owner: &str,
+    created: u64,
+) -> serde_json::Value {
+    // `created` is required by the OpenAI `Model` schema and is the one field this
+    // object used to omit. It is a *stable* stamp (first time this process served
+    // the model), not `now()`: a value that moved on every request would make a
+    // client diffing catalogues see permanent churn.
     let mut v = serde_json::json!({
         "id": id,
         "object": "model",
+        "created": created,
         "owned_by": owner,
     });
     // One number, every spelling a client actually reads. Publishing only
@@ -233,6 +272,46 @@ mod tests {
     use super::*;
     use crate::api::server::test_support::{MINIMAL, state, temp_config};
     use crate::config::{ComboConfig, ProviderConfig};
+
+    /// A model object must carry `created`, and it must be *stable*.
+    ///
+    /// The OpenAI `Model` schema requires `id`, `object`, `created`, `owned_by`; the
+    /// gateway omitted `created` entirely. It also must not be `now()` per request,
+    /// or a client diffing the catalogue sees permanent churn.
+    #[tokio::test]
+    async fn a_model_object_carries_a_stable_created_stamp() {
+        let path = temp_config(MINIMAL);
+        let st = state(&path);
+
+        let created_once = created_for(&st, "mock/some-model");
+        assert!(created_once > 0, "created must be a real unix timestamp");
+        // Same id, later call: unchanged.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_eq!(
+            created_for(&st, "mock/some-model"),
+            created_once,
+            "created must not move on a later request"
+        );
+        // A different id gets its own (possibly equal) stamp — the invariant is
+        // per-id stability, not global distinctness.
+        let _other = created_for(&st, "mock/other-model");
+
+        // And it reaches the wire in the model object.
+        let obj = model_json(
+            crate::limits::Limits::default(),
+            "mock/some-model",
+            "mock",
+            created_once,
+        );
+        assert_eq!(obj["created"], created_once);
+        assert_eq!(obj["object"], "model");
+        assert_eq!(obj["id"], "mock/some-model");
+        assert_eq!(obj["owned_by"], "mock");
+
+        // The full listing keeps the invariant for every entry.
+        let _ = list_models(axum::extract::State(st.clone()), None).await;
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn state_with_catalogue() -> (Arc<AppState>, std::path::PathBuf) {
         let path = temp_config(MINIMAL);

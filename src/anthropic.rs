@@ -77,10 +77,7 @@ fn content_blocks(content: Option<&Value>) -> Result<Vec<Value>, String> {
                             .pointer("/image_url/url")
                             .and_then(|u| u.as_str())
                             .unwrap_or("");
-                        match url
-                            .strip_prefix("data:")
-                            .and_then(|d| d.split_once(";base64,"))
-                        {
+                        match split_data_url(url) {
                             Some((mime, b64)) => blocks.push(json!({
                                 "type": "image",
                                 "source": {"type": "base64", "media_type": mime, "data": b64},
@@ -113,6 +110,17 @@ fn content_blocks(content: Option<&Value>) -> Result<Vec<Value>, String> {
 /// OpenAI content may be a plain string or an array of text parts.
 /// (Same helper as gemini.rs — array-form system/assistant/tool messages used
 /// to be silently dropped or JSON-dumped into the text.)
+/// Split a `data:<mime>;base64,<payload>` URL into (mime, base64).
+///
+/// The one place a data URL becomes an Anthropic image source: message parts and
+/// tool-result parts both go through it, so the two cannot disagree about which
+/// forms are accepted.
+fn split_data_url(url: &str) -> Option<(&str, &str)> {
+    url.strip_prefix("data:")
+        .and_then(|d| d.split_once(";base64,"))
+        .filter(|(mime, data)| !mime.is_empty() && !data.is_empty())
+}
+
 fn content_text(content: Option<&Value>) -> Option<String> {
     match content {
         Some(Value::String(s)) => Some(s.clone()),
@@ -161,7 +169,7 @@ fn max_output_cap(model: &str) -> u64 {
 /// below the real context — clients sizing context windows and the pool's token
 /// counters both undercounted. The cached share is also surfaced the way OpenAI
 /// does (`prompt_tokens_details.cached_tokens`).
-fn prompt_usage(u: &Value) -> (u64, u64) {
+pub(crate) fn prompt_usage(u: &Value) -> (u64, u64) {
     let plain = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
     let cache_read = u
         .get("cache_read_input_tokens")
@@ -221,6 +229,16 @@ fn replay_thinking(msg: &Value, blocks: &mut Vec<Value>) {
 /// `p.clone(); p["model"] = …` for every retry, i.e. a full copy of a body that
 /// can be 32 MiB.
 pub fn translate_request(body: &Value, model: &str) -> Result<Value, String> {
+    // See the Gemini translator: one `choices[0]` is all that comes back, so a
+    // multi-choice request must be refused rather than silently truncated.
+    if body
+        .get("n")
+        .and_then(|n| n.as_i64())
+        .is_some_and(|n| n > 1)
+    {
+        return Err("'n' > 1 is not supported by this provider; ask for one completion".into());
+    }
+
     let messages = body
         .get("messages")
         .and_then(|m| m.as_array())
@@ -291,7 +309,53 @@ pub fn translate_request(body: &Value, model: &str) -> Result<Value, String> {
                 out_msgs.push(json!({"role": "assistant", "content": blocks}));
             }
             "tool" => {
-                let result = content_text(msg.get("content")).unwrap_or_default();
+                // `tool_result.content` accepts a string OR an array of content
+                // blocks, so a tool that returns an image (a screenshot/browser
+                // tool) can be handed to the model instead of being flattened to
+                // its text and silently losing the picture — the module's own rule
+                // is that an untranslatable part is an error, never a drop.
+                let result = match msg.get("content") {
+                    Some(Value::Array(parts)) => {
+                        let mut blocks: Vec<Value> = Vec::new();
+                        for p in parts {
+                            match p.get("type").and_then(|t| t.as_str()) {
+                                Some("text") => {
+                                    if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                                        blocks.push(json!({"type": "text", "text": t}));
+                                    }
+                                }
+                                Some("image_url") => {
+                                    let url = p
+                                        .pointer("/image_url/url")
+                                        .and_then(|u| u.as_str())
+                                        .unwrap_or("");
+                                    let Some((media, data)) = split_data_url(url) else {
+                                        return Err(
+                                            "only base64 data: URLs are supported for images"
+                                                .into(),
+                                        );
+                                    };
+                                    blocks.push(json!({"type": "image", "source": {
+                                        "type": "base64", "media_type": media, "data": data,
+                                    }}));
+                                }
+                                other => {
+                                    return Err(format!(
+                                        "unsupported tool-result part type '{}'",
+                                        other.unwrap_or("(missing type)")
+                                    ));
+                                }
+                            }
+                        }
+                        if blocks.is_empty() {
+                            json!("")
+                        } else {
+                            json!(blocks)
+                        }
+                    }
+                    Some(Value::String(t)) => json!(t),
+                    _ => json!(content_text(msg.get("content")).unwrap_or_default()),
+                };
                 out_msgs.push(json!({
                     "role": "user",
                     "content": [{
@@ -326,21 +390,63 @@ pub fn translate_request(body: &Value, model: &str) -> Result<Value, String> {
         }
         merged.push(m);
     }
+    // Anthropic rejects `messages: []` with an opaque 400. Say what is wrong
+    // here, in the same words the Gemini translator uses, so a client gets the
+    // same answer whichever provider the model happens to sit on.
+    if merged.is_empty() {
+        return Err("no user or assistant messages: the conversation must not be empty".into());
+    }
 
     let model_name = model;
+    // Anthropic requires max_tokens; the default must fit the model's output cap
+    // (32000 is rejected outright by claude-3.5/3.7/haiku-3). A zero or negative
+    // value is not a budget Anthropic accepts, and forwarding it produced an opaque
+    // upstream 400 instead of the gateway naming the field the client got wrong.
+    let max_tokens = match body
+        .get("max_completion_tokens")
+        .or_else(|| body.get("max_tokens"))
+    {
+        Some(mt) => {
+            let Some(n) = mt.as_i64() else {
+                return Err("'max_tokens' must be an integer".into());
+            };
+            if n < 1 {
+                return Err("'max_tokens' must be at least 1".into());
+            }
+            json!(n)
+        }
+        None => json!(default_max_tokens(model_name)),
+    };
     let mut req = json!({
         "model": model,
-        // Anthropic requires max_tokens; the default must fit the model's
-        // output cap (32000 is rejected outright by claude-3.5/3.7/haiku-3).
-        "max_tokens": body
-            .get("max_completion_tokens")
-            .or_else(|| body.get("max_tokens"))
-            .cloned()
-            .unwrap_or_else(|| json!(default_max_tokens(model_name))),
+        "max_tokens": max_tokens,
         "messages": merged,
     });
     if !system_texts.is_empty() {
         req["system"] = json!(system_texts.join("\n\n"));
+    }
+    // OpenAI's `user` is an end-user identifier for abuse/usage attribution;
+    // Anthropic's equivalent is `metadata.user_id`. Dropping it made the client's
+    // correlation with the provider-side log impossible — [Create a
+    // Message](https://docs.anthropic.com/docs/en/api/messages/create) documents
+    // the field, and every other OpenAI-compatible client already sends one.
+    if let Some(user) = body.get("user").and_then(|u| u.as_str())
+        && !user.trim().is_empty()
+    {
+        req["metadata"] = json!({"user_id": user});
+    }
+    // Anthropic has no seed, penalties or logprobs. Say so once at debug level
+    // rather than letting a client believe a determinism knob took effect.
+    for absent in [
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+        "logit_bias",
+        "logprobs",
+    ] {
+        if body.get(absent).is_some() {
+            tracing::debug!("anthropic: dropping '{absent}' — the Messages API has no equivalent");
+        }
     }
     // OpenAI allows temperature/top_p up to 2.0; Anthropic rejects anything above
     // 1.0 with a hard 400. A client that is perfectly valid against an OpenAI model
@@ -354,11 +460,20 @@ pub fn translate_request(body: &Value, model: &str) -> Result<Value, String> {
         req["top_p"] = json!(t.clamp(0.0, 1.0));
     }
     if let Some(stop) = body.get("stop") {
-        let seqs = match stop {
+        let mut seqs = match stop {
             Value::String(s) => vec![json!(s)],
             Value::Array(a) => a.clone(),
             _ => vec![],
         };
+        // Same rule as the Gemini translator: Anthropic's `stop_sequences` are
+        // plain strings and reject control characters, so a stop sequence this
+        // side cannot express is dropped instead of making the request a 400.
+        // A stop the gateway drops costs nothing — the answer still stops on the
+        // real terminator.
+        seqs.retain(|q| {
+            q.as_str()
+                .is_some_and(|t| !t.is_empty() && !t.chars().any(char::is_control))
+        });
         if !seqs.is_empty() {
             req["stop_sequences"] = json!(seqs);
         }
@@ -377,16 +492,35 @@ pub fn translate_request(body: &Value, model: &str) -> Result<Value, String> {
                 let new_max = b.saturating_add(1).min(cap as i64).max(1);
                 req["max_tokens"] = json!(new_max);
             }
-            // A budget at or above max_tokens is invalid: leave room for one token
-            // of output so the request stays legal after the clamp.
+            // Anthropic enforces TWO rules on `budget_tokens`: it must be
+            // **at least 1024**, and it must be **less than `max_tokens`**. A 400
+            // follows either way, and the old `.max(1)` clamp could produce 1..1023
+            // whenever the client's `max_tokens` was small (e.g. `max_tokens: 500`
+            // with `reasoning_effort: "low"` gave 499).
+            //
+            // When the ceiling cannot fit a legal budget, thinking is dropped
+            // rather than sent illegal: the answer is what the client actually
+            // asked for, and an unusable budget would fail the whole request.
+            const MIN_THINKING_BUDGET: i64 = 1024;
             let max_tokens = req["max_tokens"].as_i64().unwrap_or(cap as i64);
-            let b = b.min(max_tokens.saturating_sub(1)).max(1);
-            // ...and rejects temperature/top_p combined with thinking — drop them.
-            if let Some(o) = req.as_object_mut() {
-                o.remove("temperature");
-                o.remove("top_p");
+            let room = max_tokens.saturating_sub(1);
+            if room < MIN_THINKING_BUDGET {
+                tracing::debug!(
+                    max_tokens,
+                    "anthropic: dropping 'thinking' — no room for the 1024-token minimum budget"
+                );
+                if let Some(o) = req.as_object_mut() {
+                    o.remove("thinking");
+                }
+            } else {
+                let b = b.clamp(MIN_THINKING_BUDGET, room);
+                // ...and rejects temperature/top_p combined with thinking — drop them.
+                if let Some(o) = req.as_object_mut() {
+                    o.remove("temperature");
+                    o.remove("top_p");
+                }
+                req["thinking"] = json!({"type": "enabled", "budget_tokens": b});
             }
-            req["thinking"] = json!({"type": "enabled", "budget_tokens": b});
         }
         Some(_) => {
             req["thinking"] = json!({"type": "disabled"});
@@ -408,6 +542,10 @@ pub fn translate_request(body: &Value, model: &str) -> Result<Value, String> {
         }
     }
 
+    // Hosted tools cannot be run here; refuse them rather than dropping the entry
+    // and answering as if the tool had never been asked for (README documents a
+    // 400 for exactly this).
+    crate::proxy::ensure_no_hosted_tools(body)?;
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         let converted: Vec<Value> = tools
             .iter()
@@ -432,16 +570,54 @@ pub fn translate_request(body: &Value, model: &str) -> Result<Value, String> {
                 "auto" => Some(json!({"type": "auto"})),
                 _ => None,
             },
-            Value::Object(o) => o
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .map(|n| json!({"type": "tool", "name": n})),
+            // The object spelling has two shapes: `{"type":"required"}` (a mode)
+            // and `{"type":"function","function":{"name":…}}` (a specific tool).
+            // Only the second was handled, so `{"type":"required"}` — OpenAI's
+            // usual object form — fell through to `None`, the field was omitted,
+            // and Anthropic defaulted to `auto`: the client asked for mandatory
+            // tools and got optional ones.
+            Value::Object(o) => {
+                if let Some(name) = o
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                {
+                    Some(json!({"type": "tool", "name": name}))
+                } else {
+                    match o.get("type").and_then(|t| t.as_str()) {
+                        Some("none") => Some(json!({"type": "none"})),
+                        Some("required") | Some("any") => Some(json!({"type": "any"})),
+                        Some("auto") => Some(json!({"type": "auto"})),
+                        _ => None,
+                    }
+                }
+            }
             _ => None,
         };
         if let Some(c) = choice {
             req["tool_choice"] = c;
         }
+    }
+    // `parallel_tool_calls: false` is a real constraint the client asked for, and
+    // Anthropic has an exact equivalent. It used to be dropped, so a client that
+    // needed one tool call per turn could get several and lose track of them.
+    if body
+        .get("parallel_tool_calls")
+        .and_then(|v| v.as_bool())
+        .is_some_and(|allowed| !allowed)
+        && let Some(choice) = req.get_mut("tool_choice")
+        && choice.is_object()
+    {
+        choice["disable_parallel_tool_use"] = json!(true);
+    } else if body
+        .get("parallel_tool_calls")
+        .and_then(|v| v.as_bool())
+        .is_some_and(|allowed| !allowed)
+        && req.get("tools").is_some()
+    {
+        // No `tool_choice` was sent, so Anthropic defaults to `auto`; state the
+        // constraint on that default rather than silently ignoring it.
+        req["tool_choice"] = json!({"type": "auto", "disable_parallel_tool_use": true});
     }
 
     Ok(req)
@@ -449,12 +625,28 @@ pub fn translate_request(body: &Value, model: &str) -> Result<Value, String> {
 
 // ---------- response translation (Anthropic -> OpenAI) ----------
 
+/// The reasoning share of `completion_tokens`, as OpenAI names it.
+///
+/// Anthropic puts it at `usage.output_tokens_details.thinking_tokens`; older
+/// responses omit the block entirely, in which case 0 is the honest answer (the
+/// field is present so a client indexing it never sees `undefined`).
+fn reasoning_tokens_of(u: &Value) -> u64 {
+    u.pointer("/output_tokens_details/thinking_tokens")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0)
+}
+
 fn map_stop(r: Option<&str>) -> &'static str {
     match r {
         Some("max_tokens") => "length",
         Some("tool_use") => "tool_calls",
         // Safety refusal — let safety-aware clients distinguish it from a normal stop.
         Some("refusal") => "content_filter",
+        // A compacted turn was cut short to fit the context window: the answer is
+        // truncated, so reporting "stop" told the client it was complete. LiteLLM
+        // maps this the same way (`compaction -> length`). `end_turn`,
+        // `stop_sequence` and `pause_turn` all genuinely mean "stopped normally".
+        Some("compaction") => "length",
         _ => "stop",
     }
 }
@@ -568,6 +760,13 @@ pub fn translate_response(model: &str, v: &Value) -> Value {
             // shaping in `proxy::responses`.
             "total_tokens": prompt_tokens.saturating_add(completion_tokens),
             "prompt_tokens_details": {"cached_tokens": cached_tokens},
+            // Anthropic reports the thinking share as
+            // `usage.output_tokens_details.thinking_tokens`. Without it a client
+            // that prices reasoning separately saw the billed tokens but could not
+            // attribute them — LiteLLM had the same gap and fixed it the same way.
+            "completion_tokens_details": {
+                "reasoning_tokens": reasoning_tokens_of(&u),
+            },
         },
     })
 }
@@ -594,6 +793,16 @@ struct SseState {
     thinking: Option<ThinkingBuf>,
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// The thinking share of `completion_tokens`, from the stream's usage.
+    reasoning_tokens: u64,
+    /// A chunk carrying a non-null `finish_reason` has been emitted.
+    ///
+    /// OpenAI clients read the last non-null `finish_reason` as the reason the
+    /// answer stopped; a stream that ends without one is indistinguishable from a
+    /// truncated answer, which the module docs explicitly promise never to hand
+    /// over. Anthropic only guarantees `stop_reason` on `message_delta`, and a
+    /// stream can end (upstream reset, idle deadline) before that arrives.
+    finish_sent: bool,
 }
 
 impl SseState {
@@ -621,6 +830,10 @@ impl SseState {
                 // See `translate_response`: the counters come from the upstream
                 // stream, so the sum saturates instead of overflowing.
                 "total_tokens": self.prompt_tokens.saturating_add(self.completion_tokens),
+                // Same attribution as the non-streaming body.
+                "completion_tokens_details": {
+                    "reasoning_tokens": self.reasoning_tokens,
+                },
             },
         })
     }
@@ -796,11 +1009,26 @@ fn translate_event(v: &Value, st: &mut SseState) -> Result<Option<Value>, String
             if let Some(o) = v.pointer("/usage/output_tokens").and_then(|x| x.as_u64()) {
                 st.completion_tokens = o;
             }
+            if let Some(t) = v.pointer("/usage/output_tokens_details/thinking_tokens")
+                && let Some(n) = t.as_u64()
+            {
+                st.reasoning_tokens = n;
+            }
             let finish = v
                 .pointer("/delta/stop_reason")
                 .and_then(|r| r.as_str())
                 .map(|r| json!(map_stop(Some(r))));
-            Ok(finish.map(|f| st.chunk(json!({}), f)))
+            match finish {
+                Some(f) => {
+                    st.finish_sent = true;
+                    Ok(Some(st.chunk(json!({}), f)))
+                }
+                // A `message_delta` that carries only `usage` is legal and
+                // common. Emitting nothing is fine *here* — the stream may still
+                // deliver `message_stop` with the real reason — but see
+                // `finish_if_missing`, which runs when the stream ends.
+                None => Ok(None),
+            }
         }
         _ => Ok(None),
     }
@@ -824,6 +1052,8 @@ struct Upstream {
     /// No more frames will be produced (terminal frame already queued).
     ended: bool,
     usage_added: bool,
+    /// The client asked for a final usage chunk.
+    include_usage: bool,
     stats: Option<std::sync::Arc<crate::pool::KeyState>>,
     st: SseState,
 }
@@ -839,8 +1069,32 @@ impl Upstream {
         }
     }
 
+    /// Make sure the client is told *why* the answer stopped.
+    ///
+    /// `message_stop` normally follows a `message_delta` that already carried
+    /// `stop_reason`, so this is a no-op on a healthy stream. It matters on the
+    /// ones that are not: an upstream that resets, an idle deadline that fires, or
+    /// a provider that sends `message_delta` with usage only. Without it the client
+    /// sees text, then usage, then `[DONE]` and cannot tell a complete answer from
+    /// a cut one — "stop" is the honest default because nothing claimed otherwise.
+    fn finish_if_missing(&mut self) {
+        if self.st.finish_sent {
+            return;
+        }
+        self.st.finish_sent = true;
+        let chunk = self.st.chunk(json!({}), json!(map_stop(None)));
+        self.out.push_back(crate::sse::frame(&chunk));
+    }
+
     /// The usage chunk OpenAI clients expect at the end of a stream.
+    ///
+    /// Only when the client asked for it (`stream_options.include_usage`): OpenAI
+    /// sends no `usage` at all otherwise, and an unconditional extra chunk made
+    /// clients that sum per-chunk usage count it twice.
     fn push_usage(&mut self) {
+        if !self.include_usage {
+            return;
+        }
         let (p, c) = (self.st.prompt_tokens, self.st.completion_tokens);
         if p > 0 || c > 0 {
             let chunk = self.st.usage_chunk();
@@ -870,11 +1124,13 @@ pub fn translate_sse_stream(
     resp: reqwest::Response,
     model: &str,
     stats: Option<std::sync::Arc<crate::pool::KeyState>>,
+    include_usage: bool,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
     translate_sse_stream_from(
         resp.bytes_stream().map(|r| r.map_err(io::Error::other)),
         model,
         stats,
+        include_usage,
     )
 }
 
@@ -884,6 +1140,7 @@ pub fn translate_sse_stream_from<S>(
     inner: S,
     model: &str,
     stats: Option<std::sync::Arc<crate::pool::KeyState>>,
+    include_usage: bool,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
@@ -896,6 +1153,7 @@ where
         eof: false,
         ended: false,
         usage_added: false,
+        include_usage,
         stats,
         st: SseState {
             id: gen_id(),
@@ -906,6 +1164,8 @@ where
             thinking: None,
             prompt_tokens: 0,
             completion_tokens: 0,
+            reasoning_tokens: 0,
+            finish_sent: false,
         },
     };
 
@@ -937,6 +1197,7 @@ where
                     }
                 }
                 if is_stop {
+                    s.finish_if_missing();
                     s.add_usage_once();
                     s.push_usage();
                     s.push_done();
@@ -945,8 +1206,14 @@ where
             }
 
             if s.eof {
+                // A clean end of body with no `message_stop`: the provider
+                // finished the transfer without a terminal event. Give the client
+                // the `finish_reason` it would otherwise never receive, so a
+                // complete answer is not mistaken for a cut one.
+                s.finish_if_missing();
                 s.add_usage_once();
                 if !s.ended {
+                    s.push_usage();
                     s.push_done();
                 }
                 continue;
@@ -1106,7 +1373,7 @@ mod translate_tests {
             event(json!({"type": "message_stop"})),
         ];
         let resp = sse_response(body).await;
-        let out = frames(translate_sse_stream(resp, "claude-x", None)).await;
+        let out = frames(translate_sse_stream(resp, "claude-x", None, true)).await;
         let block = chunks(&out)
             .into_iter()
             .find_map(|v| v.pointer("/choices/0/delta/thinking_blocks").cloned())
@@ -1134,7 +1401,7 @@ mod translate_tests {
                     "content_block": {"type": "tool_use", "id": "t", "name": "f"}})),
             ];
             let resp = sse_response(body).await;
-            let out = frames(translate_sse_stream(resp, "claude-x", None)).await;
+            let out = frames(translate_sse_stream(resp, "claude-x", None, true)).await;
             let err = error_frame(&out)
                 .unwrap_or_else(|| panic!("no error frame for index {index}: {out:?}"));
             assert_eq!(err["error"]["type"], "upstream_error");
@@ -1150,6 +1417,593 @@ mod translate_tests {
                 "{err}"
             );
         }
+    }
+
+    /// An empty conversation is an upstream 400; the gateway names it instead.
+    ///
+    /// The Gemini translator already refused this; Anthropic sent `messages: []`
+    /// and let the provider answer with an opaque error, so the same client got
+    /// two different experiences depending on where the model lived.
+    #[test]
+    fn an_empty_conversation_is_refused_locally() {
+        let err = translate_request(&json!({"messages": []}), "claude-x")
+            .expect_err("an empty conversation must be refused");
+        assert!(err.contains("no user or assistant messages"), "{err}");
+
+        // A system-only history has the same shape after extraction.
+        let err = translate_request(
+            &json!({"messages": [{"role": "system", "content": "be nice"}]}),
+            "claude-x",
+        )
+        .expect_err("a system-only history must be refused");
+        assert!(err.contains("no user or assistant messages"), "{err}");
+    }
+
+    /// `tool_choice` in its object spelling must reach Anthropic.
+    ///
+    /// `{"type":"required"}` is OpenAI's usual object form. Only the
+    /// `{"type":"function",…}` shape was handled, so a mandatory-tools request
+    /// fell through, the field was omitted, and Anthropic defaulted to `auto` —
+    /// the client got optional tools after asking for required ones.
+    #[test]
+    fn object_tool_choice_modes_are_translated() {
+        let tools =
+            json!([{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]);
+        for (given, expect) in [
+            (json!({"type": "required"}), json!({"type": "any"})),
+            (json!({"type": "none"}), json!({"type": "none"})),
+            (json!({"type": "auto"}), json!({"type": "auto"})),
+            (
+                json!({"type": "function", "function": {"name": "f"}}),
+                json!({"type": "tool", "name": "f"}),
+            ),
+        ] {
+            let out = translate_request(
+                &json!({
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": tools,
+                    "tool_choice": given,
+                }),
+                "claude-x",
+            )
+            .expect("translates");
+            assert_eq!(out["tool_choice"], expect, "for {given}");
+        }
+
+        // The string spelling keeps working (it always did).
+        let out = translate_request(
+            &json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": tools,
+                "tool_choice": "required",
+            }),
+            "claude-x",
+        )
+        .expect("translates");
+        assert_eq!(out["tool_choice"], json!({"type": "any"}));
+    }
+
+    /// A hosted tool must be refused, not silently dropped from the tool set.
+    #[test]
+    fn a_hosted_tool_is_refused_not_dropped() {
+        let err = translate_request(
+            &json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "web_search"}],
+            }),
+            "claude-x",
+        )
+        .expect_err("a hosted tool must be refused");
+        assert!(err.contains("web_search"), "{err}");
+
+        // A function tool still translates.
+        let ok = translate_request(
+            &json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
+            }),
+            "claude-x",
+        )
+        .expect("a function tool translates");
+        assert_eq!(ok["tools"][0]["name"], "f");
+    }
+
+    /// Every documented `stop_reason` maps to the right OpenAI reason.
+    ///
+    /// `compaction` (a turn cut short to fit the context window) was falling
+    /// through to "stop", which told the client a truncated answer was complete.
+    /// LiteLLM maps it to "length" for the same reason.
+    #[test]
+    fn every_stop_reason_maps_to_an_openai_finish_reason() {
+        for (native, expected) in [
+            ("end_turn", "stop"),
+            ("stop_sequence", "stop"),
+            ("pause_turn", "stop"),
+            ("max_tokens", "length"),
+            ("compaction", "length"),
+            ("tool_use", "tool_calls"),
+            ("refusal", "content_filter"),
+        ] {
+            assert_eq!(
+                map_stop(Some(native)),
+                expected,
+                "Anthropic {native} must map to {expected}"
+            );
+        }
+        // An unknown reason is a normal stop, never a silent truncation claim.
+        assert_eq!(map_stop(Some("something_new")), "stop");
+        assert_eq!(map_stop(None), "stop");
+
+        // And the mapping is visible in the translated body.
+        let body = translate_response(
+            "claude-x",
+            &json!({
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "compaction",
+            }),
+        );
+        assert_eq!(body["choices"][0]["finish_reason"], "length", "{body}");
+    }
+
+    /// Anthropic requires `budget_tokens >= 1024` AND `< max_tokens`.
+    ///
+    /// The clamp used to be `.max(1)`, so a small `max_tokens` produced a budget
+    /// between 1 and 1023 — a guaranteed 400. When the ceiling cannot fit a legal
+    /// budget, thinking is dropped instead of sent illegal.
+    #[test]
+    fn the_thinking_budget_respects_anthropics_two_rules() {
+        for (max_tokens, effort) in [
+            (Some(500_i64), "low"),
+            (Some(1024), "low"),
+            (Some(2000), "low"),
+            (Some(8192), "high"),
+            (None, "high"),
+        ] {
+            let mut body = json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": effort,
+            });
+            if let Some(m) = max_tokens {
+                body["max_tokens"] = json!(m);
+            }
+            let out = translate_request(&body, "claude-sonnet-4").expect("translates");
+            let ceiling = out["max_tokens"].as_i64().expect("a ceiling");
+            match out.get("thinking") {
+                Some(t) if t["type"] == "enabled" => {
+                    let budget = t["budget_tokens"].as_i64().expect("a budget");
+                    assert!(
+                        budget >= 1024,
+                        "max_tokens={max_tokens:?}: budget {budget} is below the 1024 minimum"
+                    );
+                    assert!(
+                        budget < ceiling,
+                        "max_tokens={max_tokens:?}: budget {budget} must stay under {ceiling}"
+                    );
+                }
+                // Dropping thinking is the only legal answer when nothing fits.
+                _ => assert!(
+                    ceiling <= 1025,
+                    "max_tokens={max_tokens:?}: thinking was dropped with room to spare: {out}"
+                ),
+            }
+        }
+
+        // No effort means no thinking block at all.
+        let plain = translate_request(
+            &json!({"messages": [{"role": "user", "content": "hi"}]}),
+            "claude-x",
+        )
+        .expect("translates");
+        assert!(plain.get("thinking").is_none(), "{plain}");
+    }
+
+    /// An image returned by a tool must reach the model, not be flattened away.
+    ///
+    /// `tool_result.content` accepts a string *or* an array of content blocks, so a
+    /// screenshot tool's picture belongs in the array. It used to be reduced to its
+    /// text with no error — the opposite of this module's own rule.
+    #[test]
+    fn a_tool_result_keeps_its_image() {
+        let out = translate_request(
+            &json!({
+                "messages": [
+                    {"role": "user", "content": "look"},
+                    {"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "shot", "arguments": "{}"}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "c1", "content": [
+                        {"type": "text", "text": "taken"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                    ]},
+                ],
+            }),
+            "claude-x",
+        )
+        .expect("translates");
+        let blocks = out["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+            .find(|b| b["type"] == "tool_result")
+            .expect("a tool_result block");
+        let content = blocks["content"].as_array().expect("an array of blocks");
+        assert!(
+            content.iter().any(|b| b["type"] == "image"),
+            "the image was dropped: {content:?}"
+        );
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+
+        // A plain string result still works.
+        let plain = translate_request(
+            &json!({
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    {"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "c1", "content": "just text"},
+                ],
+            }),
+            "claude-x",
+        )
+        .expect("translates");
+        let tr = plain["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+            .find(|b| b["type"] == "tool_result")
+            .expect("a tool_result");
+        assert_eq!(tr["content"], "just text");
+    }
+
+    /// `parallel_tool_calls: false` must reach Anthropic, which has an exact knob.
+    #[test]
+    fn disabling_parallel_tool_calls_is_forwarded() {
+        let tools =
+            json!([{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]);
+
+        // With an explicit tool_choice: the flag rides on it.
+        let out = translate_request(
+            &json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": tools,
+                "tool_choice": "auto",
+                "parallel_tool_calls": false,
+            }),
+            "claude-x",
+        )
+        .expect("translates");
+        assert_eq!(out["tool_choice"]["type"], "auto");
+        assert_eq!(out["tool_choice"]["disable_parallel_tool_use"], true);
+
+        // Without one: the default `auto` carries it rather than being ignored.
+        let out = translate_request(
+            &json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": tools,
+                "parallel_tool_calls": false,
+            }),
+            "claude-x",
+        )
+        .expect("translates");
+        assert_eq!(out["tool_choice"]["type"], "auto");
+        assert_eq!(out["tool_choice"]["disable_parallel_tool_use"], true);
+
+        // `true` (the default) must not add anything.
+        let out = translate_request(
+            &json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": tools,
+                "parallel_tool_calls": true,
+            }),
+            "claude-x",
+        )
+        .expect("translates");
+        assert!(
+            out.get("tool_choice").is_none(),
+            "the default must not invent a tool_choice: {out}"
+        );
+    }
+
+    // ----- invalid client input is named, not forwarded -----
+
+    /// A zero/negative `max_tokens` reaches Anthropic as an opaque 400; the
+    /// gateway knows which field the client got wrong, so it says so.
+    #[test]
+    fn a_nonsensical_max_tokens_is_refused_locally() {
+        for bad in [0, -1, -999] {
+            let err = translate_request(
+                &json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": bad}),
+                "claude-x",
+            )
+            .expect_err("a non-positive budget must be refused");
+            assert!(err.contains("max_tokens"), "{err}");
+        }
+        let err = translate_request(
+            &json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": []}),
+            "claude-x",
+        )
+        .expect_err("a non-numeric budget must be refused");
+        assert!(err.contains("max_tokens"), "{err}");
+
+        let ok = translate_request(
+            &json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 64}),
+            "claude-x",
+        )
+        .expect("translates");
+        assert_eq!(ok["max_tokens"], 64);
+    }
+
+    /// `max_completion_tokens` is the newer spelling and takes precedence, with
+    /// the same validation.
+    #[test]
+    fn max_completion_tokens_is_validated_too() {
+        let err = translate_request(
+            &json!({"messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 0}),
+            "claude-x",
+        )
+        .expect_err("a zero budget must be refused");
+        assert!(err.contains("max_tokens"), "{err}");
+
+        let ok = translate_request(
+            &json!({"messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 512}),
+            "claude-x",
+        )
+        .expect("translates");
+        assert_eq!(ok["max_tokens"], 512);
+    }
+
+    /// One `choices[0]` comes back, so a multi-choice request must be refused.
+    #[test]
+    fn a_multi_choice_request_is_refused_rather_than_truncated() {
+        let err = translate_request(
+            &json!({"messages": [{"role": "user", "content": "hi"}], "n": 2}),
+            "claude-x",
+        )
+        .expect_err("n > 1 must be refused");
+        assert!(err.contains("one completion"), "{err}");
+        translate_request(
+            &json!({"messages": [{"role": "user", "content": "hi"}], "n": 1}),
+            "claude-x",
+        )
+        .expect("a single choice is fine");
+    }
+
+    // ----- prompt-cache accounting agrees across paths -----
+
+    /// The streaming path, the translated body and the pool counters must all
+    /// report the same `prompt_tokens` for the same upstream usage. The non-stream
+    /// call site read `input_tokens` raw, so a cached conversation counted 12
+    /// tokens there and 30 012 everywhere else.
+    #[test]
+    fn cached_prompt_tokens_are_counted_the_same_on_every_path() {
+        let usage = json!({
+            "input_tokens": 12,
+            "cache_read_input_tokens": 30_000,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 40,
+        });
+
+        // The helper both call sites now go through.
+        let (prompt, cached) = prompt_usage(&usage);
+        assert_eq!(prompt, 30_012, "the cached share belongs in prompt_tokens");
+        assert_eq!(cached, 30_000, "and is reported separately, like OpenAI");
+
+        // The translated (non-streaming) body agrees.
+        let body = translate_response(
+            "claude-x",
+            &json!({"content": [{"type": "text", "text": "hi"}], "usage": usage}),
+        );
+        assert_eq!(body["usage"]["prompt_tokens"], 30_012, "{body}");
+        assert_eq!(
+            body["usage"]["prompt_tokens_details"]["cached_tokens"], 30_000,
+            "{body}"
+        );
+
+        // Cache *writes* count too (a cold prefix is billed as input).
+        let writing = json!({
+            "input_tokens": 5,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 900,
+        });
+        assert_eq!(prompt_usage(&writing).0, 905);
+    }
+
+    /// The usage chunk is sent only when the client asked for it.
+    ///
+    /// OpenAI sends no `usage` in a stream unless `stream_options.include_usage`
+    /// is set. This chunk used to be unconditional, so a client that summed
+    /// per-chunk usage counted it twice and one that expected no usage chunk saw an
+    /// unexpected event.
+    #[tokio::test]
+    async fn the_usage_chunk_is_sent_only_when_requested() {
+        let body = || {
+            vec![
+                event(json!({"type": "message_start", "message": {"usage": {"input_tokens": 7}}})),
+                event(json!({"type": "content_block_delta", "index": 0,
+                             "delta": {"type": "text_delta", "text": "hi"}})),
+                event(
+                    json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                             "usage": {"output_tokens": 3}}),
+                ),
+                event(json!({"type": "message_stop"})),
+            ]
+        };
+
+        let asked = frames(translate_sse_stream(
+            sse_response(body()).await,
+            "c",
+            None,
+            true,
+        ))
+        .await;
+        let usage_chunks: Vec<Value> = chunks(&asked)
+            .into_iter()
+            .filter(|v| v.get("usage").is_some())
+            .collect();
+        assert_eq!(usage_chunks.len(), 1, "exactly one usage chunk: {asked:?}");
+        assert_eq!(
+            usage_chunks[0]["choices"],
+            json!([]),
+            "choices must be empty"
+        );
+        assert_eq!(usage_chunks[0]["usage"]["prompt_tokens"], 7);
+        assert_eq!(usage_chunks[0]["usage"]["completion_tokens"], 3);
+        // …and it comes before [DONE].
+        let last_data = asked
+            .iter()
+            .rev()
+            .find_map(|f| f.lines().find(|l| l.starts_with("data: ")));
+        assert_eq!(last_data, Some("data: [DONE]"));
+
+        let unasked = frames(translate_sse_stream(
+            sse_response(body()).await,
+            "c",
+            None,
+            false,
+        ))
+        .await;
+        assert!(
+            chunks(&unasked).iter().all(|v| v.get("usage").is_none()),
+            "no usage was requested, so none may be sent: {unasked:?}"
+        );
+    }
+
+    /// Reasoning tokens are attributed, not just billed.
+    ///
+    /// Anthropic reports the thinking share as
+    /// `usage.output_tokens_details.thinking_tokens`; the gateway read neither the
+    /// non-streaming nor the streaming field, so a client pricing reasoning
+    /// separately saw the tokens in `completion_tokens` but could not attribute
+    /// them.
+    #[tokio::test]
+    async fn reasoning_tokens_are_reported_from_the_thinking_bucket() {
+        // Non-streaming body.
+        let body = translate_response(
+            "claude-x",
+            &json!({
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {
+                    "input_tokens": 5,
+                    "output_tokens": 40,
+                    "output_tokens_details": {"thinking_tokens": 30},
+                },
+            }),
+        );
+        assert_eq!(
+            body["usage"]["completion_tokens_details"]["reasoning_tokens"], 30,
+            "{body}"
+        );
+        assert_eq!(body["usage"]["completion_tokens"], 40, "{body}");
+
+        // …and it is always present, so a client indexing it never gets undefined.
+        let plain = translate_response(
+            "claude-x",
+            &json!({"content": [{"type": "text", "text": "hi"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 2}}),
+        );
+        assert_eq!(
+            plain["usage"]["completion_tokens_details"]["reasoning_tokens"], 0,
+            "{plain}"
+        );
+
+        // The streaming usage chunk carries the same number.
+        let stream_body = vec![
+            event(json!({"type": "message_start", "message": {"usage": {"input_tokens": 5}}})),
+            event(json!({"type": "content_block_delta", "index": 0,
+                         "delta": {"type": "text_delta", "text": "hi"}})),
+            event(
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                         "usage": {"output_tokens": 40,
+                                   "output_details": {"thinking_tokens": 30},
+                                   "output_tokens_details": {"thinking_tokens": 30}}}),
+            ),
+            event(json!({"type": "message_stop"})),
+        ];
+        let out = frames(translate_sse_stream(
+            sse_response(stream_body).await,
+            "claude-x",
+            None,
+            true,
+        ))
+        .await;
+        let usage = chunks(&out)
+            .into_iter()
+            .find(|v| v.get("usage").is_some())
+            .expect("a usage chunk");
+        assert_eq!(
+            usage["usage"]["completion_tokens_details"]["reasoning_tokens"], 30,
+            "{usage}"
+        );
+    }
+
+    // ----- a stream that ends without a finish_reason -----
+
+    /// A `message_delta` carrying only `usage` is legal, and an upstream can then
+    /// close before `message_stop`. Both used to leave the client with text, a
+    /// usage chunk and `[DONE]` but **no** `finish_reason` — a truncated answer
+    /// indistinguishable from a complete one, which this module promises never to
+    /// do. The fix synthesises one at the end of the stream.
+    #[tokio::test]
+    async fn a_stream_without_a_stop_reason_still_reports_a_finish_reason() {
+        // (a) No `message_stop` at all: the body just ends.
+        let body = vec![
+            event(json!({"type": "message_start", "message": {"usage": {"input_tokens": 3}}})),
+            event(json!({"type": "content_block_start", "index": 0,
+                         "content_block": {"type": "text", "text": ""}})),
+            event(json!({"type": "content_block_delta", "index": 0,
+                         "delta": {"type": "text_delta", "text": "hel"}})),
+            // Usage only, no `stop_reason` — the gap this test exists for.
+            event(json!({"type": "message_delta", "usage": {"output_tokens": 2}})),
+        ];
+        let out = frames(translate_sse_stream(
+            sse_response(body).await,
+            "claude-x",
+            None,
+            true,
+        ))
+        .await;
+        let finishes: Vec<Value> = chunks(&out)
+            .into_iter()
+            .filter_map(|v| v.pointer("/choices/0/finish_reason").cloned())
+            .filter(|f| !f.is_null())
+            .collect();
+        assert_eq!(
+            finishes.len(),
+            1,
+            "exactly one non-null finish_reason is required: {out:?}"
+        );
+        assert_eq!(finishes[0], "stop");
+
+        // (b) `message_delta` with a real stop reason must not be duplicated.
+        let body = vec![
+            event(json!({"type": "message_start", "message": {"usage": {"input_tokens": 3}}})),
+            event(
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                         "usage": {"output_tokens": 1}}),
+            ),
+            event(json!({"type": "message_stop"})),
+        ];
+        let out = frames(translate_sse_stream(
+            sse_response(body).await,
+            "claude-x",
+            None,
+            true,
+        ))
+        .await;
+        let finishes: Vec<Value> = chunks(&out)
+            .into_iter()
+            .filter_map(|v| v.pointer("/choices/0/finish_reason").cloned())
+            .filter(|f| !f.is_null())
+            .collect();
+        assert_eq!(
+            finishes,
+            vec![json!("stop")],
+            "a healthy stream must report its reason exactly once: {out:?}"
+        );
     }
 
     // ----- mid-stream errors -----
@@ -1177,6 +2031,7 @@ mod translate_tests {
             sse_response(body).await,
             "claude-x",
             None,
+            true,
         ))
         .await;
         let usage = chunks(&out)
@@ -1204,7 +2059,7 @@ mod translate_tests {
             event(json!({"type": "message_stop"})),
         ];
         let resp = sse_response(body).await;
-        let out = frames(translate_sse_stream(resp, "claude-x", None)).await;
+        let out = frames(translate_sse_stream(resp, "claude-x", None, true)).await;
         let err = error_frame(&out).unwrap_or_else(|| panic!("no error frame: {out:?}"));
         assert_eq!(err["error"]["message"], "Overloaded");
         assert_eq!(err["error"]["type"], "upstream_error");
@@ -1222,7 +2077,7 @@ mod translate_tests {
     #[tokio::test]
     async fn an_endless_event_fails_loudly_instead_of_truncating() {
         let resp = sse_response(vec![vec![b'x'; 2 * 1024 * 1024]]).await;
-        let out = frames(translate_sse_stream(resp, "claude-x", None)).await;
+        let out = frames(translate_sse_stream(resp, "claude-x", None, true)).await;
         let err = error_frame(&out).unwrap_or_else(|| panic!("no error frame: {out:?}"));
         assert!(
             err["error"]["message"]

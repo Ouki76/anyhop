@@ -77,10 +77,40 @@ pub async fn fim_completions(
         }
     }
 
-    let max_tokens = req
-        .get("max_tokens")
-        .and_then(|t| t.as_u64())
-        .unwrap_or(256);
+    // DeepSeek documents a 4K ceiling for FIM; a larger value is a guaranteed
+    // upstream 400, and a zero one is meaningless. Refuse the ceiling out loud and
+    // clamp the impossible-to-honour case.
+    let max_tokens = match req.get("max_tokens").and_then(|t| t.as_i64()) {
+        None => 256,
+        Some(n) if n < 1 => {
+            return crate::proxy::error_response(
+                StatusCode::BAD_REQUEST,
+                "'max_tokens' must be at least 1",
+                "invalid_request_error",
+            );
+        }
+        Some(n) if n > 4096 => {
+            return crate::proxy::error_response(
+                StatusCode::BAD_REQUEST,
+                "'max_tokens' exceeds the 4096-token limit of fill-in-the-middle completions",
+                "invalid_request_error",
+            );
+        }
+        Some(n) => n as u64,
+    };
+    // One choice is all this endpoint returns, so `n > 1` must be refused rather
+    // than silently collapsed to one.
+    if req.get("n").and_then(|n| n.as_i64()).is_some_and(|n| n > 1) {
+        return crate::proxy::error_response(
+            StatusCode::BAD_REQUEST,
+            "'n' > 1 is not supported on completions; ask for one completion",
+            "invalid_request_error",
+        );
+    }
+    // DeepSeek, Mistral and OpenAI `/completions` all document SSE for this
+    // endpoint. The gateway used to ignore the flag entirely and answer a single
+    // JSON object, which is a silent behavioural divergence rather than a refusal.
+    let wants_stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let synthetic = json!({
         "model": model,
@@ -205,6 +235,33 @@ pub async fn fim_completions(
         }
     }
 
+    // A streaming request gets a stream. The wrapped path asks the provider for a
+    // chat *stream* and translates each delta into a `text_completion` chunk, which
+    // is the shape DeepSeek/OpenAI use for `/completions`. Answering a single JSON
+    // object to a client that asked for SSE is a silent divergence, not a refusal.
+    if wants_stream {
+        let stream_req = {
+            let mut b = synthetic.clone();
+            b["stream"] = json!(true);
+            b
+        };
+        let resp =
+            crate::proxy::run_target_pub(&state, provider, &upstream_model, &stream_req, true)
+                .await;
+        let Some(resp) = resp else {
+            return crate::proxy::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("provider '{}' unavailable", provider.name),
+                "provider_unavailable",
+            );
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            return resp;
+        }
+        return stream_wrapped_completion(resp, model);
+    }
+
     let resp =
         crate::proxy::run_target_pub(&state, provider, &upstream_model, &synthetic, false).await;
     let Some(resp) = resp else {
@@ -250,6 +307,133 @@ pub async fn fim_completions(
         "usage": chat.get("usage").cloned().unwrap_or(json!({})),
     }))
     .into_response()
+}
+
+/// Translate a chat SSE stream into a legacy-completions one.
+///
+/// OpenAI/DeepSeek `/completions` streams carry `choices[0].text` deltas; the
+/// wrapped provider speaks chat chunks with `choices[0].delta.content`. The
+/// conversion is per-delta, so the client sees text as it is produced instead of
+/// waiting for the whole completion.
+///
+/// The prefix/suffix trimming the non-streaming path applies cannot run
+/// incrementally (the model may echo the prefix across several deltas), so the
+/// stream relays text verbatim and the client keeps what it asked for. That is the
+/// same trade the native path makes: a stream is a stream.
+fn stream_wrapped_completion(resp: Response, model: &str) -> Response {
+    use futures::StreamExt as _;
+
+    // Unique per request: a constant id broke dedupe and log correlation.
+    let id = {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("fcmpl-{nanos:x}{n:x}")
+    };
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let model = model.to_string();
+
+    let body = resp.into_body().into_data_stream();
+    let parser = crate::sse::SseParser::new();
+    let stream = futures::stream::unfold(
+        (body, parser, false),
+        move |(mut body, mut parser, done)| {
+            let id = id.clone();
+            let model = model.clone();
+            async move {
+                if done {
+                    return None;
+                }
+                loop {
+                    match body.next().await {
+                        Some(Ok(chunk)) => {
+                            let events = parser.feed(&chunk);
+                            let mut out = String::new();
+                            for ev in &events {
+                                let Ok(v) = serde_json::from_slice::<serde_json::Value>(ev) else {
+                                    continue;
+                                };
+                                if let Some(text) = v
+                                    .pointer("/choices/0/delta/content")
+                                    .and_then(|c| c.as_str())
+                                {
+                                    let frame = serde_json::json!({
+                                        "id": id,
+                                        "object": "text_completion",
+                                        "created": created,
+                                        "model": model,
+                                        "choices": [{"index": 0, "text": text, "finish_reason": null}],
+                                    });
+                                    out.push_str(&String::from_utf8_lossy(&crate::sse::frame(
+                                        &frame,
+                                    )));
+                                }
+                                if let Some(finish) = v
+                                    .pointer("/choices/0/finish_reason")
+                                    .and_then(|f| f.as_str())
+                                {
+                                    let frame = serde_json::json!({
+                                        "id": id,
+                                        "object": "text_completion",
+                                        "created": created,
+                                        "model": model,
+                                        "choices": [{"index": 0, "text": "", "finish_reason": finish}],
+                                    });
+                                    out.push_str(&String::from_utf8_lossy(&crate::sse::frame(
+                                        &frame,
+                                    )));
+                                }
+                            }
+                            if !out.is_empty() {
+                                return Some((
+                                    Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(out)),
+                                    (body, parser, false),
+                                ));
+                            }
+                            // Nothing in this chunk: keep reading rather than
+                            // emitting an empty frame.
+                        }
+                        Some(Err(e)) => {
+                            let frame = serde_json::json!({
+                                "error": {
+                                    "message": format!("upstream stream error: {e}"),
+                                    "type": "upstream_error",
+                                }
+                            });
+                            let mut out =
+                                String::from_utf8_lossy(&crate::sse::frame(&frame)).into_owned();
+                            out.push_str(&String::from_utf8_lossy(crate::sse::DONE_FRAME));
+                            return Some((
+                                Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(out)),
+                                (body, parser, true),
+                            ));
+                        }
+                        None => {
+                            return Some((
+                                Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from_static(
+                                    crate::sse::DONE_FRAME,
+                                )),
+                                (body, parser, true),
+                            ));
+                        }
+                    }
+                }
+            }
+        },
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
 /// Outcome of the native attempt.
@@ -298,7 +482,9 @@ async fn native_completions(provider: &Provider, model: &str, req: &Value) -> Na
             body.insert(key.into(), v.clone());
         }
     }
-    body.insert("stream".into(), json!(false));
+    // Honour the client's flag: all three documented FIM/completions APIs stream.
+    let wants_stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    body.insert("stream".into(), json!(wants_stream));
 
     let url = format!("{}/completions", provider.base_url.trim_end_matches('/'));
     let attempts = provider.max_retries.clamp(1, 4);
@@ -322,6 +508,24 @@ async fn native_completions(provider: &Provider, model: &str, req: &Value) -> Na
                 // Pass the upstream body through untouched: whatever the model
                 // wrote IS the completion in this mode.
                 let status = resp.status();
+                let is_sse = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.starts_with("text/event-stream"));
+                if is_sse {
+                    // Relay the provider's own SSE frames: in native mode the
+                    // completion is whatever the model wrote, so re-encoding it
+                    // would only add a way to change it.
+                    return Native::Answer(
+                        Response::builder()
+                            .status(status)
+                            .header("content-type", "text/event-stream")
+                            .header("cache-control", "no-cache")
+                            .body(axum::body::Body::from_stream(resp.bytes_stream()))
+                            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()),
+                    );
+                }
                 let bytes = resp.bytes().await.unwrap_or_default();
                 return Native::Answer(
                     Response::builder()
@@ -512,6 +716,38 @@ mod tests {
     /// Native FIM: an OpenAI-compatible provider gets the client's prompt (with
     /// whatever FIM tokens it carries), the suffix and the caps verbatim — the
     /// model keeps its native request shape instead of being wrapped into a chat.
+    /// Every documented FIM/completions API streams; the gateway must not answer a
+    /// single JSON object to a client that asked for SSE.
+    #[tokio::test]
+    async fn a_streaming_fim_request_gets_server_sent_events() {
+        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ab\"},\"finish_reason\":null}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(axum::body::Body::from_stream(futures::stream::iter(vec![
+                Ok::<_, std::io::Error>(bytes::Bytes::from(sse.to_string())),
+            ])))
+            .expect("response");
+
+        let out = stream_wrapped_completion(resp, "gemini/test");
+        assert_eq!(
+            out.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream"),
+            "a streaming request must be answered with SSE"
+        );
+        let bytes = axum::body::to_bytes(out.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("text_completion"), "{body}");
+        assert!(body.contains("\"text\":\"ab\""), "{body}");
+        assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+    }
+
     #[tokio::test]
     async fn native_completions_forwards_prompt_and_suffix_untouched() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

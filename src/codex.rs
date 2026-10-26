@@ -231,6 +231,19 @@ impl CodexAccount {
 // ---------- request translation (chat.completions -> Responses API) ----------
 
 pub fn translate_request(model: &str, body: &Value) -> Result<Value, String> {
+    // `n` asks for several independent completions. Every translator here emits
+    // exactly one `choices[0]`, so forwarding a multi-choice request would hand
+    // the client a single answer with no indication that the rest were silently
+    // dropped — worse than refusing. A translator that gains multi-candidate
+    // support (Gemini's `candidateCount`) can lift this.
+    if body
+        .get("n")
+        .and_then(|n| n.as_i64())
+        .is_some_and(|n| n > 1)
+    {
+        return Err("'n' > 1 is not supported by this provider; ask for one completion".into());
+    }
+
     let messages = body
         .get("messages")
         .and_then(|m| m.as_array())
@@ -292,6 +305,10 @@ pub fn translate_request(model: &str, body: &Value) -> Result<Value, String> {
         "input": input,
     });
 
+    // Hosted tools cannot be run here; refuse them rather than dropping the entry
+    // and answering as if the tool had never been asked for (README documents a
+    // 400 for exactly this).
+    crate::proxy::ensure_no_hosted_tools(body)?;
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         let converted: Vec<Value> = tools
             .iter()
@@ -315,11 +332,26 @@ pub fn translate_request(model: &str, body: &Value) -> Result<Value, String> {
                 "none" | "auto" | "required" => Some(tc.clone()),
                 _ => None,
             },
-            Value::Object(o) => o
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .map(|n| json!({"type": "function", "name": n})),
+            // Same two shapes as the Anthropic translator: a mode
+            // (`{"type":"required"}`) and a specific tool (`{"type":"function",…}`).
+            // Only the second was handled, so a mandatory-tools request silently
+            // became the backend default.
+            Value::Object(o) => {
+                if let Some(name) = o
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                {
+                    Some(json!({"type": "function", "name": name}))
+                } else {
+                    match o.get("type").and_then(|t| t.as_str()) {
+                        Some("none") => Some(json!("none")),
+                        Some("required") => Some(json!("required")),
+                        Some("auto") => Some(json!("auto")),
+                        _ => None,
+                    }
+                }
+            }
             _ => None,
         };
         if let Some(c) = choice {
@@ -428,8 +460,25 @@ fn user_content(content: Option<&Value>) -> Result<Vec<Value>, String> {
                         }
                         parts.push(json!({"type": "input_image", "image_url": url}));
                     }
-                    _ => {}
+                    // A part this translator cannot express is an error, never
+                    // something to drop: a 200 with an answer written as if the
+                    // attachment did not exist is indistinguishable from success,
+                    // and the client is billed for it. This used to be `_ => {}`,
+                    // so `input_audio` / `file` parts vanished silently — and an
+                    // audio-only message went upstream with `"content": []`.
+                    // The Gemini translator argues the same point in its own
+                    // content-parts code ("a part we cannot translate is an error").
+                    other => {
+                        return Err(format!(
+                            "unsupported content part type '{}': this provider accepts text and \
+                             base64 images only",
+                            other.unwrap_or("(missing type)")
+                        ));
+                    }
                 }
+            }
+            if parts.is_empty() {
+                return Err("message content produced no parts: nothing would be sent".into());
             }
             Ok(parts)
         }
@@ -1103,6 +1152,58 @@ mod translate_tests {
     /// The Codex backend has no "system" role: system/developer content becomes
     /// `instructions`, and the conversation becomes typed `input` items. Getting
     /// this wrong silently drops the operator's system prompt.
+    /// A content part the translator cannot express is an error, never a drop.
+    ///
+    /// This used to be `_ => {}`, so an `input_audio`/`file` part vanished and the
+    /// client got a 200 with an answer written as if the attachment did not exist —
+    /// indistinguishable from success, and billed. An audio-only message even went
+    /// upstream with `"content": []`.
+    #[test]
+    fn an_untranslatable_content_part_is_refused_not_dropped() {
+        for part in [
+            json!({"type": "input_audio", "input_audio": {"data": "AAA", "format": "wav"}}),
+            json!({"type": "file", "file": {"file_id": "f_1"}}),
+            json!({"type": "video_url", "video_url": {"url": "https://x/y.mp4"}}),
+            json!({"text": "no type at all"}),
+        ] {
+            let err = translate_request(
+                "gpt-codex",
+                &json!({"messages": [{"role": "user", "content": [part]}]}),
+            )
+            .expect_err("a part it cannot express must fail loudly");
+            assert!(
+                err.contains("unsupported content part type"),
+                "the error must name the part: {err}"
+            );
+            // And the message must read as one sentence, not a run of spaces.
+            assert!(
+                !err.contains("  "),
+                "the message has broken whitespace: {err:?}"
+            );
+        }
+
+        // An empty array is refused too: nothing would be sent.
+        let err = translate_request(
+            "gpt-codex",
+            &json!({"messages": [{"role": "user", "content": []}]}),
+        )
+        .expect_err("empty content must fail loudly");
+        assert!(err.contains("no parts"), "{err}");
+
+        // Text and a base64 image both pass.
+        let ok = translate_request(
+            "gpt-codex",
+            &json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+            ]}]}),
+        )
+        .expect("text and a data URL translate");
+        let content = ok["input"][0]["content"].as_array().expect("content parts");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], "input_image");
+    }
+
     #[test]
     fn a_chat_request_becomes_a_responses_request() {
         let body = json!({

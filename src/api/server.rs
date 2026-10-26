@@ -107,6 +107,7 @@ pub struct TuningUpdate {
     ui_refresh_secs: Option<u64>,
     sse_keepalive_secs: Option<u64>,
     client_body_timeout_secs: Option<u64>,
+    client_header_timeout_secs: Option<u64>,
     capacity_wait_ms: Option<u64>,
     shutdown_grace_secs: Option<u64>,
     quota_cache_ttl_secs: Option<u64>,
@@ -533,6 +534,7 @@ pub async fn update_server(
         sync_num!(ui_refresh_secs, "ui_refresh_secs");
         sync_num!(sse_keepalive_secs, "sse_keepalive_secs");
         sync_num!(client_body_timeout_secs, "client_body_timeout_secs");
+        sync_num!(client_header_timeout_secs, "client_header_timeout_secs");
         sync_num!(capacity_wait_ms, "capacity_wait_ms");
         sync_num!(shutdown_grace_secs, "shutdown_grace_secs");
         sync_num!(quota_cache_ttl_secs, "quota_cache_ttl_secs");
@@ -691,6 +693,9 @@ keys = ["sk-test-key"]
 [server]
 listen = "127.0.0.1:18080"
 api_key = "test-gw-key"
+# A client-key deployment needs its own admin credential: the gateway key is
+# handed to every client and deliberately does not open `/api/*`.
+admin_key = "test-admin-key"
 "#;
 
     pub(crate) fn state(path: &std::path::Path) -> Arc<AppState> {
@@ -699,7 +704,7 @@ api_key = "test-gw-key"
                 providers: Vec::new(),
                 combos: Vec::new(),
             }),
-            cfg: RwLock::new(crate::proxy::RtConfig {
+            cfg: arc_swap::ArcSwap::from_pointee(crate::proxy::RtConfig {
                 max_retries: 2,
                 attempt_timeout: std::time::Duration::from_secs(30),
                 api_key: Some("test-gw-key".to_string()),
@@ -722,6 +727,8 @@ api_key = "test-gw-key"
             auth_start_lock: tokio::sync::Mutex::new(()),
             auth_fails: Mutex::new(crate::middleware::AuthFailures::default()),
             catalog_epoch: AtomicU64::new(0),
+            model_first_seen: std::sync::Mutex::new(std::collections::HashMap::new()),
+            inflight_bytes: crate::proxy::InflightBytes::new(0),
             tls_enabled_flag: AtomicBool::new(false),
             models_cache: Mutex::new(None),
             request_log: Mutex::new(VecDeque::new()),

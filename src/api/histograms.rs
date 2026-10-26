@@ -153,7 +153,7 @@ const STATIC_ROUTES: &[&str] = &[
 
 /// Map key. Ordered so that the same tuple always sorts into the same place,
 /// which is what makes [`render`]'s output stable.
-type Key = (String, String, u16);
+type Key = (String, &'static str, u16);
 
 /// One histogram series.
 ///
@@ -239,7 +239,10 @@ pub fn record(route: &str, method: &str, status: u16, secs: f64) {
         "OPTIONS" => "OPTIONS",
         _ => OTHER_METHOD,
     };
-    let key: Key = (route.to_owned(), method.to_owned(), status);
+    // The method above is a `&'static str` from a closed set, so looking up a
+    // known series costs exactly one allocation — the route label the caller had
+    // to produce anyway.
+    let key: Key = (route.to_owned(), method, status);
 
     // Poisoning-recoverable read, like the rest of the crate: a panicking
     // registrar must not turn into a panic on every subsequent request.
@@ -282,7 +285,7 @@ fn admit(mut key: Key) -> Arc<Buckets> {
     // folded away as well once the cap is reached, so the overflow is *one* series.
     if map.len() >= MAX_SERIES {
         key.0 = OTHER_ROUTE.to_owned();
-        key.1 = OTHER_METHOD.to_owned();
+        key.1 = OTHER_METHOD;
         key.2 = 0;
         if let Some(buckets) = map.get(&key) {
             return Arc::clone(buckets);
@@ -486,19 +489,31 @@ pub fn reset() {
     map.clear();
 }
 
+/// Serialises every test that touches the process-wide registry, because each of
+/// them starts with [`reset`]. Without it a parallel test could wipe another's
+/// series mid-assertion; with it, every test observes exactly the series it
+/// recorded, in any execution order.
+///
+/// It lives outside the `tests` module so `api::metrics` — which renders the
+/// registry into a document and asserts each sample has a `# TYPE` line — can
+/// hold the same lock instead of racing the writer tests.
+#[cfg(test)]
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the registry lock for the duration of a test that reads or resets it.
+///
+/// Poisoning-recoverable, like every other lock in the crate.
+#[cfg(test)]
+pub fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serialises the tests that touch the process-wide registry, because each of
-    /// them starts with [`reset`]. Without it a parallel test could wipe the
-    /// other's series mid-assertion; with it, every test observes exactly the
-    /// series it recorded, in any execution order.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn guard() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        test_guard()
     }
 
     /// Last field of the first line beginning with `prefix`, as an integer.

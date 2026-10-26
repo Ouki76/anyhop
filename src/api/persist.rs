@@ -27,25 +27,31 @@ pub(crate) async fn save_client_keys(
     commit_config_text(state, &text).await.map(|_| ())
 }
 
-/// Persist the whole `disabled_models` list (same discipline as
-/// [`save_client_keys`]).
-pub(crate) async fn save_disabled_models(
+/// Run `edit` against a *fresh* snapshot taken **while `config_lock` is held**.
+///
+/// Every persisted list on this API is a whole-list rewrite, so the caller has to
+/// read the current value, change one entry and write the result back. Reading
+/// before the lock makes that a read-modify-write race: two dashboard tabs each
+/// snapshot `[a, b]`, the first writes `[a', b]`, the second writes `[a, b']`, and
+/// the first edit is gone from the TOML *and* from memory. `persist.rs`'s own docs
+/// describe exactly this bug as fixed for client keys; the same pattern remained
+/// for `disabled_models` and `[[model_limits]]`.
+///
+/// `edit` therefore receives the list and returns the list it wants, and it may
+/// reject with a response of its own.
+pub(crate) async fn with_locked_list<T, F>(
     state: &Arc<AppState>,
-    disabled: &[String],
-) -> Result<(), Box<axum::response::Response>> {
+    read: impl Fn(&AppState) -> T,
+    edit: F,
+    write: impl Fn(&str, &T) -> anyhow::Result<String>,
+) -> Result<(), Box<axum::response::Response>>
+where
+    F: FnOnce(T) -> Result<T, Box<axum::response::Response>>,
+{
     let _guard = state.config_lock.lock().await;
-    let text = disabled_models_text(&state.config_path, disabled).map_err(io_error)?;
-    commit_config_text(state, &text).await.map(|_| ())
-}
-
-/// Persist the whole `[[model_limits]]` list (same discipline as
-/// [`save_client_keys`]): validate, build, write, install.
-pub(crate) async fn save_model_limits(
-    state: &Arc<AppState>,
-    limits: &[crate::config::ModelLimit],
-) -> Result<(), Box<axum::response::Response>> {
-    let _guard = state.config_lock.lock().await;
-    let text = model_limits_text(&state.config_path, limits).map_err(io_error)?;
+    let current = read(state);
+    let next = edit(current)?;
+    let text = write(&state.config_path, &next).map_err(io_error)?;
     commit_config_text(state, &text).await.map(|_| ())
 }
 

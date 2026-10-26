@@ -5,10 +5,17 @@ on:
     branches: [main, master]
   pull_request:
 
-# `contents: write` is only so the integration job can publish its failure log to a
-# throwaway branch (otherwise a failed e2e run is unreadable without a token).
+# Least privilege at workflow level: every job gets read-only contents, and the
+# one job that publishes a failure log to the `ci-logs` branch asks for `write`
+# itself. Granting `write` to the whole workflow meant a compromised test
+# dependency — or a merged PR that edits a shell script — could push to the repo.
 permissions:
-  contents: write
+  contents: read
+
+# One run per branch/PR: a superseded push should not keep burning runners.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,12 +25,14 @@ jobs:
   # Fast gate: it must compile and the unit tests must pass before anything else runs.
   test:
     runs-on: ubuntu-latest
+    # A hung job otherwise burns six hours of runner time before failing.
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (v4)
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3 (v2)
       # Style is a gate, not a suggestion: an unformatted or un-linted tree fails CI.
       - name: Formatting
         run: cargo fmt --all -- --check
@@ -32,6 +41,12 @@ jobs:
       - name: Build
         run: cargo build --locked --all-targets
       - name: Unit tests
+        # The parser fuzz harness is an integration test, so this runs it too.
+        # CI used to leave `ANYHOP_FUZZ_ITERS` at its 2 000 default, which meant
+        # the 1.6 M-input campaign `docs/FUZZING.md` cites as evidence was never
+        # executed by any automation. 20 000 keeps the job a few seconds long.
+        env:
+          ANYHOP_FUZZ_ITERS: "20000"
         run: cargo test --locked 2>&1 | tee /tmp/suite.log
 
       - name: Publish failure logs
@@ -49,18 +64,31 @@ jobs:
       # and is easy to break by referencing a dashboard-only symbol.
       - name: Build without the dashboard feature
         run: cargo build --locked --no-default-features
+      # The no-dashboard build must also *pass its tests*: it is the "minimal
+      # image" path, and building it without exercising it is how a
+      # dashboard-only symbol reaches for a type that is not there.
+      - name: Test without the dashboard feature
+        run: cargo test --locked --no-default-features
+      # A dependency advisory is a vulnerability in this binary, not a style
+      # issue. It used to be checked only by the local audit.sh, i.e. never in CI.
+      - name: Dependency advisories
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 (v2)
+        with:
+          command: check advisories bans sources
+          arguments: --all-features
 
   # End-to-end: real HTTP against mock providers, including access control and the UI.
   integration:
     runs-on: ubuntu-latest
     needs: [test, ui]
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (v4)
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3 (v2)
       # Without this the embedded dashboard is the "ui not built" placeholder and
       # the CSP assertions cannot pass (see the ui job).
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0 (v4)
         with:
           name: ui-dist
           path: ui/dist
@@ -84,6 +112,9 @@ jobs:
       # throwaway branch so the failure can be inspected from a checkout.
       - name: Publish failure logs
         if: failure() && github.event_name == 'push'
+        # Only this step needs to write; the workflow default stays `read`.
+        permissions:
+          contents: write
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -119,15 +150,16 @@ jobs:
   # The dashboard is a Rust→WASM app and is not covered by `cargo build` at the root.
   ui:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (v4)
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3 (v2)
         with:
           workspaces: ui
-      - uses: taiki-e/install-action@trunk
+      - uses: taiki-e/install-action@6c6e39d0df4ad531d391315e1c39e567f0444fbc # trunk
       - name: Build dashboard (WASM)
         run: cd ui && trunk build --release
       # The CSP allows the inline scripts by hash; a build that changes them must
@@ -138,7 +170,7 @@ jobs:
       # `build.rs` embeds its placeholder — that is exactly how the e2e job failed:
       # the binary served "ui not built", so there were no inline scripts and no
       # CSP hashes. Hand the real bundle to the job that builds the tested binary.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 (v4)
         with:
           name: ui-dist
           path: ui/dist

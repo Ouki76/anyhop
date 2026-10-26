@@ -15,6 +15,9 @@ axum = "0.8"
 # upgrade hook (already in the tree through axum's server) plus a local RFC 6455
 # codec in `src/ws.rs`.
 hyper = { version = "1", features = ["server", "http1"] }
+# Only for `TokioIo`/`TokioExecutor`: the plain-HTTP listener needs its own accept
+# loop to enforce a header deadline, which `axum::serve` offers no hook for.
+hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",

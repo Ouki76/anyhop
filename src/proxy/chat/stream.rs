@@ -228,7 +228,15 @@ pub(super) fn accept_2xx(kind: ProviderKind, is_stream: bool, raw_content_type: 
 /// `stream: true` to a compat proxy that ignores it); it must not be booked as a
 /// key-health failure, or one client benches the provider for everyone.
 pub(super) fn is_json_like(content_type: &str) -> bool {
-    content_type == "application/json" || content_type.ends_with("+json")
+    // An *absent* content type is legal (`Content-Type` is optional on a
+    // response) and `accept_2xx` already treats it as acceptable on the
+    // non-streaming branch. It is also the same class as `application/json`
+    // here: the answer is not an error page, so it must not be booked as a key
+    // failure — that is what benches a healthy provider for everyone.
+    // Normalise the same way `accept_2xx` does, so a `; charset=` parameter or a
+    // different case cannot make the two predicates disagree.
+    let ct = normalize_content_type(content_type);
+    ct.is_empty() || ct == "application/json" || ct.ends_with("+json")
 }
 
 /// Build the client response for a successful upstream call.
@@ -240,6 +248,8 @@ pub(super) async fn success_response(
     model: &str,
     body: Upstream,
     is_stream: bool,
+    // The client asked for a final usage chunk (`stream_options.include_usage`).
+    include_usage: bool,
     key: Arc<KeyState>,
     guard: KeyGuard,
 ) -> Response {
@@ -350,12 +360,14 @@ pub(super) async fn success_response(
                         stream,
                         model,
                         Some(key),
+                        include_usage,
                     )),
                     _ => Box::pin(gemini::translate_sse_stream_from(
                         stream,
                         model,
                         envelope,
                         Some(key),
+                        include_usage,
                     )),
                 };
                 let stream = stream.map(move |item| {
@@ -371,9 +383,16 @@ pub(super) async fn success_response(
                         Ok(v) => {
                             if matches!(provider.kind, ProviderKind::Anthropic) {
                                 let u = v.get("usage").cloned().unwrap_or(Value::Null);
+                                // Same accounting as the streaming path and as the
+                                // translated body: Anthropic's `input_tokens`
+                                // excludes the prompt-cache buckets, so reading it
+                                // raw made a cached conversation report a tiny
+                                // context here and the real one there — and the
+                                // pool's counters inherited the wrong number.
+                                let (prompt, _cached) = anthropic::prompt_usage(&u);
                                 add_usage(
                                     &key,
-                                    u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                                    prompt,
                                     u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
                                 );
                                 Json(anthropic::translate_response(model, &v)).into_response()
@@ -457,11 +476,26 @@ fn pass_through(
     stream: BodyStream,
     guard: KeyGuard,
 ) -> Response {
-    let stream =
-        futures::stream::unfold((Some(stream), Some(guard)), |(inner, guard)| async move {
+    // `seen_done` tracks whether the upstream terminated the stream properly.
+    //
+    // OpenAI clients stop reading at `data: [DONE]`. A provider (or a proxy in
+    // front of it) that closes the body without it leaves the client waiting on a
+    // socket that will never say anything more, or treating a complete answer as
+    // truncated. Measured: a stream ending with `finish_reason: "stop"` and no
+    // `[DONE]` is passed through verbatim, so the client never learns the answer
+    // is over.
+    let stream = futures::stream::unfold(
+        (Some(stream), Some(guard), false),
+        |(inner, guard, seen_done)| async move {
             let mut inner = inner?;
             match inner.next().await {
-                Some(Ok(chunk)) => Some((Ok::<Bytes, std::io::Error>(chunk), (Some(inner), guard))),
+                Some(Ok(chunk)) => {
+                    let has_done = crate::sse::contains_done(&chunk);
+                    Some((
+                        Ok::<Bytes, std::io::Error>(chunk),
+                        (Some(inner), guard, seen_done || has_done),
+                    ))
+                }
                 Some(Err(e)) => {
                     let frame = crate::sse::frame(&serde_json::json!({
                         "error": {
@@ -473,11 +507,27 @@ fn pass_through(
                     let mut out = bytes::BytesMut::from(&b"\n\n"[..]);
                     out.extend_from_slice(&frame);
                     out.extend_from_slice(crate::sse::DONE_FRAME);
-                    Some((Ok::<Bytes, std::io::Error>(out.freeze()), (None, guard)))
+                    Some((
+                        Ok::<Bytes, std::io::Error>(out.freeze()),
+                        (None, guard, true),
+                    ))
                 }
-                None => None,
+                None => {
+                    // A clean end of body that never carried `[DONE]`: close the
+                    // stream the way an OpenAI client expects, instead of leaving
+                    // it to infer that from a closed socket.
+                    if seen_done {
+                        None
+                    } else {
+                        Some((
+                            Ok::<Bytes, std::io::Error>(Bytes::from_static(crate::sse::DONE_FRAME)),
+                            (None, guard, true),
+                        ))
+                    }
+                }
             }
-        });
+        },
+    );
     let mut builder = Response::builder().status(status);
     for (n, v) in headers {
         builder = builder.header(n, v);
@@ -490,6 +540,52 @@ fn pass_through(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- shape mismatch vs provider fault -----
+
+    /// `is_json_like` decides whether a 2xx that is not SSE is a *shape mismatch*
+    /// (the client asked for a stream, a compat proxy ignored the flag — never a
+    /// key-health failure) or an *error page* (the provider's fault, back off).
+    ///
+    /// It must agree with `accept_2xx`, which already treats an absent content
+    /// type as acceptable on the non-streaming branch. A missing `Content-Type` on
+    /// a JSON answer used to be booked as a provider fault, so one client could
+    /// drive a healthy key's backoff to `max_cooldown` — taking the provider out
+    /// for everyone — just by sending `stream: true`.
+    #[test]
+    fn an_absent_content_type_is_a_shape_mismatch_not_a_provider_fault() {
+        for ct in [
+            "",
+            "   ",
+            "application/json",
+            "application/json; charset=utf-8",
+        ] {
+            assert!(
+                is_json_like(ct),
+                "{ct:?} is a JSON-ish answer, not an error page"
+            );
+        }
+        assert!(is_json_like("application/vnd.api+json"));
+
+        // A named non-JSON type *is* an error page and must still bench the key.
+        for ct in ["text/html", "text/plain", "application/xml"] {
+            assert!(!is_json_like(ct), "{ct:?} is not a completion");
+        }
+
+        // The two predicates must not disagree about the absent case: whatever
+        // `accept_2xx` lets through for a non-stream request, `is_json_like` must
+        // not then report as a provider fault.
+        for ct in ["", "application/json", "application/json; charset=utf-8"] {
+            assert!(
+                matches!(
+                    accept_2xx(ProviderKind::OpenaiCompat, false, ct),
+                    Accepted::Ok
+                ),
+                "accept_2xx rejects {ct:?} while is_json_like accepts it"
+            );
+            assert!(is_json_like(ct), "is_json_like rejects {ct:?}");
+        }
+    }
 
     // ----- response header allowlist -----
 
@@ -698,7 +794,7 @@ mod tests {
                 b"<html><body>502 Bad Gateway</body></html>",
             ))])),
         };
-        let resp = success_response(&provider, "m", body, false, key, guard).await;
+        let resp = success_response(&provider, "m", body, false, false, key, guard).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -817,7 +913,7 @@ mod tests {
         let key = provider.pool.pick("m", None).expect("one key");
         let guard = key.try_acquire().expect("a free slot");
         let (body, upstream_dropped) = stalled_body();
-        let resp = success_response(&provider, "m", opened(body), true, key, guard).await;
+        let resp = success_response(&provider, "m", opened(body), true, false, key, guard).await;
 
         assert_eq!(
             in_flight(&provider),
@@ -857,7 +953,7 @@ mod tests {
             .expect("the body opens");
         let key = provider.pool.pick("m", None).expect("one key");
         let guard = key.try_acquire().expect("a free slot");
-        let resp = success_response(&provider, "m", body, true, key, guard).await;
+        let resp = success_response(&provider, "m", body, true, false, key, guard).await;
 
         // A client that reads one frame and vanishes.
         let mut frames = resp.into_body().into_data_stream();
@@ -893,18 +989,19 @@ mod tests {
                 b"data: a\n\n",
             ))])),
         };
-        let resp = success_response(&provider, "m", body, true, key, guard).await;
+        let resp = success_response(&provider, "m", body, true, false, key, guard).await;
 
         let mut frames = resp.into_body().into_data_stream();
-        let mut count = 0;
+        let mut relayed = Vec::new();
         while let Some(item) = frames.next().await {
-            item.expect("every relayed item is a frame");
-            count += 1;
+            relayed.push(item.expect("every relayed item is a frame"));
         }
-        assert_eq!(
-            count, 1,
-            "the single frame is relayed before the end of body"
-        );
+        // Upstream sent one data frame and no `[DONE]`, so the relay adds the
+        // terminator: a client must never be left guessing whether the answer
+        // ended or the socket died.
+        assert_eq!(relayed.len(), 2, "one frame plus the synthesised [DONE]");
+        assert_eq!(&relayed[0][..], b"data: a\n\n");
+        assert_eq!(&relayed[1][..], crate::sse::DONE_FRAME);
         assert_eq!(
             in_flight(&provider),
             0,
@@ -920,7 +1017,7 @@ mod tests {
         let key = provider.pool.pick("m", None).expect("one key");
         let guard = key.try_acquire().expect("a free slot");
         let (body, upstream_dropped) = stalled_body();
-        let resp = success_response(&provider, "m", opened(body), true, key, guard).await;
+        let resp = success_response(&provider, "m", opened(body), true, false, key, guard).await;
 
         assert_eq!(
             in_flight(&provider),

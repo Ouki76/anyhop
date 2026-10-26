@@ -1237,6 +1237,16 @@ struct StreamMapper {
     /// How many tool-call items were announced, and their element ids (the compact
     /// `function_call` item carries an `fc_…` id of its own).
     tool_items: Vec<(String, String)>,
+    /// The `output_index` each tool item was *announced* with.
+    ///
+    /// It used to be recomputed at close time from `item_added`, which flips when
+    /// the lazily-emitted message item is announced — so a tool item could be
+    /// announced at 0 and closed at 1, while the message item also claimed 0. Any
+    /// client keying items by `output_index` then mis-associated them. The index is
+    /// a property of the item, fixed when it is first announced.
+    tool_indices: Vec<usize>,
+    /// The index the message item was announced with (`0` until it exists).
+    message_index: usize,
     /// Whether the `output_item.added` frame for a tool index was sent.
     announced: Vec<bool>,
     sequence: u64,
@@ -1265,6 +1275,8 @@ impl StreamMapper {
             finish_reason: None,
             tool_calls: Vec::new(),
             tool_items: Vec::new(),
+            tool_indices: Vec::new(),
+            message_index: 0,
             announced: Vec::new(),
             sequence: 0,
         }
@@ -1305,10 +1317,16 @@ impl StreamMapper {
 
     fn item_added_event(&mut self) -> Bytes {
         let item_id = self.item_id.clone();
+        // The message item's index follows every item already announced before it.
+        // It used to be a hard-coded 0, so a tool call announced first and the
+        // message announced later both claimed 0 and clients keying by
+        // `output_index` mixed them up.
+        let index = self.next_message_index();
+        self.message_index = index;
         self.emit(
             "response.output_item.added",
             json!({
-                "output_index": 0,
+                "output_index": index,
                 "item": {
                     "type": "message",
                     "id": item_id,
@@ -1318,6 +1336,17 @@ impl StreamMapper {
                 },
             }),
         )
+    }
+
+    /// The index the message item gets: one past every announced tool item.
+    fn next_message_index(&self) -> usize {
+        self.tool_indices
+            .iter()
+            .filter(|i| **i != usize::MAX)
+            .copied()
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0)
     }
 
     /// Frames the client must see before the first delta.
@@ -1368,11 +1397,12 @@ impl StreamMapper {
         }
         self.push_text(delta);
         let item_id = self.item_id.clone();
+        let output_index = self.message_index;
         out.push(self.emit(
             "response.output_text.delta",
             json!({
                 "item_id": item_id,
-                "output_index": 0,
+                "output_index": output_index,
                 "content_index": 0,
                 "delta": delta,
             }),
@@ -1412,6 +1442,11 @@ impl StreamMapper {
             // complete `function_call` item rather than a nameless one.
             if !self.tool_calls[idx].name.is_empty() && !self.item_announced(idx) {
                 self.mark_announced(idx);
+                let announced_index = self.next_index_for_tool(idx);
+                while self.tool_indices.len() <= idx {
+                    self.tool_indices.push(usize::MAX);
+                }
+                self.tool_indices[idx] = announced_index;
                 let (item_id, call_id) = self.tool_items[idx].clone();
                 let call_id = if self.tool_calls[idx].id.is_empty() {
                     call_id
@@ -1421,7 +1456,7 @@ impl StreamMapper {
                 out.push(self.emit(
                     "response.output_item.added",
                     json!({
-                        "output_index": self.output_index(idx),
+                        "output_index": announced_index,
                         "item": {
                             "type": "function_call",
                             "id": item_id,
@@ -1444,7 +1479,7 @@ impl StreamMapper {
                     "response.function_call_arguments.delta",
                     json!({
                         "item_id": item_id,
-                        "output_index": self.output_index(idx),
+                        "output_index": self.announced_index(idx),
                         "delta": args,
                     }),
                 ));
@@ -1453,13 +1488,24 @@ impl StreamMapper {
         out
     }
 
-    /// Index of the message item: it is emitted lazily, so the tool items have to
-    /// start after it when text already arrived.
-    fn output_index(&self, tool_idx: usize) -> usize {
+    /// The index a tool item would get if announced *now*.
+    ///
+    /// Only called at announce time; afterwards the item's index is read back from
+    /// [`Self::announced_index`] so a later `item_added` cannot move it.
+    fn next_index_for_tool(&self, tool_idx: usize) -> usize {
         if self.item_added {
             tool_idx + 1
         } else {
             tool_idx
+        }
+    }
+
+    /// The index a tool item was announced with, or a fresh one if it somehow was
+    /// never announced (a defensive fallback, not a normal path).
+    fn announced_index(&self, tool_idx: usize) -> usize {
+        match self.tool_indices.get(tool_idx) {
+            Some(&i) if i != usize::MAX => i,
+            _ => self.next_index_for_tool(tool_idx),
         }
     }
 
@@ -1513,11 +1559,12 @@ impl StreamMapper {
                 out.push(self.item_added_event());
             }
             let item_id = self.item_id.clone();
+            let output_index = self.message_index;
             out.push(self.emit(
                 "response.output_text.done",
                 json!({
                     "item_id": item_id,
-                    "output_index": 0,
+                    "output_index": output_index,
                     "content_index": 0,
                     "text": text,
                 }),
@@ -1533,7 +1580,7 @@ impl StreamMapper {
             };
             let name = self.tool_calls[idx].name.clone();
             let args = self.tool_calls[idx].arguments.clone();
-            let output_index = self.output_index(idx);
+            let output_index = self.announced_index(idx);
             out.push(self.emit(
                 "response.function_call_arguments.done",
                 json!({
@@ -2450,6 +2497,99 @@ mod tests {
     }
 
     // ----- streaming -----
+
+    /// A tool item keeps the `output_index` it was *announced* with.
+    ///
+    /// The message item is emitted lazily, and `output_index` was recomputed at
+    /// close time against that flag — so a `function_call` announced at 0 could be
+    /// closed at 1 while a following message item also claimed 0. Probe-measured:
+    /// `added(0, function_call)`, `added(0, message)`, `done(1, function_call)`.
+    /// Any client keying items by `output_index` then mixed them up.
+    #[test]
+    fn a_tool_item_keeps_the_output_index_it_was_announced_with() {
+        let mut mapper = StreamMapper::new("m".to_string(), None, true, Value::Null);
+        let mut frames = mapper.start();
+        // A tool call first…
+        frames.extend(mapper.feed(
+            br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":""}}]}}]}"#,
+        ));
+        frames.extend(mapper.feed(
+            br#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}"#,
+        ));
+        // …then text, which forces the message item to be announced afterwards.
+        frames.extend(mapper.feed(br#"{"choices":[{"delta":{"content":"hello"}}]}"#));
+        frames.extend(mapper.feed(br#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#));
+        frames.extend(mapper.feed(b"[DONE]"));
+
+        // Collect (event, item type, output_index) for output_item.* frames.
+        let mut seen: Vec<(String, String, i64)> = Vec::new();
+        for f in &frames {
+            let s = std::str::from_utf8(f).expect("utf-8");
+            let mut lines = s.lines();
+            let name = lines
+                .next()
+                .and_then(|l| l.strip_prefix("event: "))
+                .unwrap_or_default()
+                .to_string();
+            if !name.starts_with("response.output_item.") {
+                continue;
+            }
+            let data = lines
+                .find_map(|l| l.strip_prefix("data: "))
+                .expect("a data line");
+            let v: Value = serde_json::from_str(data).expect("json");
+            let ty = v
+                .pointer("/item/type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            seen.push((name, ty, v["output_index"].as_i64().expect("an index")));
+        }
+
+        let added_call = seen
+            .iter()
+            .find(|(n, t, _)| n.ends_with("added") && t == "function_call")
+            .expect("the tool item is announced");
+        let added_msg = seen
+            .iter()
+            .find(|(n, t, _)| n.ends_with("added") && t == "message")
+            .expect("the message item is announced");
+        let done_call = seen
+            .iter()
+            .find(|(n, t, _)| n.ends_with("done") && t == "function_call")
+            .expect("the tool item is closed");
+        assert_eq!(
+            added_call.2, done_call.2,
+            "a tool item must be closed at the index it was announced with: {seen:?}"
+        );
+        assert_ne!(
+            added_call.2, added_msg.2,
+            "two different items must not share an output_index: {seen:?}"
+        );
+
+        // The message item is closed by `response.output_text.done` (this mapper
+        // announces text through that event rather than an item.done), and it must
+        // report the same index the added frame used.
+        let text_done_index = frames
+            .iter()
+            .filter_map(|f| {
+                let s = std::str::from_utf8(f).expect("utf-8");
+                let mut lines = s.lines();
+                let name = lines.next()?.strip_prefix("event: ")?.to_string();
+                if name != "response.output_text.done" {
+                    return None;
+                }
+                let data = lines.find_map(|l| l.strip_prefix("data: "))?;
+                let v: Value = serde_json::from_str(data).ok()?;
+                v["output_index"].as_i64()
+            })
+            .next()
+            .expect("output_text.done carries an output_index");
+        assert_eq!(
+            text_done_index, added_msg.2,
+            "the message index must be stable from announce to done"
+        );
+    }
 
     #[test]
     fn chat_deltas_map_to_responses_sse_events() {

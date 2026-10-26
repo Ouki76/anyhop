@@ -136,9 +136,33 @@ impl StickySessions {
         let max_entries = self.tuning().sticky_max_entries;
         let mut map = lock(&self.map);
         if map.len() >= max_entries {
-            map.clear(); // coarse eviction on overflow
+            self.evict(&mut map, max_entries, now);
         }
         map.insert(session, (kid.to_string(), now));
+    }
+
+    /// Make room for one more binding.
+    ///
+    /// This used to be `map.clear()`: the whole table dropped at the cap, so at
+    /// once every live conversation lost its key binding *and* one request paid
+    /// for thousands of frees — the sticky pin exists to keep a conversation on
+    /// one key for its prompt cache, and the cliff undid that for everyone just
+    /// when the gateway was busiest.
+    ///
+    /// Expired entries go first (they cost nothing to lose). Only if that frees
+    /// nothing are the oldest quarter dropped, which under sustained load is the
+    /// traffic least likely to still be live.
+    fn evict(&self, map: &mut HashMap<u64, (String, u64)>, max_entries: usize, now: u64) {
+        let ttl = self.tuning().sticky_ttl().as_millis() as u64;
+        map.retain(|_, (_, seen)| now.saturating_sub(*seen) < ttl);
+        if map.len() < max_entries {
+            return;
+        }
+        let mut ages: Vec<(u64, u64)> = map.iter().map(|(s, (_, seen))| (*seen, *s)).collect();
+        ages.sort_unstable_by_key(|(seen, _)| *seen);
+        for (_, session) in ages.into_iter().take(max_entries / 4) {
+            map.remove(&session);
+        }
     }
 }
 
@@ -168,6 +192,82 @@ mod tests {
         let distinct: std::collections::HashSet<u64> =
             (0..1000).map(|i| score(7, &i.to_string())).collect();
         assert!(distinct.len() > 990, "poor spread: {}", distinct.len());
+    }
+
+    /// At the cap, eviction must drop the *oldest* bindings — never the whole
+    /// table.
+    ///
+    /// `bind` used to call `map.clear()`, so the moment a busy gateway reached
+    /// `sticky_max_entries` every live conversation lost its key binding at once
+    /// and one request paid for thousands of frees. A sticky pin exists to keep a
+    /// conversation on one key for its prompt cache; the cliff undid that for
+    /// everyone exactly when the gateway was busiest.
+    #[test]
+    fn eviction_at_the_cap_keeps_the_newest_bindings() {
+        let t = Arc::new(arc_swap::ArcSwap::from_pointee(Tuning {
+            sticky_mode: "map".to_string(),
+            sticky_max_entries: 8,
+            ..Tuning::default()
+        }));
+        let s = StickySessions::new(t);
+        // Fill to the cap with distinct sessions, oldest first. No `lookup` here:
+        // a lookup refreshes an entry's timestamp, which is the point of the TTL.
+        for i in 0..8u64 {
+            s.bind(i, "key-a", 1_000 + i);
+        }
+
+        // One more binding trips eviction. The newest entries must survive and
+        // only the oldest quarter may go.
+        s.bind(99, "key-a", 1_008);
+        assert_eq!(
+            s.lookup(7, 1_008).as_deref(),
+            Some("key-a"),
+            "the newest binding was evicted by the cap"
+        );
+        assert_eq!(
+            s.lookup(99, 1_008).as_deref(),
+            Some("key-a"),
+            "the binding that triggered eviction must exist"
+        );
+        assert_eq!(
+            s.lookup(0, 1_008),
+            None,
+            "the oldest binding is the one that should go"
+        );
+        // The middle of the table is untouched: a clear() would have lost it too.
+        assert_eq!(
+            s.lookup(5, 1_008).as_deref(),
+            Some("key-a"),
+            "eviction dropped more than the oldest quarter"
+        );
+    }
+
+    /// Expired entries are dropped first, so a table full of dead sessions does
+    /// not force live ones out.
+    #[test]
+    fn expired_bindings_are_evicted_before_live_ones() {
+        let t = Arc::new(arc_swap::ArcSwap::from_pointee(Tuning {
+            sticky_mode: "map".to_string(),
+            sticky_max_entries: 4,
+            ..Tuning::default()
+        }));
+        let s = StickySessions::new(t);
+        let ttl_ms = Tuning::default().sticky_ttl().as_millis() as u64;
+        // Three long-expired sessions, then one live one at the cap.
+        for i in 0..3u64 {
+            s.bind(i, "key-a", 0);
+        }
+        let now = ttl_ms + 5_000;
+        s.bind(50, "key-a", now);
+        // Adding one more must evict only the dead ones.
+        s.bind(51, "key-a", now + 1);
+        assert_eq!(
+            s.lookup(50, now + 1).as_deref(),
+            Some("key-a"),
+            "a live binding was dropped while expired ones existed"
+        );
+        assert_eq!(s.lookup(51, now + 1).as_deref(), Some("key-a"));
+        assert_eq!(s.lookup(0, now + 1), None, "expired entries must be gone");
     }
 
     /// The point of the hashed mode: two independent "instances" (no shared

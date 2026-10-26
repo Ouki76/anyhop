@@ -1726,7 +1726,7 @@ whisper-1\r\n\
                 .is_some_and(|v| v.starts_with("application/json"))
         );
         let body: serde_json::Value = resp.json().await.expect("JSON envelope");
-        assert_eq!(body["error"]["code"], 400);
+        assert_eq!(body["error"]["code"], "invalid_request_error");
         assert!(
             body["error"]["message"]
                 .as_str()

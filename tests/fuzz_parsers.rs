@@ -1569,6 +1569,8 @@ fn gemini_exercise(bytes: &[u8]) {
             "fuzz-model",
             envelope,
             None,
+            // Alternate the flag so both branches stay covered.
+            bytes.len().is_multiple_of(3),
         ))
     });
     // The non-streaming translation of the same payload.
@@ -1583,6 +1585,7 @@ fn anthropic_exercise(bytes: &[u8]) {
             stream::iter(chunks.into_iter().map(Ok::<Bytes, io::Error>)),
             "fuzz-model",
             None,
+            bytes.len().is_multiple_of(3),
         ))
     });
     if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
@@ -1850,6 +1853,7 @@ fn hostile_usage_totals_saturate_instead_of_overflowing() {
         stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(body))]),
         "m",
         None,
+        true,
     ));
     let usage = frames
         .iter()
