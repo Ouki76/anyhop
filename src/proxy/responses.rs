@@ -1274,6 +1274,13 @@ struct StreamMapper {
     tool_indices: Vec<usize>,
     /// The index the message item was announced with (`0` until it exists).
     message_index: usize,
+    /// Set once the reasoning item has been announced in the *stream*.
+    reasoning_announced: bool,
+    /// The `output_index` the reasoning item took, and its item id.
+    reasoning_index: usize,
+    reasoning_item_id: String,
+    /// Set once the reasoning item has been closed in the stream.
+    reasoning_closed: bool,
     /// Whether the `output_item.added` frame for a tool index was sent.
     announced: Vec<bool>,
     sequence: u64,
@@ -1305,6 +1312,10 @@ impl StreamMapper {
             tool_items: Vec::new(),
             tool_indices: Vec::new(),
             message_index: 0,
+            reasoning_announced: false,
+            reasoning_index: 0,
+            reasoning_item_id: random_id("rs_"),
+            reasoning_closed: false,
             announced: Vec::new(),
             sequence: 0,
         }
@@ -1368,13 +1379,46 @@ impl StreamMapper {
 
     /// The index the message item gets: one past every announced tool item.
     fn next_message_index(&self) -> usize {
-        self.tool_indices
+        let tool_max = self
+            .tool_indices
             .iter()
             .filter(|i| **i != usize::MAX)
             .copied()
+            .max();
+        // The reasoning item, when present, is announced first and owns index 0.
+        let reasoning_max = self.reasoning_announced.then_some(self.reasoning_index);
+        tool_max
+            .into_iter()
+            .chain(reasoning_max)
             .max()
             .map(|m| m + 1)
             .unwrap_or(0)
+    }
+
+    /// Announce the reasoning item, once, when the first thought arrives.
+    ///
+    /// OpenAI streams a reasoning summary as its own output item with
+    /// `response.reasoning_summary_text.delta` events. Emitting only the final
+    /// object left a streaming client with nothing to render while the answer was
+    /// being written — which is exactly what a thinking panel reads.
+    fn reasoning_item_added(&mut self) -> Option<Bytes> {
+        if self.reasoning_announced {
+            return None;
+        }
+        self.reasoning_announced = true;
+        let index = 0;
+        self.reasoning_index = index;
+        Some(self.emit(
+            "response.output_item.added",
+            json!({
+                "output_index": index,
+                "item": {
+                    "type": "reasoning",
+                    "id": self.reasoning_item_id.clone(),
+                    "summary": [],
+                },
+            }),
+        ))
     }
 
     /// Frames the client must see before the first delta.
@@ -1415,8 +1459,37 @@ impl StreamMapper {
         if let Some(r) = chunk
             .pointer("/choices/0/delta/reasoning_content")
             .and_then(Value::as_str)
+            .filter(|r| !r.is_empty())
         {
+            // Announce the item on the first thought, then stream each delta under
+            // the name OpenAI uses. Without these events a streaming client has
+            // nothing to render until the turn is over.
+            if let Some(added) = self.reasoning_item_added() {
+                out.push(added);
+                let item_id = self.reasoning_item_id.clone();
+                let index = self.reasoning_index;
+                out.push(self.emit(
+                    "response.reasoning_summary_part.added",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": index,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": ""},
+                    }),
+                ));
+            }
             self.push_reasoning(r);
+            let item_id = self.reasoning_item_id.clone();
+            let index = self.reasoning_index;
+            out.push(self.emit(
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "item_id": item_id,
+                    "output_index": index,
+                    "summary_index": 0,
+                    "delta": r,
+                }),
+            ));
         }
         let delta = chunk
             .pointer("/choices/0/delta/content")
@@ -1426,6 +1499,8 @@ impl StreamMapper {
             return out;
         }
         if !self.item_added {
+            // Thinking ends where the answer begins.
+            out.extend(self.close_reasoning());
             self.item_added = true;
             out.push(self.item_added_event());
         }
@@ -1573,6 +1648,51 @@ impl StreamMapper {
         self.reasoning.push_str(&delta[..end]);
     }
 
+    /// Close the reasoning item if it is open.
+    ///
+    /// Emitted before the answer starts, which is the order the Responses API
+    /// documents and the order a client renders in: thinking, done, then the reply.
+    fn close_reasoning(&mut self) -> Vec<Bytes> {
+        if !self.reasoning_announced || self.reasoning_closed {
+            return Vec::new();
+        }
+        self.reasoning_closed = true;
+        let item_id = self.reasoning_item_id.clone();
+        let index = self.reasoning_index;
+        let summary = self.reasoning.clone();
+        vec![
+            self.emit(
+                "response.reasoning_summary_text.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": index,
+                    "summary_index": 0,
+                    "text": summary,
+                }),
+            ),
+            self.emit(
+                "response.reasoning_summary_part.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": self.reasoning},
+                }),
+            ),
+            self.emit(
+                "response.output_item.done",
+                json!({
+                    "output_index": index,
+                    "item": {
+                        "type": "reasoning",
+                        "id": item_id,
+                        "summary": [{"type": "summary_text", "text": self.reasoning}],
+                    },
+                }),
+            ),
+        ]
+    }
+
     fn push_text(&mut self, delta: &str) {
         let remaining = MAX_OUTPUT_TEXT.saturating_sub(self.text.len());
         if remaining == 0 {
@@ -1594,6 +1714,9 @@ impl StreamMapper {
         // From here on the reply is real: the relay stores it.
         self.ok = true;
         let mut out = Vec::new();
+        // A reasoning item that never got an answer after it still has to be
+        // closed, or the client leaves the thinking block spinning.
+        out.extend(self.close_reasoning());
         let text = self.text.clone();
         let has_tools = !self.tool_calls.is_empty();
         // A tool-only turn has no message item: announcing one with empty text
@@ -2689,6 +2812,71 @@ mod tests {
             blank.len(),
             1,
             "an empty reasoning string must not emit an item"
+        );
+    }
+
+    /// The reasoning summary is streamed as its own item, in the documented order.
+    ///
+    /// Only the final object carried it, so a streaming client — which is what a
+    /// chat UI is — had nothing to render while the answer was being written and
+    /// showed no thinking at all. Measured on a live gateway: the event stream held
+    /// one `output_item.added`, one `output_text.delta` and no reasoning event.
+    #[test]
+    fn streaming_reasoning_emits_the_documented_event_sequence() {
+        let mut mapper = StreamMapper::new("m".to_string(), None, true, Value::Null);
+        let mut frames = mapper.start();
+        frames.extend(mapper.feed(
+            br#"{"choices":[{"delta":{"role":"assistant","reasoning_content":"17*20=340, "}}]}"#,
+        ));
+        frames.extend(mapper.feed(br#"{"choices":[{"delta":{"reasoning_content":"17*3=51."}}]}"#));
+        frames.extend(mapper.feed(br#"{"choices":[{"delta":{"content":"391"}}]}"#));
+        frames.extend(mapper.feed(
+            br#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+        ));
+        frames.extend(mapper.feed(b"[DONE]"));
+
+        assert_eq!(
+            event_names(&frames),
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.completed",
+            ],
+            "thinking must open, stream and close before the answer starts"
+        );
+
+        // The two items must not share an index.
+        let mut indices = Vec::new();
+        for f in &frames {
+            let s = std::str::from_utf8(f).expect("utf-8");
+            let mut lines = s.lines();
+            let name = lines
+                .next()
+                .and_then(|l| l.strip_prefix("event: "))
+                .unwrap_or_default();
+            if name != "response.output_item.added" {
+                continue;
+            }
+            let data = lines.find_map(|l| l.strip_prefix("data: ")).expect("data");
+            let v: Value = serde_json::from_str(data).expect("json");
+            indices.push((
+                v["item"]["type"].as_str().unwrap_or("?").to_string(),
+                v["output_index"].as_i64().expect("index"),
+            ));
+        }
+        assert_eq!(
+            indices,
+            vec![("reasoning".to_string(), 0), ("message".to_string(), 1)],
+            "reasoning owns 0, the message follows at 1"
         );
     }
 
