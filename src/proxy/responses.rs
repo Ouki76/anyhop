@@ -1067,8 +1067,24 @@ fn tool_calls_of(message: &Value) -> Vec<ToolCall> {
 
 /// The Responses `output` array: an assistant message when there is text, then one
 /// `function_call` item per tool call.
-fn output_items(item_id: &str, text: &str, calls: &[ToolCall]) -> Vec<Value> {
+fn output_items(
+    item_id: &str,
+    text: &str,
+    calls: &[ToolCall],
+    reasoning: Option<&str>,
+) -> Vec<Value> {
     let mut out = Vec::new();
+    // An OpenAI `reasoning` item comes BEFORE the message, which is the order every
+    // client renders it in. It was never emitted, so a chat UI showed no thinking
+    // for a model that reasoned — the chat endpoint had the same text in
+    // `reasoning_content` all along.
+    if let Some(r) = reasoning.filter(|r| !r.is_empty()) {
+        out.push(json!({
+            "type": "reasoning",
+            "id": random_id("rs_"),
+            "summary": [{"type": "summary_text", "text": r}],
+        }));
+    }
     if !text.is_empty() {
         out.push(json!({
             "type": "message",
@@ -1114,6 +1130,7 @@ fn response_object(
     item_id: &str,
     text: &str,
     calls: &[ToolCall],
+    reasoning: Option<&str>,
     usage: (u64, u64),
     previous_response_id: Option<&str>,
 ) -> Value {
@@ -1127,7 +1144,7 @@ fn response_object(
         // The turn this one continues, exactly as the client sent it (null for a
         // fresh conversation), so a client can chain without bookkeeping.
         "previous_response_id": previous_response_id,
-        "output": output_items(item_id, text, calls),
+        "output": output_items(item_id, text, calls, reasoning),
         // Convenience field the official SDK reads without walking `output`.
         "output_text": text,
         "usage": {
@@ -1164,6 +1181,12 @@ async fn non_stream_response(resp: Response, ctx: &ResponseContext) -> Response 
         .get("content")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    // The chat layer already carries the provider's thoughts here; the Responses
+    // endpoint has to surface them too or a reasoning UI shows nothing.
+    let reasoning = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|r| !r.is_empty());
     let calls = tool_calls_of(&message);
     let id = random_id("resp_");
     let created_at = unix_now();
@@ -1178,6 +1201,7 @@ async fn non_stream_response(resp: Response, ctx: &ResponseContext) -> Response 
             &random_id("msg_"),
             text,
             &calls,
+            reasoning,
             usage,
             ctx.previous_response_id.as_deref(),
         ),
@@ -1220,6 +1244,9 @@ struct StreamMapper {
     /// `metadata` as the client sent it, echoed back.
     metadata: Value,
     text: String,
+    /// The provider's thoughts, accumulated exactly like `text`. Emitted as a
+    /// `reasoning` item so a reasoning UI has something to render.
+    reasoning: String,
     usage: (u64, u64),
     /// `output_item.added` is emitted lazily, right before the first delta.
     item_added: bool,
@@ -1268,6 +1295,7 @@ impl StreamMapper {
             store,
             metadata,
             text: String::new(),
+            reasoning: String::new(),
             usage: (0, 0),
             item_added: false,
             completed: false,
@@ -1384,6 +1412,12 @@ impl StreamMapper {
             self.finish_reason = Some(reason.to_string());
         }
         let mut out = self.feed_tool_calls(&chunk);
+        if let Some(r) = chunk
+            .pointer("/choices/0/delta/reasoning_content")
+            .and_then(Value::as_str)
+        {
+            self.push_reasoning(r);
+        }
         let delta = chunk
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
@@ -1526,6 +1560,19 @@ impl StreamMapper {
     /// UTF-8 even when the cut lands inside a multi-byte character, and the delta
     /// itself has already gone to the client untouched — only the copy we keep is
     /// bounded.
+    /// Accumulate a `reasoning_content` delta, capped like the answer text.
+    fn push_reasoning(&mut self, delta: &str) {
+        let remaining = MAX_OUTPUT_TEXT.saturating_sub(self.reasoning.len());
+        if remaining == 0 {
+            return;
+        }
+        let mut end = delta.len().min(remaining);
+        while end > 0 && !delta.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.reasoning.push_str(&delta[..end]);
+    }
+
     fn push_text(&mut self, delta: &str) {
         let remaining = MAX_OUTPUT_TEXT.saturating_sub(self.text.len());
         if remaining == 0 {
@@ -1613,6 +1660,7 @@ impl StreamMapper {
                 &item_id,
                 &text,
                 &self.tool_calls,
+                (!self.reasoning.is_empty()).then_some(self.reasoning.as_str()),
                 self.usage,
                 self.previous_response_id.as_deref(),
             ),
@@ -2004,7 +2052,7 @@ mod tests {
             name: "lookup".into(),
             arguments: "{\"q\":\"x\"}".into(),
         }];
-        let out = response_object("resp_1", 1, "m", "msg_1", "", &calls, (5, 2), None);
+        let out = response_object("resp_1", 1, "m", "msg_1", "", &calls, None, (5, 2), None);
         let items = out["output"].as_array().expect("output");
         assert_eq!(items.len(), 1, "{out}");
         assert_eq!(items[0]["type"], "function_call");
@@ -2022,6 +2070,7 @@ mod tests {
             "msg_1",
             "let me look",
             &calls,
+            None,
             (5, 2),
             None,
         );
@@ -2037,7 +2086,7 @@ mod tests {
     #[test]
     fn store_and_metadata_are_echoed() {
         let v = with_request_fields(
-            response_object("resp_1", 1, "m", "msg_1", "hi", &[], (1, 1), None),
+            response_object("resp_1", 1, "m", "msg_1", "hi", &[], None, (1, 1), None),
             false,
             &json!({"trace": "abc"}),
         );
@@ -2046,7 +2095,7 @@ mod tests {
 
         // Absent metadata stays absent instead of becoming `null`.
         let v = with_request_fields(
-            response_object("resp_1", 1, "m", "msg_1", "hi", &[], (1, 1), None),
+            response_object("resp_1", 1, "m", "msg_1", "hi", &[], None, (1, 1), None),
             true,
             &Value::Null,
         );
@@ -2472,6 +2521,7 @@ mod tests {
             "msg_abc",
             text,
             &[],
+            None,
             usage_pair(&chat),
             None,
         );
@@ -2588,6 +2638,106 @@ mod tests {
         assert_eq!(
             text_done_index, added_msg.2,
             "the message index must be stable from announce to done"
+        );
+    }
+
+    /// A model's thoughts reach the client as a `reasoning` item.
+    ///
+    /// The chat endpoint put them in `reasoning_content` all along, but this
+    /// endpoint built `output` from the answer text only, so a reasoning UI showed
+    /// nothing for a model that reasoned. Reproduced live against Gemini 3.8:
+    /// chat returned 973 characters of `reasoning_content`, `/v1/responses`
+    /// returned a single `message` item and no reasoning at all.
+    #[test]
+    fn a_reasoning_model_surfaces_a_reasoning_item() {
+        let message = json!({
+            "role": "assistant",
+            "content": "17 x 23 = 391",
+            "reasoning_content": "17 x 20 = 340, 17 x 3 = 51, total 391.",
+        });
+        let text = message["content"].as_str().unwrap_or_default();
+        let reasoning = message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .filter(|r| !r.is_empty());
+        let items = output_items("msg_1", text, &[], reasoning);
+
+        assert_eq!(items.len(), 2, "{items:?}");
+        // Reasoning comes first — the order every client renders it in.
+        assert_eq!(items[0]["type"], "reasoning", "{items:?}");
+        assert_eq!(items[0]["summary"][0]["type"], "summary_text");
+        assert_eq!(
+            items[0]["summary"][0]["text"],
+            "17 x 20 = 340, 17 x 3 = 51, total 391."
+        );
+        assert!(
+            items[0]["id"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("rs_")
+        );
+        assert_eq!(items[1]["type"], "message");
+
+        // No thoughts -> no reasoning item, so a non-reasoning model is unchanged.
+        let plain = output_items("msg_1", "hi", &[], None);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0]["type"], "message");
+
+        // Empty string is absence, not an empty item.
+        let blank = output_items("msg_1", "hi", &[], Some(""));
+        assert_eq!(
+            blank.len(),
+            1,
+            "an empty reasoning string must not emit an item"
+        );
+    }
+
+    /// The streaming mapper accumulates `reasoning_content` into the final object.
+    #[test]
+    fn streaming_reasoning_reaches_the_final_response() {
+        let mut mapper = StreamMapper::new("m".to_string(), None, true, Value::Null);
+        let mut frames = mapper.start();
+        frames
+            .extend(mapper.feed(br#"{"choices":[{"delta":{"reasoning_content":"thinking..."}}]}"#));
+        frames.extend(mapper.feed(br#"{"choices":[{"delta":{"content":"answer"}}]}"#));
+        frames.extend(mapper.feed(
+            br#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+        ));
+        frames.extend(mapper.feed(b"[DONE]"));
+
+        // The terminal event carries the full object.
+        let completed = frames
+            .iter()
+            .filter_map(|f| {
+                let s = std::str::from_utf8(f).ok()?;
+                let mut lines = s.lines();
+                let name = lines.next()?.strip_prefix("event: ")?;
+                if name != "response.completed" {
+                    return None;
+                }
+                let data = lines.find_map(|l| l.strip_prefix("data: "))?;
+                serde_json::from_str::<Value>(data).ok()
+            })
+            .next()
+            .expect("a response.completed event");
+        let types: Vec<&str> = completed["response"]["output"]
+            .as_array()
+            .expect("output")
+            .iter()
+            .filter_map(|o| o["type"].as_str())
+            .collect();
+        assert_eq!(
+            types,
+            vec!["reasoning", "message"],
+            "the streamed response must carry both items: {completed}"
+        );
+        assert_eq!(
+            completed["response"]["output"][0]["summary"][0]["text"],
+            "thinking..."
+        );
+        assert_eq!(
+            completed["response"]["output"][1]["content"][0]["text"],
+            "answer"
         );
     }
 
@@ -3131,7 +3281,7 @@ mod tests {
         let usage = usage_pair(&chat);
         assert_eq!(usage, (u64::MAX, 1));
 
-        let out = response_object("resp_x", 0, "m", "msg_x", "hi", &[], usage, None);
+        let out = response_object("resp_x", 0, "m", "msg_x", "hi", &[], None, usage, None);
         assert_eq!(out["usage"]["input_tokens"], json!(u64::MAX));
         assert_eq!(out["usage"]["output_tokens"], json!(1));
         assert_eq!(out["usage"]["total_tokens"], json!(u64::MAX));
