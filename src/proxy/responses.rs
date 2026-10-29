@@ -816,14 +816,19 @@ fn push_input_item(
                     return Err(bad_request(format!("unsupported message role '{other}'")));
                 }
             };
-            let text = message_text(obj.get("content"), used)?;
-            out.push(json!({"role": role, "content": text}));
+            let content = message_content(obj.get("content"), used)?;
+            out.push(json!({"role": role, "content": content}));
             Ok(())
         }
         "input_text" => {
             let text = obj.get("text").and_then(Value::as_str).unwrap_or_default();
             charge_input(used, text.len())?;
             out.push(user_message(text));
+            Ok(())
+        }
+        "input_image" => {
+            let image_part = parse_input_image_part(obj, used)?;
+            out.push(json!({"role": "user", "content": [image_part]}));
             Ok(())
         }
         // The tool-call half of a turn: what the model asked for last time. Chat
@@ -920,6 +925,103 @@ fn flatten_tool_output(v: Option<&Value>) -> String {
             out
         }
         Some(other) => other.to_string(),
+    }
+}
+
+/// Parse an image content part (`input_image` or `image_url`) into a chat-completions
+/// `{"type": "image_url", "image_url": {"url": "..."}}` part.
+fn parse_input_image_part(
+    o: &serde_json::Map<String, Value>,
+    used: &mut usize,
+) -> Result<Value, (StatusCode, String)> {
+    let url = if let Some(url) = o.get("image_url").and_then(Value::as_str) {
+        url
+    } else if let Some(url) = o.get("image_url").and_then(|v| v.get("url")).and_then(Value::as_str) {
+        url
+    } else if let Some(url) = o.get("url").and_then(Value::as_str) {
+        url
+    } else {
+        return Err(bad_request("'input_image' part requires an 'image_url'"));
+    };
+    charge_input(used, url.len())?;
+    let mut image_obj = json!({"url": url});
+    if let Some(detail) = o.get("detail").and_then(Value::as_str) {
+        image_obj["detail"] = json!(detail);
+    }
+    Ok(json!({
+        "type": "image_url",
+        "image_url": image_obj,
+    }))
+}
+
+/// Convert a message `content` (string or array of parts) to a Value.
+/// If all parts are text, collapses to a plain string. If there are image parts,
+/// produces an array of `input_text` and `image_url` parts for chat completions.
+fn message_content(content: Option<&Value>, used: &mut usize) -> Result<Value, (StatusCode, String)> {
+    match content {
+        None | Some(Value::Null) => Ok(Value::String(String::new())),
+        Some(Value::String(s)) => {
+            charge_input(used, s.len())?;
+            Ok(Value::String(s.clone()))
+        }
+        Some(Value::Array(parts)) => {
+            let mut has_image = false;
+            for part in parts {
+                if let Value::Object(o) = part {
+                    let ty = o.get("type").and_then(Value::as_str).unwrap_or("input_text");
+                    if ty == "input_image" || ty == "image_url" {
+                        has_image = true;
+                        break;
+                    }
+                }
+            }
+
+            if !has_image {
+                let text = message_text(content, used)?;
+                return Ok(Value::String(text));
+            }
+
+            let mut out_parts = Vec::new();
+            for part in parts {
+                match part {
+                    Value::String(s) => {
+                        charge_input(used, s.len())?;
+                        out_parts.push(json!({"type": "text", "text": s}));
+                    }
+                    Value::Object(o) => {
+                        let ty = o
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("input_text");
+                        match ty {
+                            "input_text" | "output_text" | "text" => {
+                                let piece =
+                                    o.get("text").and_then(Value::as_str).unwrap_or_default();
+                                charge_input(used, piece.len())?;
+                                out_parts.push(json!({"type": "text", "text": piece}));
+                            }
+                            "input_image" | "image_url" => {
+                                out_parts.push(parse_input_image_part(o, used)?);
+                            }
+                            other => {
+                                return Err(bad_request(format!(
+                                    "message content part type '{other}' is not supported"
+                                )));
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(bad_request(
+                            "message content parts must be strings or objects",
+                        ));
+                    }
+                }
+            }
+            Ok(Value::Array(out_parts))
+        }
+        Some(_) => Err(bad_request(
+            "'content' must be a string or an array of parts",
+        )),
     }
 }
 
@@ -2043,6 +2145,58 @@ mod tests {
                 {"role": "user", "content": "Hi there"},
                 {"role": "assistant", "content": "hello"},
                 {"role": "user", "content": "again"},
+            ])
+        );
+    }
+
+    #[test]
+    fn input_image_is_translated_to_image_url_parts() {
+        let chat = to_chat_request(&json!({
+            "model": "m",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "What is in this image?"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "detail": "high"}
+                    ]
+                },
+                {
+                    "type": "input_image",
+                    "url": "https://example.com/test.jpg"
+                }
+            ]
+        }))
+        .expect("input_image is supported");
+
+        assert_eq!(
+            chat["messages"],
+            json!([
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this image?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://example.com/test.jpg"
+                            }
+                        }
+                    ]
+                }
             ])
         );
     }
