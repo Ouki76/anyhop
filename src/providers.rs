@@ -28,7 +28,7 @@ pub fn build_http_client_with(
         // A proxy is therefore opt-in and explicit: `[server] proxy` or a
         // per-provider/per-account `proxy` key. Nothing else routes traffic.
         .no_proxy();
-    if let Some(p) = proxy {
+    if let Some(p) = proxy.map(str::trim).filter(|s| !s.is_empty()) {
         let proxy =
             reqwest::Proxy::all(p).map_err(|e| anyhow::anyhow!("invalid proxy url '{p}': {e}"))?;
         b = b.proxy(proxy);
@@ -134,7 +134,13 @@ impl Provider {
         default_retries: usize,
     ) -> anyhow::Result<Self> {
         // Priority: account.proxy > provider.proxy > server-wide proxy.
-        let effective_proxy = cfg.proxy.as_deref().or(default_proxy);
+        // An explicit empty string (proxy = "") explicitly disables the proxy
+        // for this provider, bypassing the server-wide default_proxy.
+        let effective_proxy = match cfg.proxy.as_deref().map(str::trim) {
+            Some("") => None,
+            Some(p) => Some(p),
+            None => default_proxy.map(str::trim).filter(|s| !s.is_empty()),
+        };
         let base_url = cfg.base_url.trim_end_matches('/').to_string();
         let mut codex_accounts: Vec<Arc<crate::codex::CodexAccount>> = Vec::new();
         let (secrets, ag_accounts) = match cfg.kind {
